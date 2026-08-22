@@ -1117,26 +1117,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                                       .get_memory_descriptor()
                                                       .buffer_descriptor;
                                 SegmentRestore* match = nullptr;
+                                SegmentRestore* endpoint_match = nullptr;
+                                size_t endpoint_match_count = 0;
                                 for (auto& restore : restores) {
                                     if (descriptor.transport_endpoint_ ==
                                             restore.segment.te_endpoint ||
                                         descriptor.transport_endpoint_ ==
                                             restore.segment.name) {
-                                        // When multiple segments share the
-                                        // same endpoint (e.g. UB per-NUMA
-                                        // segments), disambiguate by
-                                        // checking whether the replica's
-                                        // buffer address falls within this
-                                        // segment's virtual address range
-                                        // [base, base+size).  Each
-                                        // per-NUMA segment occupies a
-                                        // contiguous and non-overlapping
-                                        // range, so at most one segment
-                                        // matches.
+                                        endpoint_match = &restore;
+                                        ++endpoint_match_count;
                                         if (descriptor.buffer_address_ <
                                                 restore.segment.base ||
-                                            descriptor.buffer_address_ >=
-                                                restore.segment.base +
+                                            descriptor.buffer_address_ -
+                                                        restore.segment.base >=
                                                     restore.segment.size) {
                                             continue;
                                         }
@@ -1146,6 +1139,18 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                         }
                                         match = &restore;
                                     }
+                                }
+                                // Preserve endpoint-only matching when it is
+                                // unique so allocator restoration validates
+                                // descriptor bounds. Shared endpoints (e.g.
+                                // UB per-NUMA segments) require one address
+                                // range match to disambiguate the segment.
+                                if (endpoint_match_count == 1) {
+                                    match = endpoint_match;
+                                } else if (endpoint_match_count > 1 &&
+                                           match == nullptr) {
+                                    ambiguous_endpoint = true;
+                                    return;
                                 }
                                 if (match != nullptr) {
                                     if (descriptor.protocol_ == "cxl") {
