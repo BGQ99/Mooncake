@@ -1128,17 +1128,40 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                                   .get_memory_descriptor()
                                                   .buffer_descriptor;
                             SegmentRestore* match = nullptr;
+                            SegmentRestore* endpoint_match = nullptr;
+                            size_t endpoint_match_count = 0;
                             for (auto& restore : restores) {
                                 if (descriptor.transport_endpoint_ ==
                                         restore.segment.te_endpoint ||
                                     descriptor.transport_endpoint_ ==
                                         restore.segment.name) {
+                                    endpoint_match = &restore;
+                                    ++endpoint_match_count;
+                                    if (descriptor.buffer_address_ <
+                                            restore.segment.base ||
+                                        descriptor.buffer_address_ -
+                                                restore.segment.base >=
+                                            restore.segment.size) {
+                                        continue;
+                                    }
                                     if (match != nullptr) {
                                         ambiguous_endpoint = true;
                                         return;
                                     }
                                     match = &restore;
                                 }
+                            }
+                            // Preserve endpoint-only matching when it is
+                            // unique so allocator restoration validates
+                            // descriptor bounds. Shared endpoints (e.g.
+                            // UB per-NUMA segments) require one address
+                            // range match to disambiguate the segment.
+                            if (endpoint_match_count == 1) {
+                                match = endpoint_match;
+                            } else if (endpoint_match_count > 1 &&
+                                       match == nullptr) {
+                                ambiguous_endpoint = true;
+                                return;
                             }
                             if (match != nullptr) {
                                 if (descriptor.protocol_ == "cxl") {
