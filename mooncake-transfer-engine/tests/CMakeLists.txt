@@ -27,8 +27,7 @@ add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 # Fingerprint, blob and option checks run without a VMM backend.
 add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
 target_include_directories(
-  shared_segment_test
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
+  shared_segment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
 target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME shared_segment_test COMMAND shared_segment_test)
@@ -86,6 +85,13 @@ add_executable(sender_credit_test ${WORKSPACE}/sender_credit_test.cpp)
 target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME sender_credit_test COMMAND sender_credit_test)
+
+# CtrlChannel RDMA notify correctness. Self-skips without RDMA.
+add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
+target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags
+                                              glog::glog gtest)
+add_test(NAME rdma_notify_test COMMAND rdma_notify_test)
+set_tests_properties(rdma_notify_test PROPERTIES LABELS "rdma")
 
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
@@ -208,6 +214,12 @@ if(USE_EFA)
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
   target_link_libraries(efa_single_nic_large_mr_test
                         PUBLIC transfer_engine gflags::gflags glog::glog)
+
+  add_executable(efa_large_mr_test ${WORKSPACE}/efa_large_mr_test.cpp)
+  target_link_libraries(efa_large_mr_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+  # No add_test(): needs EFA hardware plus MC_MAX_MR_SIZE=67108864 in the
+  # environment, same as rdma_large_mr_test.
 
   add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
   target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags

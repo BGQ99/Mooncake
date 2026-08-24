@@ -48,6 +48,12 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+
+// After this many consecutive failed reclaim attempts, lazyFreeBatch stops
+// retrying a batch (see Batch::reclaim_abandoned). Transient errors heal in a
+// pass or two and a healthy-but-inflight batch reports PENDING (which resets
+// the counter), so only a permanently failing poll or queue retire gets here.
+constexpr size_t kMaxReclaimAttempts = 4096;
 }  // namespace
 
 struct Batch {
@@ -61,6 +67,13 @@ struct Batch {
     size_t runtime_refs{0};
     bool free_requested{false};
     uint64_t queue_token{0};
+    // Consecutive lazyFreeBatch passes that failed to reclaim this batch
+    // (poll error or queue retire error). Reset when a pass observes the
+    // batch healthy (PENDING). At kMaxReclaimAttempts the batch is marked
+    // reclaim_abandoned: the sweep stops retrying (and warning) and leaves
+    // it for deconstruct(), which reclaims the freelist unconditionally.
+    size_t reclaim_failures{0};
+    bool reclaim_abandoned{false};
 
     struct SubmitHook {
         size_t start_task_id{0};
@@ -145,6 +158,47 @@ Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
 
     return Status::InvalidArgument(
         "rpc_server_port must be an integer or integer string" LOC_MARK);
+}
+
+Status getRpcServerThreadsFromConfig(const Config& config, size_t default_value,
+                                     size_t& threads) {
+    constexpr const char* kKey = "rpc_server_threads";
+    constexpr long long kMinThreads = 1;
+    constexpr long long kMaxThreads = 1024;
+    auto validate = [&](long long value, const std::string& source) -> Status {
+        if (value < kMinThreads || value > kMaxThreads) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_threads '" + source +
+                "', expected value in range [1, " +
+                std::to_string(kMaxThreads) + "]" LOC_MARK);
+        }
+        threads = static_cast<size_t>(value);
+        return Status::OK();
+    };
+    if (!config.contains(kKey)) {
+        threads = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validate(numeric_value, std::to_string(numeric_value));
+    }
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_threads '" + string_value +
+                "', expected integer in range [1, " +
+                std::to_string(kMaxThreads) + "]" LOC_MARK);
+        }
+        return validate(*parsed_value, string_value);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_threads must be an integer or integer string" LOC_MARK);
 }
 
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
@@ -288,6 +342,8 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    size_t rpc_server_threads = 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
@@ -336,7 +392,7 @@ Status TransferEngineImpl::construct() {
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
-    CHECK_STATUS(metadata_->start(port_, ipv6_));
+    CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
     if (metadata_type == "p2p")
         local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6_);
@@ -834,21 +890,52 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
 
 Status TransferEngineImpl::lazyFreeBatch() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    // freelist is insertion-ordered. A batch that cannot be reclaimed on this
+    // pass (poll error, queue owners not yet terminal) must not stop the sweep:
+    // returning early would strand every batch queued behind it, and a
+    // permanent error would strand them for good. Skip it, keep going, and
+    // report the first error once the pass is complete. Most callers drop the
+    // returned status (the ProgressWorker sweeps on every step), so the skip is
+    // also logged here, rate-limited, or a permanently stuck batch would be
+    // re-polled forever without a trace.
+    Status first_error = Status::OK();
     for (auto it = batch_set_.freelist.begin();
          it != batch_set_.freelist.end();) {
         auto& batch = *it;
-        if (batch->runtime_refs > 0) {
+        if (batch->runtime_refs > 0 || batch->reclaim_abandoned) {
             it++;
             continue;
         }
         TransferStatus overall_status;
-        CHECK_STATUS(getTransferStatus((BatchID)batch, overall_status));
-        if (overall_status.s == PENDING) {
+        auto status = getTransferStatus((BatchID)batch, overall_status);
+        if (status.ok() && overall_status.s == PENDING) {
+            batch->reclaim_failures = 0;
             it++;
             continue;
         }
-        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
-            CHECK_STATUS(retireQueueForBatch(batch));
+        if (status.ok() && runtime_queue_config_.enabled &&
+            batch->queue_token != 0) {
+            status = retireQueueForBatch(batch);
+        }
+        if (!status.ok()) {
+            if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
+                batch->reclaim_abandoned = true;
+                TENT_RECORD_BATCH_QUARANTINED();
+                LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
+                           << batch->reclaim_failures
+                           << " consecutive reclaim attempts; giving up until "
+                              "engine teardown reclaims it unconditionally. "
+                              "Last error: "
+                           << status.ToString();
+            } else {
+                LOG_EVERY_N(WARNING, 100)
+                    << "lazyFreeBatch: batch " << batch
+                    << " cannot be reclaimed yet, left in freelist: "
+                    << status.ToString();
+            }
+            if (first_error.ok()) first_error = status;
+            it++;
+            continue;
         }
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             auto& transport = transport_list_[type];
@@ -860,7 +947,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
         Slab<Batch>::Get().deallocate(batch);
         it = batch_set_.freelist.erase(it);
     }
-    return Status::OK();
+    return first_error;
 }
 
 Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
@@ -1927,10 +2014,11 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
             for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
                  ++tid) {
                 auto& t = batch->task_list[tid];
-                if (t.status == PENDING) {
-                    all_completed = false;
-                    break;
-                }
+                // Merged requests are carried by one owning task; the derived
+                // ones keep their initial status forever, so checking them
+                // would make this hook never fire. getBatchStatus() skips them
+                // for the same reason.
+                if (t.derived) continue;
                 if (t.status != COMPLETED) {
                     all_completed = false;
                     break;
@@ -2333,7 +2421,13 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
+    // Transfer-bound notifications may only be delivered once the transfer
+    // they are attached to has actually completed. The second parameter is
+    // "verify completion before sending", so passing the batch's completion
+    // into it inverted the guard: for a batch still in flight, or one that
+    // ended in failure, check was false and every hook fired anyway.
+    if (overall_status.s == COMPLETED)
+        CHECK_STATUS(maybeFireSubmitHooks(batch, /*check=*/false));
     return Status::OK();
 }
 
