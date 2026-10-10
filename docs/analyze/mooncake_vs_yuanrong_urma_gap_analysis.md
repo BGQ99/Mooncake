@@ -1,552 +1,374 @@
-# Mooncake vs yuanrong-datasystem：传输层可靠性与元数据能力 Gap 分析
+# Mooncake 可靠性与性能建设方案——借鉴 yuanrong-datasystem
 
-> 对比基线：
-> - **Mooncake**：`supercache-snapshot-912` 分支（HEAD `14a9f55a`），重点考察 `mooncake-transfer-engine/src/transport/kunpeng_transport/`（UB/URMA）与 `mooncake-store`（元数据/HA）。
-> - **yuanrong-datasystem**（kvc）：`master` 分支（HEAD `4b19814c3`），重点考察 `src/datasystem/common/rdma/`（URMA）、`src/datasystem/cluster/`（拓扑/元数据）、`src/datasystem/client/object_cache/transport/`（客户端传输）。
+> 更新日期：2026-10-10。
 >
-> 本文档为内部技术分析。源码事实尽量附 `文件:行号`；方案性结论会显式标注为“推断”或“待验证”，避免把 yuanrong 的参数直接当作 Mooncake 的正确参数。
+> - **Mooncake**：本地 `supercache-snapshot-930`，HEAD `087536ff`。
+> - **yuanrong-datasystem（下称 yuanrong）**：本地 `master`，HEAD `09d56b266`。
+> - 设计目标：借鉴 yuanrong 的成熟机制，完善 **TE 的 URMA 可靠性与性能**、**Master 的元数据可靠性与扩缩容能力**。
+>
+> 本文明确现有能力、设计约束、整改方案及实施计划；方案效果需通过 URMA 实机压测、故障注入和 HA 测试验收。
 
-### 证据口径与重要边界
+### 设计范围与前提
 
-- **已核实**：可由上述两个 commit 的源码直接确认；本文默认未标注的源码事实均属此类。
-- **推断**：从数据结构、调用关系或故障语义推导，必须通过故障注入或线上 shadow 指标验证。
-- **待验证**：依赖实际 UMDK/固件、部署拓扑或运行参数，静态源码不足以裁决。
-- 2026-09-12 曾两次尝试只读连接 `work@mooncake-dev` 核对 UMDK ABI，均在 SSH 握手阶段被 `127.0.0.1:2223` reset，因此本文没有把远端头/库兼容性标为已验证。
-- Mooncake 当前不是单一传输实现：至少同时存在 **classic UB**（`kunpeng_transport`）、**generic RDMA** 和 **TENT**。本文发现的 `volatile` 深度表、1 秒强制恢复、staging 生命周期等问题，除非另有说明，均特指 Store 在 `protocol=ub` 且未设置 `MC_USE_TENT` 时走的 **classic UB**；generic RDMA 已使用 `std::atomic<int>` 深度表，TENT 也已有策略路由、QoS、指标与原生 UB 数据面测试，不能把三者的能力混为一谈（`transfer_engine.cpp:401-417`、`client_service.cpp:771-833`、`rdma_endpoint.cpp:123-137`）。
-- yuanrong 的 CQE 4/9、`BONDP_USER_CTL_QUERY_PORT_STATUS` 和 128ms 延迟释放都是**特定实现中的经验值/ABI**，可借鉴其状态机与所有权思想，不应无条件复制常量。
+- Mooncake 的 **classic UB、generic RDMA、TENT** 是不同路径。`volatile` 深度表、每秒重激活、本文列出的 staging 风险主要针对 classic UB，不能推广到全部 TE。
+- MultiTransport 已有调度器接入、取消及状态委托；“TIMEOUT 后 batch busy”主要发生在**未走调度器的旧路径**，调度路径需单独验证。
+- yuanrong 已实现的功能不一定默认启用；NUMA 亲和、worker 间 BatchGet、内存再平衡等仍受开关控制。
+- provider CQE 数值、端口查询 ABI、flush/delete 的完成保证依赖 UMDK/驱动/固件。资源释放和故障恢复条件应依据实际硬件行为验证，不能仅依赖固定等待时间或经验阈值。
 
 ---
 
 ## 1. 对比范围与总体结论
 
-| 维度 | Mooncake (supercache) | yuanrong-datasystem | 差距方向 |
-|------|----------------------|---------------------|----------|
-| 光口/端口故障处理 | 异步事件置 inactive + monitor 线程 1s 强制重激活 | 端口健康监测体系（epoch 围栏 + 准入状态机 + 远端验证） | **yuanrong 显著领先** |
-| Jetty 共享与生命周期 | 每 endpoint 1 个 jetty，无池化无状态机 | 进程级池（200）+ PostGate 原子门 + 退役流水线 + 孤儿记账 | **yuanrong 显著领先** |
-| 多网口负载均衡 | 随机切片扇出 + bondp BALANCE/IODIE | chip 级 inflight 差反馈 + 亲和策略（bondp BALANCE/PORT） | **yuanrong 领先（反馈闭环）** |
-| 对端故障隔离 | 9 次重试后删 endpoint，无熔断 | 对端熔断器 + 类型化错误码 + TCP 限流降级 | **yuanrong 显著领先** |
-| 超时/迟到完成处理 | TIMEOUT 对外可见但 batch 保持 busy；无界等待迟到 CQE，且部分 staging 失败分支不收敛 | 保留事件 + 孤儿 WR 记账 + 迟到 CQE 分发 | **yuanrong 显著领先** |
-| 元数据均衡 | 有人工 Drain Job + 动态副本；无自动压力/热度再平衡 | 均衡哈希环 + 内存/热度再平衡 + 速率限制迁移 | **yuanrong 领先（调度闭环）** |
-| Master 高可用 | 围栏选举 + 有序 OpLog + 分块快照 | etcd lease + 分区确认 + 自杀围栏（数据面无共识） | **故障模型不同，不宜单项判胜** |
-| 观测性（trace/perf point） | SpDiag + trace_id 全链路 | UrmaWriteTrace 分相取证 + 慢日志建议 | **各有千秋，yuanrong 更深** |
-| GPU/设备内存传输 | CPU staging 池（D2H/H2D），存在终态收敛和 teardown 风险 | RemoteH2D + Pipeline H2D（复用 URMA jetty/JFC） | **yuanrong 领先（Mooncake 先修正确性）** |
-| 多设备并发 | 每 HCA 独立 context + 切片扇出 | 单设备（bonding_dev_0）顺序候选 | **Mooncake 领先** |
+**建设方向：TE 先补“安全完成与故障隔离”，再优化选路和批处理；Master 先补“可恢复的 slot 交接”，再开放自动扩缩容。** 不需要重写传输引擎或另建一套分布式 Master。
 
-**总体结论**：yuanrong 在 UB 数据面的**可靠性工程**（端口健康、熔断降级、生命周期管理、超时对账）上形成了闭环，是 Mooncake supercache 最值得借鉴的部分；Mooncake 在**多设备聚合、具备日志/快照的集中式 HA、SSD 分层和副本任务框架**上有自己的基础。正确方向不是移植 yuanrong 的单设备实现，而是把其“确认事实 → 准入 → 隔离/降级 → 迟到对账 → 可观测恢复”的控制闭环，适配到 Mooncake 多设备与多副本模型中。
+| 方向 | yuanrong 可借鉴能力 | Mooncake 当前基础与不足 | 建设方向 |
+|------|--------------------|------------------------|----------|
+| TE 可靠性 | 已确认健康事实驱动准入；代际围栏；迟到完成与资源退役 | classic UB 有多设备、重试和 endpoint 回收，但恢复、终态与资源所有权未闭环 | 优先修内存安全，再形成健康/熔断闭环 |
+| TE 路由与性能 | chip 负载反馈、预注册池、lane 复用、批处理、分阶段延迟观测 | 多 HCA、拓扑亲和、TENT 策略及调度框架已有；不能等同于 native UB 已具备全部反馈指标 | 保留多 HCA 优势，补可达性和实际负载反馈 |
+| Master 可靠性 | 拓扑版本与批次围栏、故障确认、恢复准入 | 已有 HA、OpLog/快照、CVM；slot 导入导出错误传播和原子交接仍有待完善环节 | 不推翻 HA，先加固现有 CVM 交接 |
+| Master 扩缩容 | 拓扑批次、迁移任务围栏、退出节点避让、重入恢复 | 已有多 SubMaster、slot、跨 Master 转发、Drain、io_pattern；缺完整可恢复扩缩容闭环 | 分清元数据 slot 迁移与数据 segment 排空 |
 
-### 1.1 三条数据面的归属判断
+### 1.1 数据面职责划分
 
-| 路径 | 当前已具备 | 本文建议承担的角色 |
-|------|------------|--------------------|
-| classic UB | Store `protocol=ub` 的直接路径；多 HCA context、staging、SIEVE endpoint | 先承接 P0 安全修复，保证现网兼容；避免继续堆叠长期性能架构 |
-| generic RDMA | 原子深度计数、rail 失败标记/替代路径、ready ACK 超时等机制 | 复用其错误分类、rail 隔离和原子资源记账思想，抽到传输中立层 |
-| TENT | 配置化 `TransportSelector`、QoS、指标、NIC load stats、原生 UB 测试 | 作为中长期统一数据面候选；新建负载学习、策略路由优先在此落地 |
+| 路径 | 已有基础 | 推荐职责 |
+|------|----------|----------|
+| classic UB | 每 HCA 独立 context、切片扇出、CPU staging、endpoint 缓存 | 回补 P0 正确性和兼容性修复；避免直接叠加大规模池化改造 |
+| generic RDMA | 原子深度计数、rail/替代路径等机制 | 复用错误分类、资源记账和故障域隔离思路 |
+| TENT | 策略选择、QoS、统计接口、原生 UB 测试 | 作为性能增强候选；先验证 native UB 的指标、取消与生命周期覆盖 |
 
-因此，整改要设置明确的**代码归属门**：影响内存安全/数据正确性的修复必须回补 classic UB；可复用的健康、熔断、错误分类放在公共抽象；大规模池化、调度和性能增强优先验证 TENT，避免永久维护两套 UB 控制面。
+TENT 暴露 NIC 统计接口，不代表每种 transport 已实现相同统计；当前 RDMA 的 quota/worker 统计不能直接当作 native UB 能力。
 
-### 1.2 本轮核查对原分析的关键纠偏
+### 1.2 关键设计约束
 
-1. “Mooncake 传输层 0 UT”不成立：classic/TENT 合计已有 8 个 UB 相关用例；准确 gap 是 classic 用例未进入 ctest，且缺系统故障注入。
-2. “Mooncake 只有驱逐、没有迁移”不准确：已有人工 Drain Job、Move/Copy Task 和动态副本；缺的是**自动压力/热度 planner、限速反馈和 HA job 意图**。
-3. “超时立即释放导致迟到 CQE UAF”不是当前直接行为：TIMEOUT 后 batch 仍 busy，实际问题是**业务终态与资源终态没有显式分离，CQE 丢失时资源无界等待**；另有未 post/重分发失败分支的确定性 staging 泄漏。
-4. `volatile` 深度表只属于 classic UB，generic RDMA 已使用原子类型；整改范围必须写清，避免重复改造或错误归因。
-5. Master HA 不能简单判胜负：Mooncake 强在状态复制/恢复，yuanrong 强在分区确认与 self-fencing，二者对应不同故障模型。
-6. yuanrong 的 128ms、200 lane、8 个 per-peer 配额、inflight 差 15 是**样本参数而非设计真理**；应复制所有权/围栏/反馈机制，再由 Mooncake 实机标定参数。
+1. **沿用现有多 SubMaster 架构**：CVM 可按 slot 分配多 SubMaster，并支持跨 Master 转发；`submaster_count` 默认仍为 1，应区分实现能力和部署配置。
+2. **复用现有热度分析框架**：已有 io_pattern 报告、分析、决策、执行及分层行为；不足是把它与拓扑变更、可恢复迁移和容量预算统一起来。
+3. **读重试必须隔离旧请求的 DMA 访问**：逻辑读取可能由远端 URMA WRITE 填充接收缓冲。yuanrong 新代码阻止 UB 模糊失败后的 QueryAndGet 二次 RemoteGet；仅校验版本不足以解决迟到写污染。
+4. **统一恢复路径的 pin 保护语义**：remount 的 `GrantLease` 只续已有 soft-pin，而 standby/slot 导入使用关闭 pin 的构造参数，需补齐状态保存与恢复首读保护。
+5. **生产连接恢复需独立治理**：yuanrong 的部分带抖动建链退避用于测试工具；Mooncake 应在生产 URMA 路径验证建链退避与并发预算，控制故障恢复期间的连接风暴。
+6. **缩容必须满足数据保护约束**：目标容量、保留副本、pin、deadline 和故障域约束不满足时，正确结果应是阻塞/暂停，而非无条件放宽后删除源。
 
 ---
 
-## 2. yuanrong 光模块组网可靠性深度洞察
+## 2. yuanrong URMA 可靠性与设备路由洞察
 
-### 2.1 端口健康监测体系（光口故障处理核心）
+### 2.1 端口健康：确认事实后隔离，带围栏恢复
 
-yuanrong 构建了一套五层递进的可靠性栈，光口故障处理是其中最完整的部分：
+yuanrong 将 provider 端口状态、健康快照、peer 准入和远端验证分层：
 
-```
-┌─ L1 硬件/bonding 层：bondp BALANCE 模式多端口分担；provider failover 显式关闭
-│    （urma_resource.cpp:177-238，把故障裁决权交给用户态）
-├─ L2 Jetty 池层：进程级 200 jetty 池 + 退役流水线 + per-peer 上限
-├─ L3 端口健康层：UbPortHealthMonitor 每秒轮询 BONDP_USER_CTL_QUERY_PORT_STATUS，
-│    按 (chip_id, die_id, port_idx) 输出 GOOD/BAD，healthEpoch 围栏防陈旧
-├─ L4 准入/熔断层：PeerUbAdmission 状态机（AVAILABLE/SUSPECT/UNAVAILABLE/PROBING），
-│    由 CQE 4（本地端口不可用）/ CQE 9（远端 ack 超时）分类驱动
-└─ L5 路由/降级层：SHM/UB/TCP 传输顾问 + 成功率驱动 worker 切换 + TCP 限流
-```
+- `verificationPending` 不能建立或解除基于端口事实的隔离；已确认全坏才隔离，部分端口健康不等同整机不可用。
+- 健康 epoch 与 peer incarnation 防止旧响应、重启前状态、迟到查询覆盖新事实。
+- 恢复流程区分**隔离前快速确认**与**隔离后随机化重探测**；新 all-bad 提示可以加速未确认故障，不能绕过已隔离状态的探测节奏。
+- 每 peer 最小查询间隔、并发预算和抖动共同限制探测放大；健康未知不伪装成已恢复。
 
-**关键机制**（均含源码引用）：
+**Mooncake 可落地的改造**：先把 classic UB 每秒无条件 `set_active(true)` 改为“事件/查询确认后恢复”，再接入薄 provider 适配器。查询能力不可用时显示 UNKNOWN，保留保守事件模式，不要求首版依赖新固件。
 
-1. **Provider 适配器**：`UrmaPortStatusProvider` 封装 `BONDP_USER_CTL_QUERY_PORT_STATUS`，解码时校验 `port_count`、排序去重端口身份（urma_port_status_provider.cpp:46-85）。业务代码不直接接触厂商类型。
-2. **健康快照 + epoch 围栏**：不可变 `shared_ptr` 快照原子发布，每次确认变化递增 `healthEpoch`（ub_port_health.cpp:131-186）。健康时轮询循环休眠（零周期查询开销，ub_port_health.cpp:188-192）。
-3. **`verificationPending` 一等状态**：未确认的观察"既不能建立隔离也不能解除隔离"（ub_port_health.h:99-110）——这是抗链路抖动（flapping）的关键设计。
-4. **CQE 4/9 语义**：CQE 4 = 本地发送端口不可用；CQE 9 = 远端对端 ack 超时（fast_transport_base.h:37-38）。同步失败经 `UrmaWriteFailure{providerStatus, cqeStatus}` 上传；**迟到完成**（请求已超时）经保留事件 + 观察者分发（urma_manager.cpp:1313-1329）。
-5. **客户端准入位字**：整个端口摘要打包进**单个 atomic uint64**（bit63=READY，bit32-62=总数，低 32 位=坏数）。仅 `bad == total` 才拒绝（`K_URMA_WORKER_UNAVAILABLE`），部分坏端口不阻塞（urma_manager.cpp:411-425）。
-6. **验证式端口健康模式**：E4/E9 不立即置 UNAVAILABLE，而是转 **SUSPECT** 并触发验证（本地刷新或远端 `QueryUbPortHealth` RPC）；只有确认的端口事实才能改变状态（peer_ub_admission.cpp:311-335, 356-400）。`portHealthGoverned` 标志保证一旦确认事实主导隔离，普通结果不能覆盖（peer_ub_admission.cpp:863-870）。
-7. **远端健康传播**：`QueryUbPortHealth` RPC 携带 incarnation 防重启竞态（worker_oc_service_impl.cpp:3639-3662）；客户端最多 4 并发验证查询（remote_ub_port_health_verifier.h:34-35）；验证后的摘要进入 `WorkerRouter` 过滤链，把全坏 worker 从路由中剔除（ub_remote_port_health_propagation_test.cpp:108-145 有端到端测试）。
-8. **Piggyback**：每个 GetObjectRemote 响应附带 provider 自健康；provider 侧 UB 写失败编码为 `ProviderUbFailureDetailPb` 让请求方隔离源端（worker_worker_oc_service_impl.cpp:229-236）。
+### 2.2 Jetty 生命周期：业务结束与硬件结束分开
 
-**故障场景覆盖矩阵**（摘自分析，均有测试或源码证据）：
+yuanrong 的价值不只是池化，而是资源所有权：
 
-| 场景 | 机制 | 结果 |
-|------|------|------|
-| 单端口故障（部分） | bonding 分担 + bad<total 不隔离 | 流量继续，`HealthyPortCount()` 供路由参考 |
-| 本地全端口故障 | CQE 4 + 客户端准入位字 | UB 操作阻塞，Put 走 TCP 降级（<1MB） |
-| 远端对端全端口故障 | CQE 9 → SUSPECT → 远端验证 → UNAVAILABLE | 对端隔离，**远端 Get RPC 也不再发起**（省成本） |
-| 链路抖动 | epoch 围栏 + pending 态 + 探测退避（1s→32s） | 状态变化需确认的、epoch 有序的事实 |
-| 对端进程重启 | incarnation 不匹配 → `K_URMA_NEED_CONNECT`；墓碑阻断陈旧摘要回放 | 连接重建，陈旧事实被拒 |
-| 池耗尽（本地压力） | `K_URMA_TRY_AGAIN`（区别于业务 K_TRY_AGAIN）+ per-peer 上限 | 调用方退避，其它对端不受影响 |
+- PostGate 将“允许 post”与“关闭/退役”放在同一原子判定中，避免准入和销毁并发穿透。
+- 超时请求保留完成身份与孤儿 WR 记账；迟到 CQE 仍能归属原请求，不再依赖已复用业务对象。
+- 退役经历停止准入、modify/flush、删除；无法确认清理完成的资源隔离保留，而非强行归还。
+- per-peer lane 配额限制故障影响范围；通过 `urma_send_lane_count_per_peer` 配置每个对端的并发上限。
+- lane、context、内存注册和动态库有依赖关系，必须按依赖逆序退出。
 
-**局限**（Mooncake 不必照搬的部分）：光模块诊断只有二元 GOOD/BAD，无温度/光功率/BER/DOM 遥测（全库搜索证实）；单设备运行（`bonding_dev_0`），多 NIC 并发数据面缺席。
+**Mooncake 最小实施顺序**：统一 staged slice 失败收敛 → 完成记录与 generation → 停止 post/flush/线程退出/内存注销顺序 → 最后评估 lane 池。只把 `volatile` 改成原子类型，不能解决整套生命周期问题。
 
-### 2.2 Jetty 共享与池化
+### 2.3 设备路由：优势在反馈和隔离，不在多 HCA
 
-- **进程级池**：`SendJettyPool` 目标 200 条 lane（`urma_send_jetty_lane_pool_size`），启动时**池外预填充**（失败即 Init 失败），后台 refill 线程 50ms tick、失败强制整 tick 退避、退役余量上限 200（urma_resource.cpp:1710-1789）。
-- **PostGate 单原子字**：`[63]=closing, [62]=retireArmed, [61]=finalizerScheduled, [60:0]=activePosts` 打包在一个 `std::atomic<uint64_t>`，准入与退役共享**同一线性化点**，显式注释拒绝 C++ 位域（urma_resource.h:629-649, 800-801）。
-- **生命周期 FSM**：`ACTIVE → QUIESCING → MODIFYING → WAIT_FLUSH → DELETE_READY → DELETING → DESTROYED`，`QUARANTINED` 为终态。退役经 `urma_modify_jetty(STATE_ERROR)` → 等 `FLUSH_ERR_DONE` CQE → 4 线程池异步删除；删除失败则隔离（保留 registry 身份防 ABA）（urma_resource.cpp:1196-1238, 1595-1648）。
-- **fail-closed**：未收敛的 jetty/context 挂到进程退出（`NoDestructor`），`providerCleanupDeferred_` 阻止 liburma 卸载（urma_resource.cpp:83-120）。
-- **孤儿 WR 记账**：超时 lane 合法归还后，在途 WR 计数转入 per-jetty 孤儿账本（警告 16 / 退役 32，`static_assert` 锁定），孤儿饱和退役**归因到对端熔断器**（urma_resource.cpp:1270-1373, 146-149）。
-- **per-peer 公平性**：`MAX_INFLIGHT_JETTIES=8` 并发上限（坏对端的爆炸半径），bthread CV 有界等待；`MAX_RETIRED_JETTIES=8` 触发熔断，退避 1s→30s，HALF_OPEN 单探针，代际围栏防旧代关闭半开熔断（urma_resource.h:1021-1043）。
-- **RPC 级 lane 共享**：worker↔worker BatchGet 整个 RPC 只取**一次** lane，所有子请求经 `UrmaWritePayloadWithLane`/`UrmaGatherWriteWithLane` 复用，RAII 保证 seal 恰好一次（worker_worker_oc_service_impl.cpp:1183-1252）。对象级失败不退役共享 lane。
+| 路由层次 | yuanrong 现状 | Mooncake 现状 | 实际优化点 |
+|----------|---------------|---------------|------------|
+| 设备发现 | 候选设备顺序尝试初始化，成功后使用一个活动设备 | 每 HCA 独立 context，可跨设备切片 | 保留多 HCA；补明确的本地/远端设备候选对 |
+| 可用性过滤 | 已确认端口状态、peer incarnation、动作相关准入 | 拓扑/亲和、inactive、重试已有，但强制恢复削弱隔离 | 先过滤健康和注册兼容性，再比较性能 |
+| 负载分配 | 源 chip 的在途 WR 与亲和反馈；物理端口分担交给 bonding | classic 主要随机/轮转；其他路径已有策略基础 | 用每 HCA 在途字节、完成带宽和排队时间评分 |
+| 故障切换 | WorkerRouter 区分 GET/SET；部分 GET 提示可影响选路，SET 排除更严格 | classic redispatch 存在，但不能等同跨本地 HCA 无缝切换 | 分开处理换路径、换副本和换协议，逐一校验语义 |
 
-### 2.3 多网口负载均衡
+yuanrong 的 chip 选择主要解决单活动设备内的负载分配；Mooncake 还需保证多 HCA 之间的注册兼容性与端到端可达性。
 
-- **chip 级 inflight 反馈选择**：`alignas(64) SrcChipInflightCounter`（每 chip 独立缓存行，完成线程并发更新），策略 = 轮转候选 → 若 `|chip1 − chip2| inflight 差 > 15` 则选空闲 chip → 否则在 WR 预算内保持内存亲和（urma_manager.cpp:1474-1551）。
-- **选择粒度可配**：`ub_numa_rr_type`（0=关 / 1=每逻辑写 / 2=每 post）；gather write 按 SGE 主导 chip 选择（SelectDominantGatherSrcChipId）。
-- **内存侧配合**：客户端 256MB（最大 2GB）传输池分 4 个 arena，页对齐 + chip 交错轮转 NUMA 绑定（`mbind` 1GB 粒度 + 逐页 touch）。
-- **局限**：仅覆盖 chip 1-2；多设备并发缺席；端口级分担交给 bonding 驱动。
+建议候选键为 `(local_device, remote_device, peer_incarnation)`，候选还必须满足内存注册域、访问权限和拓扑可达性。跨 HCA 重试时，不能沿用属于旧设备的 remote key/连接资源。
 
-### 2.4 网络拓扑与路由
+### 2.4 读重试与缓冲回收设计
 
-- **握手经 RPC**：`ExchangeUrmaConnectInfo`（非带内），支持委托上下文 blob（`rjettyBuf`/`seg_ctx`）新旧两种导入路径；连接键 = worker `host:port` 或 client `clientId`（地址回退）。
-- **incarnation 全链路围栏**：哈希环 → 准入快照 → 健康注册表 → 连接实例检查全部按 incarnation 隔离；请求可携带远端 `uniqueInstanceId`，不匹配返回 `K_URMA_NEED_CONNECT`（urma_manager.cpp:3397-3405）。
-- **传输顾问**：同 host worker → SHM（fd 传递零拷贝）；URMA 可用 → UB；否则 TCP。SHM 候选取自路由拓扑而非本地探测（transport_advisor.cpp:28-44）。
-- **读路径重建选举**：UB 面缺失时单 rebuilder 选举 + 1000ms 冷却，非选举者内联降级 TCP（data_plane_manager.cpp:1058-1156）。
-- **预热**：客户端进程内预热（20×256KB + 80×1B，16 路，500ms 预算）+ k8s 部署后 worker↔worker 定向预热 playbook（64 worker = 4032 个有向 Remote Get，验证每个方向而非假设对称）。注意：playbook 引用的 `scripts/operations/urma_warmup.py` 脚本在其仓库中并不存在（playbook 领先于代码，属待完成项）。
+- **模糊读取不立即二次拉取**：`ObjectMetadataClient::ApplyResult` 对 QueryAndGet 的 URMA 超时/错误保留错误，避免旧 provider WRITE 尚未收敛又发第二次请求。
+- **安全缓冲提前归还**：`ShmSendBufferOwner::Release` 在 UB 已有终态且非 holding 时，先释放本地生命周期句柄，再异步执行 DecreaseReference；模糊状态仍保留句柄。
+- **两个时间不能混淆**：“硬件不再访问缓冲”决定能否回池；“远端元数据引用清理完成”决定业务清理是否结束。可解耦安全路径，不能一律提前释放。
+- **适配 Mooncake**：换副本 READ 必须先收敛旧 DMA，或使用不重叠的新接收缓冲并保留旧缓冲隔离；WRITE 模糊完成交给 Store 的事务/版本裁决。TE 不应自行盲重放。
 
 ---
 
-## 3. yuanrong 元数据层负载均衡与可靠性
+## 3. 元数据可靠性与扩缩容对比
 
-### 3.1 架构
+### 3.1 现有架构：复用 CVM，不另建控制面
 
-- **worker 嵌入式 master**：元数据按一致性哈希分片到所有 worker（`enable_distributed_master=true` 默认）；错路由返回带 `topology_version` 的重定向，客户端 16 跳预算 + 环检测 + 单调版本强制（metadata_redirect_helper.h:130-153）。
-- **协调后端三选一**：外部 etcd / worker 内嵌 metastore / 独立 Coordinator（braft Raft，心跳 100ms、选举 1000ms）。
-- **对象元数据**：64 路进程内分片（tbb concurrent_hash_map + bthread RWLock）；持久化 = 本地 RocksDB（k8s hostPath 跨 pod 重启存活）+ 可选 etcd（MurmurHash 前缀分表）+ L2（OBS/SFS）。
+yuanrong 的分布式元数据、拓扑快照、拓扑批次与任务执行围栏值得借鉴，但 Mooncake 已有相应构件：
 
-### 3.2 负载均衡能力（Mooncake 缺失部分）
+- HA supervisor、OpLog、快照和 standby 恢复。
+- CVM 的 16384 个 slot、动态 SubMaster 归属、slot owner 记录和跨 Master RPC。
+- Copy/MoveTask、Drain 的 DRAINING/DRAINED 状态及副本保护。
+- io_pattern 的报告驱动分析/执行，可作为性能与分层策略输入。
 
-1. **均衡哈希环**：每 member 4 token；新成员 token 取"当前最重成员最大弧的理想份额前缀"（balanced_ring.h:56-88），超 8000 token 退化纯哈希。
-2. **扩缩容规划**：`PlanScaleOut/ScaleIn/Failure` 产出 owner 变更区间；合批窗口 scale_in 3000ms / scale_out 5000ms。
-3. **数据迁移**：速率限制 40MB/s/节点；目标选择 4 级退化梯子（空闲率 ≥50% → ≥20% → 任意非离开节点 → 无条件），保证缩容必然完成（scale_down_node_selector.h:31-57）；迁移幂等（businessOperationId）+ deadline + 可取消。
-4. **内存再平衡**（master 调度）：源 ≥80%、差 ≥20%、每批 300MB、30s epoch 预算（批间获取新目标内存反馈）、per-worker/对 60s 冷却、**拓扑围栏**（任何拓扑批活动期间暂停，拓扑版本稳定且全员新报告后恢复）。
-5. **热度再平衡**：迁移最低热度主副本离开过载 worker；源路径 A) 使用>60% 且有主副本 B) 使用>50% 且热主副本>40%；热度指数衰减（主副本半衰期 600s）。
-6. **驱逐策略集群滚动**：PRECHECK/COMMIT 两阶段 + epoch 持久化，混合策略集群暂停再平衡。
+需要区分三类动作：**slot 迁移搬元数据所有权；Drain 搬数据副本；热度/容量调度决定是否搬、搬多少。** SubMaster 扩容不必默认搬走对象数据，数据节点扩容也不必重新发明 slot 协议。
 
-### 3.3 可靠性机制
+### 3.2 可复用的可靠性机制
 
-- **故障检测分层**：etcd lease 心跳 1s / membership TTL 60s / 死亡判定 300s；`TopologyFailureClassifier` 连续缺席单调计时（后端中断时暂停）；**witness probe**——确定性选主探测者 + 3 个见证 worker 投票 REACHABLE/UNREACHABLE，防分区误判。
-- **Split-brain 自杀围栏**：keepalive 失败 → 先问对端能否达 etcd（全员不行=集群级故障，不动作）；仅自己不行 → 确认后发伪 lease-DELETE 事件 + 备份自杀计时器；隔离超时且 `auto_del_dead_node` → **`raise(SIGKILL)` 自杀**（etcd_store.cpp:645-700）。硬围栏防止陈旧 worker 在哈希段已重分配后继续服务。
-- **worker 死亡恢复**：lease 过期 → 分类窗口 + witness → FAILURE 批 → 主副本重选（`ReselectPrimaryCopy`）+ 元数据位置清扫 + L2 slot 轮转接管（恢复者自身失败的未完成任务全局重排继承）。
-- **重启 vs 死亡区分**：重启事实携带 membership 代时间戳；`enable_reconciliation` 时 master 推元数据回重启 worker；网络恢复路径重放排队异步操作。
-- **版本/围栏体系**：对象 version（恢复合并时旧版本收 `CACHE_INVALID`）、TopologyState.version（重定向拒回滚）、batchEpoch（迁移围栏）、驱逐策略 epoch、Raft term。
+| 机制 | 现有机制 | Mooncake 适配方向 |
+|------|--------------|------------------|
+| 新元数据避开退出节点 | `LocateSurvivingInSnapshot` 对 LEAVING owner 尝试选择未来存活 owner；PRE_LEAVING 并非一律排除，已有对象仍按既有协议处理 | 缩容先关闭新分配；区分新建路由与存量交接，不直接整体切走流量 |
+| 迁移任务执行围栏 | `BuildExecutionFence` 绑定拓扑版本、batch epoch、执行者及源/目标身份，并再次校验 | slot/Drain 任务绑定 owner epoch、节点 incarnation，旧任务不得提交结果 |
+| 受限 JOINING 准入 | 仅在 lease 有效、无 rejoin、唯一未就绪原因是尚未进入已提交拓扑等条件下允许特定请求 | 分离进程存活、可恢复、可接迁移、可读写；不是启动即 Ready |
+| 重入后恢复接收迁移 | 退出/缩容/在途等条件满足后，显式重开 incoming migration admission | 新 incarnation 重置旧关闭状态，先对账再接任务 |
+| 限速等待可取消、有预算 | DataLimiter 与迁移调用方支持取消/等待预算，处理缩容时速率下降 | 低带宽时可暂停/超时返回，不能永久占住任务或强删源 |
+| 拓扑读取与故障合批 | 未变权威快照可复用；故障重规划有合批窗口；所有选定 witness 已报告时可提前结束确认 | 减少重复解析/迁移抖动，但仍核查 lease、权威性与就绪状态 |
 
-**诚实的局限**：多数可靠性特性**代码默认关闭**（`enable_memory_rebalance=false`、`enable_reconciliation=false` 代码默认、`enable_lossless_data_exit_mode=false`）；内存数据无冗余（副本明说是性能非可靠性）；`distributed_disk` 恢复依赖 etcd 可用；新旧两代控制面（`master/` 遗留 + `cluster/` 新）共存于一个二进制。
+witness 故障确认结合探测结果与截止时间作出判断；未响应节点应保持未知状态，不能简单按多数投票或将沉默视为不可达。
 
----
+### 3.3 CVM 交接风险与整改要求
 
-## 4. yuanrong 数据传输层优化
+当前交接流程在错误传播、并发控制和恢复准入方面存在以下潜在风险，应优先整改并通过故障注入验证：
 
-### 4.1 内存管理
+| 当前实现 | 潜在影响 | 必要整改 |
+|----------|----------|----------|
+| heartbeat 的导入/导出回调丢弃 ErrorCode，SlotCallback 为 void | 导出失败仍可能释放 owner；导入失败仍可能发布 Stable | 回调必须返回状态，失败禁止推进并持久化重试进度 |
+| owner 认领使用“读后 Put”；删除使用“读 owner 后 Delete” | 读取和写删之间存在竞态窗口，检查不等于原子围栏 | 用 revision/owner/epoch 条件事务认领、交接与删除 |
+| 动态 resolver 先更新本地 owned slots，再做交接 | 期望归属和可服务归属可能不同步 | 分离 desired 与 serving，只有数据就绪和归属提交后才开放 |
+| Export 将整个 slot 写成单个 etcd value，随后删除本地元数据；无目标确认 | 大 slot 放大协调存储压力；导入未完成时源已退出；采集到删除之间的变更需保护 | 源保留至目标 ACK；固定导出水位并阻止/补齐并发修改 |
+| Import 无导出记录时返回成功，假设已通过 standby 恢复 | “没有导出记录”无法单独证明“恢复完成或确为空 slot” | 明确空 slot、新 slot 与故障恢复三种证明，恢复有水位门槛 |
 
-- **整池单注册**：256MB（最大 2GB）池**一次 mmap + 一次 `RegisterSegment`**，之后纯切偏移（`urma_register_whole_arena=true` 默认，urma_manager.cpp:500-533）。对比 Mooncake：注册粒度是 segment 级（每 NUMA 段一次），量级相当，但 yuanrong 把**客户端收发缓冲全部圈进预注册池**，这是其零拷贝路径的基础。
-- **池尺寸规范化**：池大小向上取整到 `pageSize × arenaNum` 的倍数，保证每 arena 整页（urma_manager.cpp:480-498）。
-- **NUMA 范围表**：arena 启动时每 1MB 采样一页 `SYS_move_pages` 构建 O(log n) 地址→NUMA 查询表（arena.cpp:1074-1139），传输时查源 chip 无系统调用。
-- **CUDA host 注册**：池初始化后 `RegisterCudaHostMemory` 钉住整池供 GPU 直达。
+CVM 已做批量认领/写入、低频重申等优化。整改应保留这些性能收益，但批量路径也必须满足同样的原子性和恢复门槛，不能以“批量等价”省去校验。
 
-### 4.2 批处理与流水线
+### 3.4 snapshot 与逐源副本保护必须保留
 
-- **MSet 流水线**：窗口 `min(32, 池大小)`，窗口内先全部非阻塞提交再统一等待——提交与完成重叠且不超订池（ub_transporter.cpp:919-954）。
-- **BatchGet 聚合 + 自适应分裂**：连续子请求打包进一个聚合缓冲（上限 32MB/1024 对象/16B 切片对齐）；**分配失败时记录 `allocationCeiling` 单向棘轮 + 平衡二分分裂**（选 `|左−右|` 最小的分割点，优先处理最大待处理区间），叶子级失败转 TCP 批量拉取（ub_transporter.cpp:362-461）。
-- **Gather write**：每 WR 13 个源 SGE（硬件上限），WR 链一次 `post_jetty_send_wr` 提交——最多 13×n 对象一次驱动态切换；`badWr` 指针匹配解析实际接受数只清理未接受事件（urma_manager.cpp:2964-3248）。
-- **平衡分块写**：`writeChunkCount = ceil(size/maxWriteSize)` 后按 `ceil(size/chunkCount)` 均分——8MB/5MB 上限 = 4+4 而非 5+3，每块延迟均匀（urma_manager.cpp:2433-2438）。
+当前 direct snapshot 的序列化字段、catalog 转 standby、standby 恢复、slot 导入并不完全同构：
 
-### 4.3 零拷贝
-
-- **Get 路径**：worker 直接 RDMA WRITE 进客户端预注册池缓冲，结果以 `externalData + externalOwner` 零拷贝返回（ub_transporter.cpp:661-664）。
-- **Create/Set 路径**：`ObjectBuffer` 直接映射到池内存（`info->pointer = handle->GetPointer()`），Set 成功后仅发**元数据 RPC**（空 payload）。
-- **模糊失败延迟释放**：RPC 状态不确定（可重试错误/`K_URMA_ERROR`）时，接收缓冲交给 `DelayedReleaseShmManager` **128ms 后才回池**——防止迟到 RDMA 写落进已回收缓冲（delayed_release_shm_manager.h:32-33）。这是 Mooncake staging 泄漏问题的同类场景下更完善的答案。
-
-### 4.4 完成路径
-
-- 单 poll 线程 + 单 JFC；批 8 CR/次、最多 10 次/唤醒、空转 `nanosleep(1µs)`（实测唤醒 ~50µs 并记入取证）；poll 线程 `sched_setattr` 运行时 1.4ms（CFS 基础切片一半）+ nice 可调。
-- **bthread CV 而非 std CV**：brpc M:N 调度下 std CV 会钉死底层 pthread；等待切片成 1s 段免疫墙钟跳变。
-- **分相延迟取证**：`UrmaWriteTrace` 记录 post/wait/poll_begin/sleep_start/sleep_end/poll_end/notify/awake/observed 九个时间戳；顺序等待上下文把首块唤醒延迟归因到后续块；慢日志附"建议检查项"字符串（urma_manager.cpp:93-99）。
-
-### 4.5 H2D/NPU 集成
-
-- `RemoteH2DManager`：RoCE（FFTS 上下文 16384 blob 上限分批）与 HCCS/HIXL（每 NPU 独立引擎、连接身份轮转分摊 p2p）双策略。
-- **Pipeline H2D**（`BUILD_PIPLN_H2D`）：**复用进程 URMA context/JFC/JFCE**，CQE 经共享 JFC poll 循环 `PiplnH2DRecvEventHook` 重定向给流水线；client-worker 间共享内存环形队列（容量 200）传递 chunk 元数据；URMA 网络写与设备侧拷贝流水化。
+- remount 在副本首次由不可读变可读时调用 `GrantLease`，但它只续已有 `soft_pin_timeout`。
+- standby 恢复和 slot 导入以 `false, false` 构造 soft/hard pin；catalog 转换还存在按 lease/soft-pin 过期过滤的逻辑，必须一并审查。
+- **整改要求**：恢复格式保留 hard-pin、soft-pin 启用语义及必要的版本/租约状态；snapshot 恢复后首次可读按既定 supercache 策略重授 soft-pin TTL，不能因旧时间已过期就默认取消该保护。
+- 区分正常 slot 平移与灾后恢复，避免每次平移无条件延长 TTL；首读重授应按恢复代际只执行一次，索引与指标同步重建。
+- 现有 SSD 下刷按源副本增加引用保护，应继续保留；迁移与下刷并发时逐源结算。取消任务需核实领取/完成状态，不得先释放仍被任务使用的源。
 
 ---
 
-## 5. Mooncake 当前分支能力现状（对照基线）
+## 4. URMA 性能优化：从已有能力出发
 
-**强项**（应保留）：
-- 多设备并发：每 HCA 独立 `UbContext` + 切片随机扇出（ub_transport.cpp:925-951；topology.cpp:786-807），重试时确定性轮转所有 NIC。
-- 拓扑发现：NUMA + PCI 距离 + JSON 覆盖 + `MC_NIC_PEER_AFFINITY` rail 对齐（topology.cpp:511-604）。
-- Master HA：围栏选举（warming 占位 `__mooncake_service_warming__`，etcd_leader_coordinator.cpp:27 → producer_view claim，master_service_supervisor.cpp:205-219 → lease TTL 预热）+ 校验和有序 OpLog + 分块快照 + supervisor 状态机（master_service_supervisor.cpp:239-640）。
-- SIEVE endpoint 缓存 + 延迟回收（有在途切片不释放，ub_context.cpp:40-167）；`failed_target_ids` 100ms 快速失败负缓存。
-- SSD 分层：tombstone GC + bucket 压实 + push 模式 owner 直写。
-- 副本运维基础：已有 `CreateCopyTask` / `CreateMoveTask`、动态副本 lease/version fence，以及人工 `CreateDrainJob`；Drain 会把源 segment 标记为 DRAINING，按并发度创建 MoveTask，并避开 hard-pin、未过期 lease、未完成副本和已有复制任务（master_service.cpp:13871-13910, 14075-14203）。
-- TENT 已有策略路由、QoS、指标和 UB 原生数据面测试；classic UB 也有 mock 支撑的 `ub_transport_test`，只是该测试未注册进 ctest（tests/CMakeLists.txt:310-317；tent/tests/CMakeLists.txt:532-538）。
-- 观测性：SpDiag PerfPoint + trace_id 全链路 + MC_LOG 异步环形日志。
+| 优化项 | yuanrong 可参考实现 | Mooncake 可执行方案 | 前置/边界 |
+|--------|--------------------|--------------------|-----------|
+| 缓冲复用效率 | 已确认安全的本地句柄不等待异步 DecRef | 将 DMA 安全完成与元数据清理拆开计时；先优化已完成请求的回池 | 模糊 WR 继续隔离，不能按固定延时证明安全 |
+| 小对象批处理 | gather WR 链、共享 lane、聚合失败后缩小分配上限并分裂批次 | 同设备、同 peer、同方向请求先聚合；逐步启用多 SGE 与有界提交窗口 | 查询实际 SGE 上限；正确处理 partial post/badWr |
+| 多 HCA 选路 | chip 在途反馈与 NUMA 亲和 | 健康过滤后，用在途字节/完成带宽估算等待，叠加 NUMA 成本 | 不照搬 WR 差值阈值；先补 native UB 指标 |
+| 资源公平性 | lane 池及 per-peer 配额 | 先做每 peer 的在途字节/WR 限额；连接创建确为瓶颈再做 per-context lane 池 | 不以全进程单池破坏 HCA 注册域隔离 |
+| 完成路径效率 | post/poll/notify/awake 等分相记录 | 在 SpDiag 上补排队、post→CQE、CQE→消费者时间；H2D 搬离 poll 线程 | 异步拷贝结束前保留 staging，不能提前标完成 |
+| NUMA/注册 | 预注册 arena、地址→NUMA 查询、可选亲和 | 复用现有注册与 staging 池，减少跨 NUMA 拷贝并检查碎片 | 基于现有 segment 注册机制优化，避免重复注册 |
 
-**弱项**（gap 所在）：
-- UB 故障处理：`DEV_FATAL/PORT_DOWN → set_active(false)+disconnectAll`，但 **monitor 线程每秒无条件 `set_active(true)`**（ub_context.cpp:622-624）击穿闩锁；32 次失败启发式用的是**生命周期累计计数器**（ub_context.h:84，且为非原子 `uint64_t`，多 worker 线程自增存在数据竞争），历史成功后永远不再触发；无熔断、无 TCP 降级、无恢复探测。
-- Jetty 模型粗糙：classic UB 默认 `num_jetty_per_ep=1`、每 context 仅 2 个共享 JFC、随机选 jetty、无池化无生命周期状态机、无 per-peer 公平性。这里的 `volatile int*` 仅存在于 classic UB；generic RDMA 已改用 `std::atomic<int>*`（urma_endpoint.h:205-207；rdma_endpoint.h:224）。
-- NIC 选择闭环不一致：classic 路径 `getNicLoadStats()` 恒空（transfer_engine.cpp:264-267）；TENT 路径会返回 `inflight_bytes` 与 `ewma_bandwidth_bps`（transfer_engine.cpp:803-818），但 TENT 需显式通过 `MC_USE_TENT` 启用，不能据此认为 classic UB 已有反馈选路。
-- 超时所有权不闭合：`MultiTransport` 检测到 slice 超时只对外返回 TIMEOUT，并未把 task 置 finished（multi_transport.cpp:274-308）；`freeBatchID` 又拒绝释放未完成 task（multi_transport.cpp:113-126）。这避免了立即 UAF，但 CQE 永不到达时 batch、slice、staging 可能永久占用。另有确定性缺陷：initial dispatch 与 redispatch 的若干直接 `markFailed()` 分支绕过 `onStagedSliceFinalFailure()`，导致 `completed_slices` 无法收敛（ub_context.cpp:242,261,269,280,530,539；ub_transport.cpp:366-392）。
-- WR 单 SGE（`num_sge=1`，jfs 能力 5）；staging 池 first-fit 无合并；poll 线程阻塞式 `cudaMemcpy`。
-- 元数据缺自动再平衡：已有人工 Drain Job 和动态副本，但没有按 segment 压力/热度自动生成迁移计划；当前 `drain_jobs_` 仅见进程内 map，未见 OpLog/快照持久化，HA 切主后的 job 重建需单独设计（master_service.h:2964-3007）。
+yuanrong 的 RemoteH2D/Pipeline H2D 可作为后续设备内存方向参考，但不进入首轮 URMA 改造的必选范围。
+
+**评估方法**：小对象看 ops/s、每对象 post 次数与 CPU；大对象看有效带宽、跨 NUMA 开销和尾延迟；故障场景看隔离资源峰值、受影响 peer 数和恢复时间。先通过性能剖析确认瓶颈，再分别调整池化、路由和 polling，避免多项改动相互干扰。
 
 ---
 
-## 6. Gap 对比矩阵
+## 5. Mooncake 当前能力与缺口归纳
 
-| # | 能力 | yuanrong | Mooncake | Gap |
-|---|------|----------|----------|-----|
-| 1 | 端口健康监测 | epoch 围栏快照 + 验证式准入 + 远端传播 | 无（1s 强制重激活） | **P0** |
-| 2 | 对端熔断器 | 8 退役触发、1s→30s 退避、HALF_OPEN 探针、代际围栏 | 无 | **P0** |
-| 3 | 类型化背压错误码 | `K_URMA_TRY_AGAIN` 等 5+ 专用码 | 通用失败 | **P0** |
-| 4 | 迟到完成对账 | 保留事件(5s/1024) + 孤儿记账(16/32) + 观察者分发 | batch busy 保活但无界；部分 staging 失败分支不收敛 | **P0** |
-| 5 | TCP 降级治理 | 进程级字节限流(10MB/1MB) + 整 RPC 钉住 | UB 内无 fallback | **P0** |
-| 6 | Jetty 生命周期 | PostGate 单字 CAS + FSM + fail-closed 隔离 | classic UB 为 volatile 深度表；generic RDMA 已原子化 | **P0** |
-| 7 | 负载感知选路 | chip inflight 差反馈 + 亲和策略 | classic 随机/轮转；TENT 有统计与策略框架 | **P1** |
-| 8 | Gather write | 13 SGE/WR + 链式提交 + badWr 解析 | 1 SGE | **P1** |
-| 9 | 批量聚合 | 32MB 聚合 + 自适应平衡分裂 | 固定 slice | **P1** |
-| 10 | 模糊失败缓冲延迟释放 | 128ms 延迟回池 | 无 | **P1** |
-| 11 | 流水线窗口提交 | MSet 32 深窗口 | watermark flush（较粗） | **P1** |
-| 12 | 元数据再平衡 | 内存/热度自动调度 + 限速 + 4 级退化梯子 | 人工 Drain + 动态副本，无自动压力/热度闭环 | **P1** |
-| 13 | 故障确认 witness | 3 见证投票防分区误判 | 无（lease 到期即判） | **P2** |
-| 14 | 分相延迟取证 | 9 时间戳 trace + 首块唤醒归因 | SpDiag（粒度较粗） | **P2** |
-| 15 | 预热 | 进程内 + k8s 定向预热 playbook | 无 | **P2** |
-| 16 | URMA mock + 故障注入 | 独立 mock 后端 + 数十个相关测试文件/数百用例 + 大量注入点 | 有 classic mock 冒烟测试和 TENT 原生 UB 测试；缺 P0 场景系统注入 | **P0 验收地基** |
-| 17 | 连接池耗尽语义 | 池化 + refill + `K_URMA_TRY_AGAIN` | jfc/jetty 深度截断提交 | **P1** |
-| 18 | 多设备并发 | 单设备 | 每 HCA context + 扇出 | **Mooncake 领先** |
-| 19 | Master HA | etcd lease + witness/自杀围栏，侧重分区自保护 | 围栏选举 + OpLog + 快照，侧重状态复制/恢复 | **模型互补；Mooncake 可补分区确认** |
-| 20 | 设备内存传输 | Pipeline H2D（复用 JFC） | CPU staging（有泄漏 bug） | **P1**（先修 bug） |
+### 5.1 应复用的基础
+
+- 多 HCA context、NUMA/PCI 拓扑、亲和与重试候选；不能为了复刻 yuanrong 退回单设备。
+- endpoint 缓存及在途回收保护，generic RDMA 原子记账，TENT/调度框架。
+- HA supervisor、OpLog、快照及 TaskManager 恢复机制，为扩缩容作业持久化提供基础。
+- CVM slot 分布、跨 Master 转发、批量 owner 写入；Drain、动态副本和 SSD 下刷保护。
+- io_pattern 报告与分层执行，以及 SpDiag/trace 基础。
+
+### 5.2 待完善能力
+
+1. **classic UB 故障恢复缺少确认闸门**：monitor 每秒重激活仍存在。
+2. **完成/退出路径不统一**：若干 worker 分支直接 `markFailed()`，未走 staging 最终失败钩子；transport 析构中 staging 注销/释放先于 context 清理，需结合在途线程验证并整改。
+3. **路由缺少完整设备对反馈**：classic 的 NIC 统计接口为空；“有重试”不等于“健康且注册兼容的跨 HCA 切换”。
+4. **CVM 交接不等于完整扩缩容协议**：错误传播、条件事务、恢复水位、目标 ACK 和 serving 门槛需补齐。
+5. **Drain job 与底层任务不是同一恢复单元**：已有 TaskManager 快照，但 `drain_jobs_` 的作业意图/进度持久化未在当前路径看到，切主恢复需专门设计。
+6. **控制面负载仍需治理**：slot 导出与 Drain 存在全量扫描路径，跨 Master 路由解析会读取注册信息；需先计数剖析，再做快照缓存、扫描预算和增量索引。
 
 ---
 
-## 7. 值得 Mooncake 借鉴的能力与补齐建议
+## 6. 建设清单、优先级与工作量
 
-### 7.1 先借鉴不变量，再借鉴实现
+P0 表示应在扩大生产灰度前解决的正确性问题，P1 表示可用性/性能建设，P2 表示后续收益项。工作量为**熟悉代码的单名 C++ 工程师人周估算，含单测与联调**，不含硬件等待、跨团队协议评审；各项有依赖和复用，不能简单相加作为交付日期。
 
-整改时应锁定以下五个跨系统不变量，它们比“池大小 200”“延迟 128ms”更重要：
+| 方向/特性 | 一句话说明 | 实际交付内容 | 优先级 | 预估 |
+|-----------|------------|--------------|--------|------|
+| TE 故障测试 | 用可重复故障验证传输安全边界 | partial post、迟到/丢失 CQE、flush 失败、退出竞态注入 | P0 | 1–2 人周 |
+| 完成与缓冲安全 | 超时能返回，硬件资源不被提前复用 | 统一终态、completion generation、隔离预算、退出顺序 | P0 | 3–5 人周 |
+| 健康与设备路由 | 确认故障后隔离，验证恢复后放行 | 健康快照、peer 围栏、退避探测、合法设备对筛选 | P0 | 2–4 人周 |
+| 安全切换与限流 | 安全换路换副本，限制重试放大 | 新缓冲 READ、模糊 WRITE 上抛、重试/TCP 字节预算 | P1 | 2–3 人周 |
+| 传输可观测性 | 分清设备拥塞、排队与完成延迟 | native UB 字节/带宽统计、分相 trace、隔离水位 | P1 | 1–2 人周 |
+| 批处理与反馈选路 | 减少小包提交，均衡多卡实际负载 | gather/窗口提交、分配失败分裂、选路 shadow→灰度 | P1 | 3–5 人周 |
+| lane 池与拷贝流水 | 按实测瓶颈提高资源复用效率 | per-context 池或异步 H2D，分别立项，不捆绑上线 | P2 | 各 2–4 人周 |
+| CVM 原子交接 | 元数据完整可用后才切换归属 | 状态返回、CAS/epoch、导出水位、目标 ACK、恢复重试 | P0 | 4–6 人周 |
+| 恢复保护一致性 | 恢复和迁移不丢 pin 与源副本保护 | 统一持久化字段、首次可读 TTL、逐源引用与兼容测试 | P0 | 2–3 人周 |
+| 可恢复扩缩容 | 扩缩容中断后可安全继续或暂停 | 持久化批次/Drain 意图、任务围栏、重启恢复与幂等 | P1 | 3–5 人周 |
+| 扩缩容准入与预算 | 有容量才接迁移，排空完成才退出 | readiness、rejoin、容量预留、限速/取消/阻塞原因 | P1 | 2–3 人周 |
+| 控制面减负与均衡 | 减少重复扫描，按新鲜负载小步迁移 | 路由快照缓存、扫描预算、io_pattern 联动 shadow planner | P1 | 2–4 人周 |
+| 故障确认增强 | 降低分区误判导致的迁移扰动 | 按故障域选择见证者、确认窗口、故障事件合批 | P2 | 2–3 人周 |
 
-1. **确认事实单调**：端口健康、peer incarnation、leader epoch、对象 version 都只能被更新的证据推进，pending/unknown 不得解除隔离。
-2. **完成事件有唯一所有者**：一个 WR 从准入到 CQE/flush/隔离必须恰好结算一次；业务超时不等于硬件已完成。
-3. **复用前证明不可再写**：slice、staging block、jetty、remote key 在可能有迟到 DMA/CQE 时不得复用；超过有界窗口仍无法证明时 fail-closed 隔离，而不是猜测成功。
-4. **故障域分层**：本地 device/port 健康、peer 可达性、单 endpoint/jetty 生命周期、局部资源背压是四类状态，不能让一次池耗尽污染整张网卡，也不能让一个坏 peer 拖垮所有 peer。
-5. **降级不改变写语义**：READ 可在 version/checksum 校验下换副本；one-sided WRITE 的超时结果可能是“未写、已写或部分写”，没有幂等 token/事务围栏时不得盲目 TCP 重放。
-
-建议先定义公共的类型化结果：`LOCAL_PORT_UNHEALTHY`、`PEER_UNREACHABLE`、`RESOURCE_BACKPRESSURE`、`AMBIGUOUS_COMPLETION`、`REMOTE_VERSION_STALE`。classic UB、generic RDMA、TENT 各自把 provider/CQE 映射到这些语义，Store 只消费公共结果，不依赖厂商 CQE 数字。
-
-### P0：传输层可靠性地基（建议最先做）
-
-#### G0. 先补故障注入与可重复测试
-
-- yuanrong 有独立 UDS/memfd mock、数十个 URMA/UB 相关测试文件与数百个用例；Mooncake 并非“0 UT”：classic 有 `mock_urma.cpp` 和 `ub_transport_test.cpp` 的 2 个用例，TENT `ub_native_data_path_test.cpp` 还有 6 个用例。真实差距是 classic 测试未注册 ctest，且缺端口抖动、CQE 延迟/丢失、breaker、资源退役、shutdown-inflight 等系统故障注入。
-- 先扩展 mock，使其能脚本化返回 async event、post 部分接受、指定 CQE 状态、CQE 延迟/乱序/永久丢失、flush/delete 失败；随后所有 G1-G5 改动必须先有失败测试再实现。
-
-#### G1. 端口健康监测体系
-
-- **借鉴点**：`UbPortHealthMonitor` 的三要素——不可变快照 + epoch 围栏 + `verificationPending` 中间态。
-- **Mooncake 现状**：`doProcessContextEvents`（urma_endpoint.cpp:390-412）对 PORT_DOWN 只是置 inactive + 断连，monitor 每秒强制激活造成"激活→失败→再激活"振荡；`failed_nr_polls>32 && !success_nr_polls` 因累计计数器事实上一次性。
-- **补齐建议**：
-    1. 引入薄 `UrmaPortStatusProvider` 适配 `BONDP_USER_CTL_QUERY_PORT_STATUS`；Mooncake 的 `FindUrma.cmake` 已要求 `urma_api.h` 与 `urma_ubagg.h`，但目前只查找/链接 `liburma`，因此必须先做 **compile+link capability probe**，不能仅凭头文件存在宣称可用；
-    2. 移除 monitor 的无条件 `set_active(true)`，改为"端口健康确认后激活"；
-    3. 把 `success_nr_polls/failed_nr_polls` 改为窗口化（或时间戳化）计数，替代生命周期累计；
-    4. 分端口的 GOOD/BAD 进入 endpoint 选择：`selectDevice` 过滤已确认全坏的 device；部分坏口仍由 bonding 分担；
-    5. 以 `MC_UB_PORT_HEALTH_MODE=off|shadow|enforce` 灰度：shadow 只记录“若执行会过滤谁”，enforce 才改变路由。
-- **风险/工作量**：中等改动、高兼容风险。需在构建节点实际核对 UMDK 头/库/固件是否同时支持 opcode、输出结构和 `urma_user_ctl`；provider 不支持时必须回退事件模式并显式暴露 UNKNOWN，不能假健康。
-
-#### G2. 对端熔断器 + 类型化背压
-
-- **借鉴点**：`PeerState` 的"退役归因"（只有对端可归因的失败计数）+ 指数退避 + HALF_OPEN 单探针 + `PrepareReplacement` 继承预算。
-- **Mooncake 现状**：slice 重试 9 次后删 endpoint，下一个 slice 立即重建并重试——坏对端会持续消耗握手与重试资源。
-- **补齐建议**：
-    1. 在 `UbEndPoint` 或 context 层加 per-peer 熔断状态（OPEN/OPEN 时间戳/探针标志）；
-    2. `redispatch`（ub_context.cpp:516-579）查熔断状态，OPEN 期内直接失败（可配快速失败错误码），到 HALF_OPEN 放一个探针 slice；
-    3. 定义 `ERR_UB_PEER_BREAKER_OPEN`/`ERR_UB_BACKPRESSURE` 专用错误码，让 store 层能区分"该换副本了"和"该退避了"（Mooncake 已有 replica_selection，缺传输层信号）。
-
-#### G3. 迟到完成对账（顺带修 staging 泄漏）
-
-- **借鉴点**：保留超时事件（TTL 5s/上限 1024）+ 孤儿 WR 记账 + 迟到 CQE 观察者。
-- **Mooncake 现状**：其一，部分 staged slice 在 worker 失败路径直接 `markFailed()` 不经 `onStagedSliceFinalFailure()`，`completed_slices` 永不到位，形成确定性租约泄漏；其二，已 post 的 slice 超时后 batch 仍保持 busy 等 CQE，避免立即回收，但没有上界和孤儿收敛策略。
-- **补齐建议**：
-    1. **先修 bug**：所有 staged slice 失败路径统一走 `onStagedSliceFinalFailure()`；
-    2. 把 completion identity 从裸 `Slice* user_ctx` 升级为稳定的 completion record（至少包含 request/generation、资源引用和一次性结算位）；业务 task 可以先结束，record 在 CQE/flush/有界隔离后再销毁，避免缓存复用造成 ABA；
-    3. slice 超时/最终失败时若 WR 可能仍在途，转入有界 orphan 账本；poll 侧迟到完成按 generation 对账，超过条目/字节上限则退役 jetty/context，绝不能仅删除记录后复用资源；
-    4. 迟到 CQE 的 provider 状态由 adapter 映射为公共故障语义，再喂给 G1/G2；业务层不直接硬编码 CQE 4/9。
-
-#### G4. TCP 降级治理
-
-- **借鉴点**：进程级字节限流（在途 10MB/单载荷 1MB，CAS ticket RAII）+ worker 侧整 RPC 钉住降级（防每对象重试风暴）。
-- **Mooncake 现状**：UB transport 无 TCP fallback；MultiTransport 的协议选择是**静态 per-segment 属性**而非失败驱动。
-- **补齐建议**：
-    1. 在公共路由层加失败驱动的 per-peer 协议降级缓存（UB breaker OPEN → 临时 TCP，带 TTL 与单探针）；不能只改 `MultiTransport::selectTransport` 后静默重放；
-    2. 降级流量经字节限流器，防挤占 RPC/元数据通道（Mooncake 的元数据也走 TCP，更需要这个保护）；
-    3. READ：切换到其它可读副本优先于 TCP，同对象 version/checksum 校验通过后才发布；
-    4. WRITE：同步 post 失败（可证明未提交）可安全改道；已 post 后 TIMEOUT/未知 CQE 属 `AMBIGUOUS_COMPLETION`，必须交 Store 的 Put/复制事务按 version/token revoke 或重试，禁止传输层直接 TCP 重放；
-    5. store 批量操作采用“整批钉住一个降级决策 + 总字节预算”，避免每 slice 独立降级形成放大。
-
-#### G5. Jetty 生命周期 PostGate 化
-
-- **借鉴点**：单原子字打包 closing/retire/finale 标志 + activePosts 计数，准入与退役同一线性化点；删除经 `modify(ERROR) → FLUSH_ERR_DONE → 异步 delete`。
-- **Mooncake 现状**：classic UB 的 `wr_depth_list_` 是 `volatile int` 数组 + `__sync_fetch_and_add`；endpoint disconnect 时手动把残余深度回退到 `jfc_outstanding_`（urma_endpoint.cpp:1039-1049）——有对账意识，但依赖手工配对。generic RDMA 已原子化，不在此整改范围。
-- **补齐建议**：短期将 classic UB 深度改成 `std::atomic<int>`，并加入同一原子线性化点上的关闭/在途计数；中期才引入 per-context jetty lane 池 + PostGate（见 G7）。完成 identity（G3）必须先于资源池化，否则退役/复用会放大裸指针 ABA 风险。
-
-### P1：性能与公平性
-
-#### G6. 负载感知选路（把 tent 的思想带进 classic 或直接推进 tent）
-
-- Mooncake 已有可复用框架：TENT 暴露 `inflight_bytes` 与 `ewma_bandwidth_bps`，`TransportSelector` 支持配置化策略。**gap 是 classic UB 未接入该闭环，以及两条数据面没有统一的负载模型**。
-- 最小落地：在 classic UB 的 `Topology::selectDevice` 加 per-device **inflight bytes**（不是只看 WR 个数）与 EWMA 完成带宽，比较 `predicted_finish = inflight_bytes / ewma_bw`；yuanrong 的 “inflight WR 差 > 15” 仅可作为初始 shadow 对照，不应直接成为多 HCA 阈值。
-- 防止反馈振荡：健康过滤先于负载评分，保留低频 probe 防冷门 NIC 永久饿死；指标按 device/peer 分层，禁止一个坏 peer 的拥塞把整个本地 HCA 判坏。
-
-#### G7. Jetty 池化 + per-peer 公平性
-
-- 借鉴 `SendJettyPool` 的**有界容量、后台补充、退役余量和 per-peer 配额**，而不是复制 200/50ms/8 三个常量。
-- Mooncake 每 HCA 有独立 context，建议做 **per-context 池 + 全局/peer 双层配额**；lane 绑定 `(local_device, peer_nic, peer_incarnation, generation)`。若做全进程池，会破坏多设备亲和并放大单 context 故障。
-- 初始容量由 `并发 peer × 每 peer 上限 × 活跃 HCA` 压测反推，并设置退役 lane/孤儿 WR/被隔离字节的硬上限与降级策略。
-
-#### G8. 多 SGE gather + 聚合批处理
-
-- Mooncake jfs 配置 `max_sge=5`（urma_endpoint.cpp:790）未用满（现在 num_sge=1）。同 endpoint 的同方向连续小 slice 可合并为多 SGE WR 链，一次 post。
-- store 的 batch_get 多副本扇出（`TransferSubmitter::submit_batch`）是天然受益者。
-- 批量聚合（yuanrong 的 32MB 聚合缓冲 + 平衡二分自适应）对 Mooncake 的 `batch_get_into` 同样适用：分配失败时棘轮降上限 + 二分，而不是整批失败。
-
-#### G9. 模糊失败缓冲延迟释放
-
-- staging 池 `releaseStaging` 直接回 free list（ub_transport.cpp:235-239）。若 slice 曾提交且结果不确定，应进入 quarantine，防迟到网络写污染复用块。与 G3 配套。
-- **不能固定复制 128ms**。安全释放条件应是“该 generation 的所有 WR 已 CQE/flush 对账”，时间只是兜底。可定义 `deadline = max(last_post + max_completion_uncertainty, task_timeout)`，其中窗口由 URMA `err_timeout`、重试、poll 调度和实机故障注入 p99.999 推导。
-- quarantine 必须按**字节**设上限并暴露水位；压力过高时停止新 staging/触发受控降级，不能提前复用。超过 deadline 仍无法证明安全时退役相关 jetty/context，并在销毁/flush 确认后释放。
-
-#### G10. 元数据主动再平衡
-
-- Mooncake master 已有 `RankedAllocationStrategy`、动态副本、`CreateCopyTask` / `CreateMoveTask` 和人工 Drain Job，但**没有自动存量再平衡**。借鉴 yuanrong：周期读取 segment 容量/热度报告 → 生成候选 → 每批重新读取目标余量 → 用现有 MoveTask 执行 → 限速与冷却。
-- 自动调度不能只是给 Drain Job 加定时器。候选必须同时满足：租户 quota、hard-pin/soft-pin TTL、client liveness/offboarding、对象 lease、动态复制 lease/version、已有 replication task、目标故障域、内存/SSD tier、目标预留容量和对象当前可读副本数。
-- **逐源副本保护**：supercache-snapshot 已明确让每个 SSD 下刷队列记录独立的受保护 `OffloadingTask`，且只有所有镜像任务尚未被领取时才允许整体取消（master_service.h:2227-2239）。自动迁移也要为每个 source 独立保持保护，只有对应目标副本首次可读且 version 匹配后才能释放该 source，不能退化为任务级单一保护。恢复路径已有 `RefreshRecoveredSoftPin()`，会复用普通 soft-pin 索引/指标并重新计算 TTL（master_service.h:1492-1505；master_service.cpp:1408-1410），应继续保留。
-- 自动 job 必须可恢复：当前 `drain_jobs_` 只见进程内 map。调度意图要么进入 OpLog/快照并带 leader epoch，要么切主后可从 DRAINING segment + 未完成 MoveTask 幂等重建；重复调度以 `(tenant,key,source,target,object_version)` 去重。
-- 阈值 `源≥80%/差≥20%/40MB/s` 只作初始配置，不是硬编码。先 shadow 产出“拟迁移计划”，用实际容量、请求热度、SSD 下刷和动态副本流量标定。
-- **注意**：不搬哈希环或 witness 所绑定的分布式 master 模型，只搬“调度器 + 反馈 + 围栏 + 限速 + 可恢复意图”。
-
-#### G11. 设备内存传输路径重构
-
-- 先修 staging 三类风险：终态不收敛（G3）、析构时先注销/释放 staging 再清理 context/worker 的顺序（ub_transport.cpp:73-85；UrmaContext 析构到 `worker_pool_.reset()` 才 join，urma_endpoint.cpp:84-93）、poll 完成路径同步执行 H2D `cudaMemcpy`（ub_transport.cpp:336-363）。再评估 yuanrong 的 Pipeline H2D 思路：**复用现有 JFC/CQE 通道**做网络写与 H2D 的流水化，而不是独立池 + 全量屏障。
-
-### P2：工程化与可运维性
-
-#### G12. witness 故障确认
-
-- Mooncake master 判 worker 死亡靠心跳到期。借鉴 3 见证投票（Mooncake 的 worker 相互可见，master 可委托 3 个 worker 探测疑似死亡目标），防网络分区误驱逐。优先级低于 yuanrong（其分布式 master 误判代价更高），但大规模集群值得。
-
-#### G13. 分相延迟取证深化
-
-- SpDiag 已有 perf point 骨架。补 yuanrong 式的"唤醒链取证"：slice 完成的 poll→notify→worker 观察三段时间戳 + 首块唤醒归因，直接定位 `URMA_QUEUE_DEPTH`/调度抖动类问题。
-
-#### G14. 预热 playbook
-
-- k8s 部署后 worker↔worker 定向握手预热（Mooncake handshake ~RPC + jetty import，同样有首个请求慢问题）。可做成 master 触发的预热任务或 `mooncake_master` 侧工具。
+TE 故障测试作为后续传输改造的公共基础；CVM 交接与恢复保护的测试随功能同步建设。首阶段重点保障故障隔离、数据正确性和资源安全回收。
 
 ---
 
-## 8. 不建议照搬的部分
+## 7. 实际可行的整改方案
 
-| yuanrong 设计 | 原因 |
-|---------------|------|
-| 单设备单上下文（bonding_dev_0） | Mooncake 的每 HCA context + 切片扇出多网卡聚合是其 README 核心卖点，架构上更优 |
-| bthread 协程绑定 | Mooncake RPC 栈是 coro_rpc，引入 bthread 无必要；但"等待不钉线程"的思想在 coro_rpc 中已有等价物 |
-| 哈希环分布式 master | Mooncake 的集中式 master、OpLog/快照和副本任务模型不同；应补调度闭环，而不是替换元数据所有权模型 |
-| 40-bit request-id 的具体编码 | 位宽和布局不必复制，但 **generation/代际围栏本身必须保留**；仅靠裸 `Slice*` 与深度指针不足以防缓存复用 ABA |
-| 固定 128ms 延迟、池 200、per-peer 8、差值 15 | 都是 yuanrong 在特定硬件/负载下的参数；Mooncake 应由不变量、资源预算和压测推导 |
-| CQE 4/9 直接写进业务状态机 | 数值属于 provider ABI；adapter 应先翻译为公共故障语义，并为未知值 fail-safe |
-| 3 witness 直接用于所有故障 | yuanrong 的分布式 master 误判代价和 Mooncake 不同；只在跨故障域且 master 无法区分自身分区时启用 |
-| 事件模式（一次一 CR） | 吞吐受限，yuanrong 自己也默认关闭 |
+### 7.1 TE：优先最小安全闭环
+
+1. **统一结果与终态**：将本地设备不可用、peer 不可达、资源背压、模糊完成分开；所有失败路径进入同一终态收敛入口，完成记录恰好结算一次。
+2. **保留稳定完成身份**：WR 绑定 request/generation 与资源引用。业务超时可以返回，完成记录和内存必须等 CQE/flush/已确认的硬件清理后回收。
+3. **给隔离设置硬预算**：按条目、字节、最老年龄计量；达到上限停止新准入或受控降级。超时不代表硬件访问已经结束，不能为了满足预算提前复用。
+4. **健康先 shadow 后执行**：影子模式记录“会过滤哪条路径”；确认 ABI 与行为后启用隔离。恢复通过有界探测，pending/旧 epoch 不解封。
+5. **切换分层**：未 post 可尝试同对象合法路径；READ 需解决旧缓冲写入风险；WRITE 模糊完成上抛 Store。跨协议需要远端能力/注册支持，不能只改协议选择器。
+6. **最后优化性能**：先补齐传输负载与分阶段延迟指标，再选择 gather、负载选路或池化；每次只灰度一个主要变量。
+
+建议复用现有调度器的取消/预算入口，但必须补测 classic 旧路径与调度路径；“取消成功”不能自动推导为“URMA 不会再访问内存”。
+
+### 7.2 Master：先完成可靠交接，再做自动化
+
+| 方案 | 改动与效果 | 推荐 |
+|------|------------|------|
+| A. 仅修回调返回与重试 | 可防止显式导入失败后继续推进，但不解决竞争认领、并发修改和切主重放 | 适合首阶段安全加固，仍需补齐完整交接协议 |
+| B. 在 CVM 上补事务化交接 | 保留 slot/HA/任务架构，补 epoch、条件事务、导出水位、ACK 与恢复 | **推荐主方案**；先允许单批受控交接 |
+| C. 移植 yuanrong 整套拓扑控制面 | 需重做 Mooncake 元数据、HA、分层及副本任务的适配 | 不建议，范围和兼容风险过大 |
+
+方案 B 的最小协议：
+
+- **准备**：持久化 `(job_id, slot, source, target, source_epoch, target_incarnation)`；校验双方 lease、目标容量/就绪与正在进行的任务。
+- **固定数据边界**：首版对正在迁移的 slot 短暂关闭修改准入，等待在途元数据变更收敛，再导出一致水位；其他 slot 正常服务。后续有必要再增加增量日志追赶，不首发双写。
+- **传输与校验**：小导出可走有大小上限的现有路径；大导出复用分块快照存储，etcd 仅存 manifest/校验和/状态。目标幂等导入，并将导入结果/水位持久化为可回放状态后才 ACK；源仍保留恢复数据。
+- **提交**：目标 ACK 后，以 owner revision/epoch 条件事务切换归属；serving 集合以已提交且就绪的状态为准，转发/重定向遵守同一版本。
+- **清理与故障**：提交后才清理源内存元数据；导出文件/manifest 至少保留至新 owner 的 HA 恢复链覆盖交接水位。重启按持久化状态续做，ACK 前失败保留源，提交后只允许新 epoch 服务；旧 leader 恢复不得重新宣告自己可写。
+- **恢复接管**：原 owner 已死亡时走 standby/OpLog/快照恢复水位校验，不能依赖“导出 key 不存在”就完成认领。
+
+同一 slot 内的 Put/Delete、GC、pin、复制任务结果与下刷状态更新都属于需围栏的修改，不能只挡客户端 Put。首版允许迁移 slot 返回可重试状态，换取协议简单和数据边界清楚。
+
+### 7.3 扩缩容作业：复用任务，不只加定时器
+
+- **意图持久化**：拓扑批次及 owner epoch 归 CVM 的协调记录；Drain/Move 作业沿现有 OpLog/快照体系扩展，并用 job_id 关联。每类状态只有一个权威来源，不做两份互相覆盖的作业状态。
+- **幂等执行**：任务关联对象版本、源/目标身份及 epoch；执行前和提交结果时复核。旧结果只能回收自己的临时资源，不能修改新 owner 元数据。
+- **目标准入**：接收前预留容量，排除 DRAINING/失联/不满足故障域的节点；报告过期则暂停决策，不把旧空闲量当可用容量。
+- **受控排空**：先停止新分配，再推进存量迁移；目标副本经校验并可读后才释放对应源保护。hard-pin、有效 lease、下刷占用等应显示明确 BLOCKED 原因。
+- **带宽预算**：与 SSD 下刷、动态副本共享总预算，并保留业务流量余量；限速等待可取消、有 deadline，暂停不能删除最后可读副本。
+- **重入恢复**：节点新 incarnation 完成任务/资源对账后重开迁入准入，旧任务和旧关闭状态不能污染新实例。
+
+### 7.4 Master 负载治理：先降控制开销，再做热点重排
+
+1. 将路由读取接入带 revision 的不可变权威快照；watch 断流/压缩后重同步，lease 和新鲜度失效时不得继续用旧缓存提交所有权。
+2. slot 导出按批次一次扫描归桶，Drain 分页扫描并设置 CPU/锁持有预算；量化收益后再引入长期 slot→key 索引。
+3. 复用 io_pattern 的热度和容量报告，先输出 shadow 计划及过滤原因；不要另建一套热度采集器。
+4. 区分元数据对象数、RPC QPS、CPU/锁等待与数据容量。哈希均匀不等于 Master 负载均匀；短期先调迁移批次和并发，热点 slot 重排作为后续独立特性。
+5. 拓扑变更期间暂停自主均衡，批次结束且报告刷新后再恢复，防扩缩容和热度调度互相搬动同一对象。
 
 ---
 
-## 9. 面向 supercache 的目标设计
+## 8. 技术选型与适配原则
 
-### 9.1 传输可靠性控制闭环
+| 设计选项 | 处理原则 |
+|---------------|----------|
+| 单活动设备、单进程大池 | Mooncake 保留多 HCA；注册域和故障域决定池归属 |
+| 固定 128ms、池 200、WR 差 15 等 | 只参考机制；参数按硬件、并发与业务尾延迟标定 |
+| CQE 数字直接驱动业务隔离 | provider 适配器先分类，区分端口故障、拥塞与本地资源不足 |
+| bthread/整套 worker 嵌入式 Master | 不因借鉴可靠性机制更换运行时或控制面架构 |
+| 无条件放松目标选择约束 | 无目标就阻塞，不能靠删除最后副本“完成缩容” |
+| witness 代替 lease/写围栏 | witness 减少误判；它不能授予所有权或证明旧主已停止写入 |
+| 定时恢复或定时释放 | 时间只触发探测/升级清理，不证明端口健康或 DMA 已结束 |
 
-建议形成如下单向状态传播，禁止下层错误被字符串化后丢失：
+---
 
-```
-URMA provider / async event / CQE
-        │  adapter：ABI 解码、device/peer 归因
-        ▼
-HealthSnapshot(device, epoch, pending) ──► DeviceAdmission
-        │                                      │
-        └──────── peer evidence ───────────────┤
-                                               ▼
-                                  PeerBreaker(peer, incarnation)
-                                               │
-                     ┌─────────────────────────┼────────────────────┐
-                     ▼                         ▼                    ▼
-                  RETRY_LOCAL             RETRY_REPLICA      FALLBACK_TCP
-                     │                         │                    │
-                     └──────────── typed result + budget ──────────┘
-                                               ▼
-                                  CompletionLedger(generation)
-                                               ▼
-                               CQE/flush 对账后释放 slice/staging/lane
+## 9. 面向 supercache 的目标流程
+
+### 9.1 TE 的两条闭环必须分开
+
+```text
+故障检测 → 设备/peer 准入 → 合法路径筛选 → 有预算的重试/副本切换
+                      ↑                    ↓
+                  新代探测确认 ← 故障/成功反馈
+
+post → 稳定完成记录 → CQE / flush / 硬件清理确认 → 释放缓冲与 lane
+           └─ 业务超时先返回，硬件未收敛的资源仍隔离
 ```
 
-关键数据结构建议：
+选路恢复不自动释放旧 WR，业务重试成功也不自动证明旧缓冲安全。
 
-- `DeviceHealthSnapshot`：`device_id, ports, health_epoch, verification_pending, observed_at, provider_status`；只发布不可变快照。
-- `PeerAdmissionKey`：`peer_segment + peer_nic + incarnation`，避免 peer 重启后旧 breaker/健康事实污染新实例。
-- `CompletionRecord`：`request_id, generation, operation, posted_at, resource_refs, terminal_once`；URMA `user_ctx` 指向 record，不再直接指向可复用 Slice。
-- `QuarantineLedger`：同时限制 orphan **条目数与字节数**；记录何时因 CQE、flush、context destroy 收敛。
-- `FallbackBudget`：按进程、peer、tenant 三层记账，控制降级对元数据 RPC 与其它租户的干扰。
+### 9.2 Master 扩缩容分为两种作业
 
-### 9.2 supercache 元数据再平衡闭环
+| 操作 | 必须经过的步骤 | 完成标准 |
+|------|----------------|----------|
+| SubMaster 扩/缩容 | 登记成员 → 生成 slot 计划 → 源固定水位 → 目标导入 ACK → 原子切归属 → 清理源 | 迁移 slot 在已提交 owner 上可服务；旧 epoch 被拒；作业可恢复 |
+| 数据节点扩容 | 注册 segment → 容量/健康就绪 → 接收新分配 → 按需小批均衡 | 不要求先迁移全部存量；业务与迁移预算满足 |
+| 数据节点缩容 | 停止新分配 → 逐源迁移/校验 → 排空并核对未完成任务 → 退出 | 无受保护/唯一可读数据遗留；阻塞项为零或得到明确人工处理 |
 
-```
-segment 容量/热度/SSD 压力报告
-        ▼
-shadow planner（只产计划、不执行）
-        ▼  通过 quota/pin/lease/version/故障域/可读副本过滤
-durable rebalance intent + leader epoch
-        ▼
-CreateMoveTask(source replica -> target)
-        ▼
-目标副本首次可读且 version 匹配
-        ▼
-按 source 释放保护；必要时重新授予 snapshot soft-pin TTL
-        ▼
-下一批读取新容量反馈，执行限速/冷却/暂停
-```
+进程同时承担 SubMaster 和数据节点角色时，两种作业分别满足完成条件后才能退出；只完成 slot 交接不足以证明数据可删。
 
-这里必须增加三个 yuanrong 原设计之外、但 supercache 必需的约束：
+### 9.3 最小观测集
 
-1. **存储层级感知**：memory、SSD、远端恢复不是等价目标，planner 要分别计算容量和迁移成本；SSD 下刷与 rebalance 共用带宽预算。
-2. **逐源副本状态**：一个对象可同时迁移多个 source，每个 source 独立保护、完成和撤销，不能用任务级单一布尔值代表全部源。
-3. **HA 可重建**：leader 切换后同一意图必须幂等继续或安全撤销；新 leader 不能因 job map 丢失而留下永久 DRAINING segment 或永久 soft-pin。
-
-### 9.3 可观测性最小集合
-
-| 类别 | 必须暴露的指标/事件 |
-|------|--------------------|
-| 端口健康 | 每 device 的 epoch、GOOD/BAD/UNKNOWN 数、pending 时长、状态转换原因、provider 查询失败 |
-| 熔断/降级 | breaker open/half-open/close、按原因计数、fallback bytes、限流/拒绝 bytes、探针结果 |
-| 完成生命周期 | outstanding WR、late CQE、orphan WR/bytes、quarantine bytes/age、generation mismatch、强制退役 |
-| lane/设备负载 | lane pool 可用/在途/退役、per-peer 配额等待、per-device inflight bytes、EWMA 带宽与预测完成时间 |
-| 再平衡 | shadow 候选/过滤原因、迁移 bytes、限速等待、重试/撤销、逐源保护数、leader 恢复重建数 |
-
-日志需携带统一关联键：`trace_id + request_id/generation + peer_incarnation + device + jetty/lane + tenant/key hash + object_version`，否则跨层对账仍只能靠时间猜测。
+- TE：设备健康 epoch、peer incarnation、在途/隔离字节、late CQE、配额等待、降级流量、分相延迟。
+- Master：期望/已提交/可服务 slot 数、交接阶段与年龄、ACK 水位、CAS 冲突、旧 epoch 拒绝、snapshot/standby 恢复水位。
+- 作业：待迁移字节、目标预留容量、阻塞原因、逐源保护数、限速等待、重启后恢复/重复任务数。
+- 性能：路由后端读次数、etcd 写字节、扫描对象数/耗时、shard 锁等待、迁移对业务 p99 的影响。
 
 ---
 
-## 10. 落地路线建议
+## 10. 分阶段建设计划
 
-```
-阶段 0：建立可证伪基线
- ├─ G0  classic UB 测试注册 ctest；扩展 mock 故障脚本
- ├─ 记录现网端口事件、CQE、超时、staging 水位和设备负载基线
- └─ 构建节点执行 UMDK port-status compile/link/runtime capability probe
+| 阶段 | TE 交付 | Master 交付 | 放行条件 |
+|------|---------|-------------|----------|
+| 0：建立基线 | 补稳定 mock 故障用例，核查 URMA ABI；记录吞吐/延迟/资源水位 | 故障注入复现 slot 导入失败、竞争认领、pin 丢失与切主中断 | 能重复观察问题，不以日志推断代替测试 |
+| 1：P0 安全加固 | 统一 staging 失败、退出顺序、完成身份；移除盲目恢复 | 错误必须阻断交接；修 pin 格式与恢复语义；上线扩缩容先限制为受控操作 | 数据正确性与资源不提前复用 |
+| 2：可靠性闭环 | completion/隔离预算、健康探测、合法路径过滤 | CAS/epoch、水位/ACK、作业持久化和重启恢复 | 关键状态逐点 kill/restart 不越权、不误删 |
+| 3：受控放量 | 安全切换与限流，native UB 观测，逐项性能灰度 | readiness、容量/带宽预算，单批小比例扩缩容 | 故障影响范围与业务尾延迟符合约定 SLO |
+| 4：优化与自动化 | gather/反馈选路；按实测瓶颈优化 lane 池/H2D | io_pattern 联动均衡、控制面减负；按需 witness | shadow 计划可解释，自动动作可暂停与恢复 |
 
-阶段 1：修复确定性正确性缺陷
- ├─ G3a 统一 staged slice 终态收敛；修正 shutdown/inflight teardown 顺序
- ├─ 引入公共类型化错误与 completion generation
- └─ 每项独立小 PR，先失败用例、后实现
-
-阶段 2：形成可靠性闭环
- ├─ G1  端口健康 shadow→enforce，移除 1s 无条件激活
- ├─ G2  per-peer breaker 与 probe
- ├─ G3b completion ledger/orphan 对账 + G9 quarantine
- └─ G4  语义安全的 replica/TCP 降级与三层预算
-
-阶段 3：公平性与性能
- ├─ G5+G7 per-context lane 池、PostGate、per-peer 配额
- ├─ G6  inflight-bytes/EWMA 反馈选路，评估推进 TENT 为默认
- └─ G8  多 SGE gather + 批量聚合自适应分裂
-
-阶段 4：supercache 自动再平衡
- ├─ G10 shadow planner 与过滤原因指标
- ├─ 持久化 intent、leader epoch、逐源副本保护与软 pin 语义
- └─ 小比例 enforce，验证 SSD/动态副本/客户 offboarding 并发场景
-```
-
-不要把多个阶段打进一个大 PR。推荐的依赖顺序是：**测试注入 → 类型化错误 → completion identity/所有权 → 健康/熔断 → 降级 → 池化 → 性能 → 自动再平衡**。其中 G3 是 G5/G7/G9 的前置，G1/G2 是 G4 的前置，durable intent 是 G10 enforce 的前置。
+TE 与 Master 两条工作流可并行；各自内部先安全、后性能。classic UB 测试当前因稳定性问题未注册 ctest，应先拆出可靠 mock 用例并治理原用例，再启用 CI，不能直接解除注释视为完成测试建设。
 
 ---
 
-## 11. 验收矩阵（整改完成定义）
+## 11. 验收矩阵
 
-| 故障注入场景 | 必须保持的不变量 | 通过标准 |
-|--------------|------------------|----------|
-| 单端口 flap，GOOD/BAD 交替 | pending/旧 epoch 不解除隔离 | 无 1s 强制复活振荡；新 epoch 确认后才恢复 |
-| 本地全部端口 DOWN | 只隔离本地 device，不污染 peer | 新 UB post 被阻止；其它 HCA 继续；状态和原因可观测 |
-| 单 peer 宕机/重启 | 其它 peer 不受影响；旧 incarnation 事实无效 | breaker 有界打开；单 probe；重启后新代恢复 |
-| post 部分接受、CQE 乱序 | 每个 WR 恰好结算一次 | 深度、task、lane、staging 计数最终归零，无负数/双完成 |
-| TIMEOUT 后迟到 CQE | 业务终态与资源终态分离 | 调用方按期返回；late CQE 命中原 generation；复用内存不被污染 |
-| CQE 永久丢失 | 资源占用有上限 | 达上限后停止准入/退役 context；无无限 batch/staging 增长 |
-| shutdown 时有在途 WR | 注销内存晚于 poll/flush 收敛 | ASan/TSan 无 UAF；没有 CQE 访问已释放 staging/endpoint |
-| UB WRITE 模糊失败 | 不盲目重放 | 返回 `AMBIGUOUS_COMPLETION`，由对象事务 version/token 裁决 |
-| TCP fallback 风暴 | 降级不能饿死元数据和其它租户 | 进程/peer/tenant 预算生效；拒绝原因可观测；无 RPC 线程池耗尽 |
-| 自动 rebalance 与 hard/soft pin 并发 | pin/lease/version 不被绕过 | 被过滤对象不迁移；逐 source 保护恰好释放；切主后可重建 |
+| 场景 | 核心通过标准 |
+|------|--------------|
+| 端口抖动、查询失败、旧 epoch 回包 | 不定时强制解封；UNKNOWN/pending 不冒充健康；新事实才能恢复 |
+| 单 HCA 全坏、单 peer 重启 | 只影响对应故障域；合法其他路径继续；旧 incarnation 无效 |
+| partial post、CQE 乱序/迟到/丢失 | 每 WR 恰好结算；业务可超时返回；资源隔离有上限且不提前复用 |
+| 在途 WR 下 shutdown、flush/delete 失败 | 内存注销晚于硬件访问终止；不能确认时保守隔离 |
+| UB Get 超时后换副本 | 旧 DMA 不写入新请求正在使用的缓冲；最终内容/版本一致 |
+| 模糊 WRITE 与 TCP 降级风暴 | 不盲重放；重试/字节预算生效，不挤垮元数据 RPC |
+| slot 导出/导入失败或 ACK 后目标退出 | 不发布虚假 Stable；导入结果可回放；恢复链覆盖前不删交接文件 |
+| 两个 Master 同时认领，旧主迟到删除 | 条件事务只允许一个当前 owner；旧写删被拒 |
+| 导出期间 Put/Delete/GC/任务完成 | 水位前状态完整，水位后修改被阻止或追赶；无漏项、复活删除对象 |
+| 无 export key 的故障接管 | 必须证明空 slot 或恢复水位达标，不能直接对外可写 |
+| snapshot→standby→remount、slot 平移 | hard-pin 不丢；恢复首读 soft-pin 按策略重授；普通平移不无限续期 |
+| 扩缩容中切主、数据节点重入 | job/任务恢复去重；旧任务拒绝；新实例迁入准入正确恢复 |
+| 容量不足、hard-pin、限速降零、任务取消 | 有明确 BLOCKED/PAUSED 状态；不永久卡住线程，不删除最后可读副本 |
+| 均衡与 SSD 下刷/动态副本并发 | 逐源保护独立结算；容量与带宽预算不超订 |
 
-除正确性外，还要建立性能守门：无故障时 classic UB 吞吐/CPU 回退不超过约定预算；故障时恢复时间、fallback 峰值、quarantine 峰值和受影响 peer 范围必须有 SLO。具体数值应由阶段 0 基线决定，不在分析文档中拍定。
+测试建设可借鉴 yuanrong 对健康验证、Jetty 准入、错误分类、元数据路由、拓扑控制、worker 准入与限速的场景覆盖；Mooncake 需结合自身多 HCA、CVM 和分层副本模型补齐回归测试。
 
----
-
-## 12. 实施前必须人工裁决/实机验证的决策门
-
-1. **UMDK ABI**：远程构建环境的 `urma_api.h`、`urma_ubagg.h`、`liburma` 是否同版本，是否定义并实现 `BONDP_USER_CTL_QUERY_PORT_STATUS`；输出结构在当前固件上是否一致。
-2. **主数据面方向**：supercache 未来 1-2 个版本继续以 classic UB 为主，还是把 TENT 升为默认；该决定影响 G5-G8 应落在哪条路径。
-3. **WRITE 降级协议**：Store 是否已有足够的 object version / lease / transaction token 来裁决模糊完成；若没有，G4 只能先支持 READ 降级和“可证明未 post”的 WRITE。
-4. **HA job 语义**：rebalance intent 写入 OpLog/快照，还是由 segment/task 状态重建；必须选一种作为唯一真相源。
-5. **参数标定**：completion uncertainty、orphan/quarantine 上限、breaker 退避、lane 配额和迁移速率均需在 `work@mooncake-dev` 实机故障注入后确定。
+性能对比使用相同对象大小、并发、NUMA、HCA 数、注册方式与故障脚本；必须同时报告吞吐、CPU、p99 和资源峰值，不能仅比较正常态带宽。
 
 ---
 
-## 附录 A：yuanrong 关键网络参数速查
+## 12. 实施前置条件与待定事项
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `urma_send_jetty_lane_pool_size` | 200 | send jetty 池目标 |
-| `urma_send_jetty_lane_refill_extra_size` | 200 | 退役余量上限 |
-| `urma_max_write_size_mb` | 4 | 单写分块上限（平衡分裂） |
-| `urma_poll_size` | 8 | 每次 poll CR 数（设备上限 16） |
-| `urma_event_mode` | false | 事件 vs 轮询模式 |
-| `enable_transport_fallback` | true | UB→TCP 降级总开关 |
-| `urma_failover_success_rate_ratio` | 0.5 | worker 切换成功率阈值 |
-| `ub_numa_inflight_wr_diff_threshold` | 15 | chip inflight 差反馈阈值 |
-| `ub_transport_arena_num` | 4 | 客户端传输池 arena 数 |
-| `urma_register_whole_arena` | true | 整池单注册 |
-| 硬编码：`MAX_INFLIGHT_JETTIES` / `MAX_RETIRED_JETTIES` | 8/8 | per-peer 上限/熔断阈值 |
-| 硬编码：孤儿 WR 告警/退役 | 16/32 | 超时 lane 对账 |
-| 硬编码：保留事件 TTL/上限 | 5s/1024 | 迟到完成窗口 |
-| 硬编码：TCP 限流在途/单载荷 | 10MB/1MB | 降级治理 |
-| 硬编码：端口健康轮询 | 1s | 仅 pending 或有坏口时查询 |
-
-## 附录 B：Mooncake 当前 UB 关键参数速查
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `MC_URMA_TRANS_MODE` | RM | RM/RC/UM |
-| `MC_URMA_BONDING_MULTIPATH_ENABLE` | false | bondp BALANCE/IODIE |
-| `MC_UB_NUMA_AFFINITY_ENABLE` | false | per-WR chip 固定 |
-| `MC_UB_TRANSPORT_CPU_STAGING` | true | GPU 缓冲 CPU 中转 |
-| `MC_UB_STAGING_POOL_SIZE` | 1GiB | staging 池 |
-| `MC_RETRY_CNT` | 9 | slice 重试 |
-| `MC_MAX_WR` | 256 | 批提交上限 |
-| `num_jetty_per_ep` | 1 | 每 endpoint jetty 数 |
-| JFC 数/context | 2 | 共享完成队列 |
-| `MC_HANDSHAKE_WORKER_THREADS` | 16 | 握手监听线程 |
-| `max_ep_per_ctx` | 65536 | SIEVE endpoint 上限 |
+1. **硬件能力**：构建环境的头文件、liburma、驱动/固件是否匹配；端口查询及 flush/destroy 的保证需 compile/link/runtime 分层验证。
+2. **数据面归属**：P0 回补正在使用的 classic UB；批处理、反馈选路及资源池优化落到 classic 还是 TENT，由当前部署与 native UB 验证结果决定。
+3. **交接可用性目标**：推荐首版允许迁移 slot 短暂返回可重试状态；若要求完全不停写，必须另加增量追赶/水位协议并重新估算工作量。
+4. **保护语义**：保留 snapshot 首次可读重授 soft-pin、逐源下刷保护；历史格式缺字段时显式记录兼容策略，不能静默视为未启用 pin。
+5. **准入与阻塞策略**：缩容失败时默认暂停并保留数据；是否允许人工解除 pin 或降低副本约束，必须独立授权，不纳入自动退化。
+6. **验收与回滚**：提前确定性能回退预算、故障恢复 SLO 与灰度规模；新 owner/快照字段需兼容旧读者，存在活动交接时不能直接回滚为不识别该状态的版本。
 
 ---
 
-*分析生成于 2026-09-12，基于两仓库当日 HEAD。源码引用行号随分支演进可能漂移。*
+## 附录：配置与部署约束
+
+| 项目 | 当前默认值/状态 | 配置说明 |
+|------|-------------------|----------|
+| yuanrong `urma_send_jetty_lane_pool_size` | 200 | 池容量样本，不是 Mooncake 推荐值 |
+| yuanrong `urma_send_lane_count_per_peer` | 8，可配置 | 公平性预算而非不可变硬件常量 |
+| yuanrong `urma_max_write_size_mb` / `urma_poll_size` | 4 / 8 | 分块与完成批次，应按设备标定 |
+| yuanrong `enable_ub_numa_affinity` | false | 存在亲和代码不等于默认生效 |
+| yuanrong `enable_worker_worker_batch_get` / `enable_remote_h2d` | false / false | 批量与设备内存路径需独立开关/验证 |
+| yuanrong `enable_memory_rebalance` | false | 自动均衡需主动启用，并配置容量、带宽和拓扑稳定性约束 |
+| Mooncake `submaster_count` | 1 | 多 SubMaster 能力存在，实际多主部署另行核实 |
+| Mooncake `io_pattern_tier_down_bytes_per_cycle` | 0 | 自动下刷预算默认未打开，不代表无分析框架 |
+| Mooncake classic `ub_transport_test` | 编译但未注册 ctest | 先治理稳定性并拆分 mock 测试 |
