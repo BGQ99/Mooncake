@@ -37,6 +37,7 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::DISK, "DISK"},
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
+                             {ReplicaType::VSEGMENT, "VSEGMENT"},
                              {ReplicaType::ALL, "ALL"}};
 
     os << (replica_type_strings.count(replicaType)
@@ -92,6 +93,9 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
+    // Optional layout/medium policy for vsegment-backed writes. Empty uses
+    // the immutable quota snapshot's default profile.
+    std::string vsegment_profile_name{};
     // Optional per-key routing group IDs. Empty string keeps that key
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
@@ -112,6 +116,7 @@ struct ReplicateConfig {
            << ", nof_replica_num: " << config.nof_replica_num
            << ", with_soft_pin: " << config.with_soft_pin
            << ", with_hard_pin: " << config.with_hard_pin
+           << ", vsegment_profile_name: " << config.vsegment_profile_name
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];
@@ -206,6 +211,22 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+// Logical location of one object replica inside an immutable vsegment view.
+// Physical endpoints remain resolved through SegmentRegistry at transfer time.
+struct VSegmentDescriptor {
+    std::string partition_id;
+    std::string vsegment_id;
+    uint64_t logical_offset{0};
+    uint64_t length{0};
+    std::string operation_id;
+    YLT_REFL(VSegmentDescriptor, partition_id, vsegment_id, logical_offset,
+             length, operation_id);
+};
+
+struct VSegmentReplicaData {
+    VSegmentDescriptor descriptor;
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -250,6 +271,12 @@ class Replica {
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
+
+    Replica(VSegmentDescriptor descriptor, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(VSegmentReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
@@ -362,6 +389,21 @@ class Replica {
 
     [[nodiscard]] bool is_local_disk_replica() const {
         return std::holds_alternative<LocalDiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] bool is_vsegment_replica() const {
+        return std::holds_alternative<VSegmentReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_vsegment_replica(
+        const Replica& replica) {
+        return replica.is_vsegment_replica();
+    }
+
+    [[nodiscard]] const VSegmentDescriptor& get_vsegment_descriptor() const {
+        const auto* data = std::get_if<VSegmentReplicaData>(&data_);
+        if (!data) throw std::runtime_error("Expected VSegmentReplicaData");
+        return data->descriptor;
     }
 
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
@@ -500,12 +542,15 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const VSegmentReplicaData&) const {
+            return ReplicaType::VSEGMENT;
+        }
     };
 
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, VSegmentDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -542,6 +587,16 @@ class Replica {
 
         bool is_local_disk_replica() const noexcept {
             return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() const noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
                 descriptor_variant);
         }
 
@@ -604,6 +659,22 @@ class Replica {
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
         }
+
+        VSegmentDescriptor& get_vsegment_descriptor() {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
+        }
+
+        const VSegmentDescriptor& get_vsegment_descriptor() const {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
+        }
     };
 
    private:
@@ -611,7 +682,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData>
+                 LocalDiskReplicaData, VSegmentReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -662,6 +733,9 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_vsegment_replica()) {
+        desc.descriptor_variant =
+            std::get<VSegmentReplicaData>(data_).descriptor;
     }
 
     return desc;
@@ -713,6 +787,13 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_vsegment_replica()) {
+        const auto& data =
+            std::get<VSegmentReplicaData>(replica.data_).descriptor;
+        os << "type: VSEGMENT, partition_id: " << data.partition_id
+           << ", vsegment_id: " << data.vsegment_id
+           << ", logical_offset: " << data.logical_offset
+           << ", length: " << data.length;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

@@ -1,10 +1,6 @@
 #include "cvm/etcd_view_store.h"
 
-#include <algorithm>
-#include <chrono>
-#include <memory>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,9 +23,17 @@ namespace cvm {
 namespace {
 
 // Parses the JSON array returned by EtcdHelper::GetRangeAsJson, which has the
-// form [{"key":"...","value":"..."}, ...].
+// form [{"key":"...","value":"..."}, ...]. Also parses the optional etcd key
+// create_revision field (defaults to 0), used by「先到先得」ordering
+// (MasterRegistrationRankLess).
+struct RangeKvWithRevision {
+    std::string key;
+    std::string value;
+    int64_t create_revision{0};
+};
+
 ErrorCode ParseRangeJson(const std::string& json,
-                         std::vector<std::pair<std::string, std::string>>& kvs) {
+                         std::vector<RangeKvWithRevision>& kvs) {
     Json::Value root;
     Json::CharReaderBuilder reader;
     std::string errors;
@@ -47,7 +51,13 @@ ErrorCode ParseRangeJson(const std::string& json,
             !item["value"].isString()) {
             return ErrorCode::INTERNAL_ERROR;
         }
-        kvs.emplace_back(item["key"].asString(), item["value"].asString());
+        RangeKvWithRevision kv;
+        kv.key = item["key"].asString();
+        kv.value = item["value"].asString();
+        if (item.isMember("create_revision") && item["create_revision"].isNumeric()) {
+            kv.create_revision = item["create_revision"].asInt64();
+        }
+        kvs.push_back(std::move(kv));
     }
     return ErrorCode::OK;
 }
@@ -55,50 +65,6 @@ ErrorCode ParseRangeJson(const std::string& json,
 }  // namespace
 
 // ---- JSON serialization ----
-
-ErrorCode EtcdViewStore::SerializeSlotOwner(const SlotOwner& owner,
-                                            std::string& out) {
-    try {
-        struct_json::to_json(owner, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSlotOwner failed: " << e.what();
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeserializeSlotOwner(const std::string& in,
-                                              SlotOwner& out) {
-    try {
-        struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSlotOwner failed: " << e.what();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::SerializeSegmentOwner(const SegmentOwner& owner,
-                                               std::string& out) {
-    try {
-        struct_json::to_json(owner, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSegmentOwner failed: " << e.what();
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeserializeSegmentOwner(const std::string& in,
-                                                 SegmentOwner& out) {
-    try {
-        struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSegmentOwner failed: " << e.what();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
 
 ErrorCode EtcdViewStore::SerializeMasterRegistration(const MasterRegistration& reg,
                                                      std::string& out) {
@@ -122,165 +88,147 @@ ErrorCode EtcdViewStore::DeserializeMasterRegistration(const std::string& in,
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::SerializeKvViewSnapshot(const KvViewSnapshot& snapshot,
-                                                 std::string& out) {
+ErrorCode EtcdViewStore::SerializeRingMeta(const RingMeta& meta,
+                                           std::string& out) {
     try {
-        struct_json::to_json(snapshot, out);
+        struct_json::to_json(meta, out);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeKvViewSnapshot failed: " << e.what();
+        LOG(ERROR) << "SerializeRingMeta failed: " << e.what();
         return ErrorCode::SERIALIZE_FAIL;
     }
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::DeserializeKvViewSnapshot(const std::string& in,
-                                                   KvViewSnapshot& out) {
+ErrorCode EtcdViewStore::DeserializeRingMeta(const std::string& in,
+                                             RingMeta& out) {
     try {
         struct_json::from_json(out, in);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeKvViewSnapshot failed: " << e.what();
+        LOG(ERROR) << "DeserializeRingMeta failed: " << e.what();
         return ErrorCode::DESERIALIZE_FAIL;
     }
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::SerializeSegmentViewSnapshot(
-    const SegmentViewSnapshot& snapshot, std::string& out) {
+ErrorCode EtcdViewStore::SerializePartitionRoute(
+    const partition::PartitionRoute& route, std::string& out) {
     try {
-        struct_json::to_json(snapshot, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSegmentViewSnapshot failed: " << e.what();
+        struct_json::to_json(route, out);
+        return ErrorCode::OK;
+    } catch (...) {
         return ErrorCode::SERIALIZE_FAIL;
     }
-    return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::DeserializeSegmentViewSnapshot(const std::string& in,
-                                                        SegmentViewSnapshot& out) {
+ErrorCode EtcdViewStore::DeserializePartitionRoute(
+    const std::string& in, partition::PartitionRoute& out) {
     try {
         struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSegmentViewSnapshot failed: " << e.what();
+        return ErrorCode::OK;
+    } catch (...) {
         return ErrorCode::DESERIALIZE_FAIL;
     }
-    return ErrorCode::OK;
 }
 
-// ---- KV view ----
-
-ErrorCode EtcdViewStore::LoadSlotOwner(const std::string& cluster_namespace,
-                                       uint16_t slot, SlotOwner& out,
-                                       ViewVersionId& version) {
-    const std::string key = SlotOwnerKey(cluster_namespace, slot);
+ErrorCode EtcdViewStore::SavePartitionRoute(
+    const std::string& ns, const partition::PartitionRoute& route) {
+    if (route.partition_id.partition_id.empty() ||
+        route.owner_submaster_id.empty() ||
+        route.route_epoch == 0)
+        return ErrorCode::INVALID_PARAMS;
     std::string value;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
-    if (err != ErrorCode::OK) {
-        return err;
+    auto error = SerializePartitionRoute(route, value);
+    if (error != ErrorCode::OK) return error;
+    const auto key =
+        PartitionRouteKey(ns, route.partition_id.partition_id);
+    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
+}
+
+ErrorCode EtcdViewStore::LoadPartitionRoute(
+    const std::string& ns, const std::string& partition_id,
+    partition::PartitionRoute& out, ViewVersionId& version) {
+    const auto key = PartitionRouteKey(ns, partition_id);
+    std::string value;
+    auto error = EtcdHelper::Get(key.data(), key.size(), value, version);
+    return error == ErrorCode::OK ? DeserializePartitionRoute(value, out)
+                                  : error;
+}
+
+ErrorCode EtcdViewStore::CASSwitchPartitionOwner(
+    const std::string& ns, const std::string& partition_id,
+    uint64_t expected_epoch, const std::string& new_owner,
+    partition::PartitionState state, const std::string& target,
+    partition::PartitionRoute& out) {
+    partition::PartitionRoute current;
+    ViewVersionId version = 0;
+    auto error = LoadPartitionRoute(ns, partition_id, current, version);
+    if (error != ErrorCode::OK) return error;
+    if (current.route_epoch != expected_epoch) return ErrorCode::STALE_ROUTE;
+    std::string old_value;
+    SerializePartitionRoute(current, old_value);
+    out = {{partition_id}, new_owner, expected_epoch + 1,
+           static_cast<int32_t>(state), target};
+    std::string new_value;
+    SerializePartitionRoute(out, new_value);
+    const auto key = PartitionRouteKey(ns, partition_id);
+    error = EtcdHelper::TxnCompareAndPut(
+        {{key, EtcdHelper::TxnCompareKind::kValueEquals, old_value}},
+        {{key, new_value}});
+    return error == ErrorCode::ETCD_TRANSACTION_FAIL ? ErrorCode::STALE_ROUTE
+                                                      : error;
+}
+
+
+// ---- Segment neutral entity (segments/{segment_id}) ----
+
+ErrorCode EtcdViewStore::SerializeSegmentDescriptor(
+    const SegmentDescriptor& desc, std::string& out) {
+    try {
+        struct_json::to_json(desc, out);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeSegmentDescriptor failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
     }
-    return DeserializeSlotOwner(value, out);
 }
 
-ErrorCode EtcdViewStore::SaveSlotOwner(const std::string& cluster_namespace,
-                                       const SlotOwner& owner) {
-    const std::string key = SlotOwnerKey(cluster_namespace, owner.slot);
+ErrorCode EtcdViewStore::DeserializeSegmentDescriptor(
+    const std::string& in, SegmentDescriptor& out) {
+    try {
+        struct_json::from_json(out, in);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeSegmentDescriptor failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode EtcdViewStore::SaveSegmentDescriptor(
+    const std::string& cluster_namespace, const SegmentDescriptor& desc) {
+    const std::string key =
+        SegmentNeutralEntityKey(cluster_namespace, desc.segment_id);
     std::string value;
-    ErrorCode err = SerializeSlotOwner(owner, value);
+    ErrorCode err = SerializeSegmentDescriptor(desc, value);
     if (err != ErrorCode::OK) {
         return err;
     }
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
-ErrorCode EtcdViewStore::SaveSlotOwnerWithLease(
-    const std::string& cluster_namespace, const SlotOwner& owner,
-    EtcdLeaseId lease_id) {
-    const std::string key = SlotOwnerKey(cluster_namespace, owner.slot);
-    std::string value;
-    ErrorCode err = SerializeSlotOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return EtcdHelper::PutWithLease(key.data(), key.size(), value.data(),
-                                    value.size(), lease_id);
-}
-
-ErrorCode EtcdViewStore::SaveSlotOwnersWithLease(
-    const std::string& cluster_namespace,
-    const std::vector<SlotOwner>& owners, EtcdLeaseId lease_id) {
-    // etcd 默认单事务操作数上限为 128，因此按 128 个/批分块，每批一次事务写。
-    constexpr size_t kTxnOpLimit = 128;
-    for (size_t i = 0; i < owners.size(); i += kTxnOpLimit) {
-        const size_t n = std::min(kTxnOpLimit, owners.size() - i);
-        std::vector<std::string> keys;
-        std::vector<std::string> values;
-        keys.reserve(n);
-        values.reserve(n);
-        bool serialize_ok = true;
-        for (size_t j = 0; j < n; ++j) {
-            const SlotOwner& owner = owners[i + j];
-            keys.push_back(SlotOwnerKey(cluster_namespace, owner.slot));
-            std::string value;
-            if (SerializeSlotOwner(owner, value) != ErrorCode::OK) {
-                serialize_ok = false;
-                break;
-            }
-            values.push_back(std::move(value));
-        }
-        if (!serialize_ok) {
-            return ErrorCode::SERIALIZE_FAIL;
-        }
-        ErrorCode err = EtcdHelper::BatchPutWithLease(keys, values, lease_id);
-        if (err == ErrorCode::OK) {
-            continue;
-        }
-        // 某批事务失败：退化为逐条写，避免整批丢弃。仍失败则上抛。
-        LOG(WARNING) << "SaveSlotOwnersWithLease batch of " << n
-                     << " failed: " << err << ", falling back per-slot";
-        for (size_t j = 0; j < n; ++j) {
-            err = EtcdHelper::PutWithLease(keys[j].data(), keys[j].size(),
-                                           values[j].data(), values[j].size(),
-                                           lease_id);
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "SaveSlotOwnersWithLease per-slot put failed for "
-                           << keys[j] << ": " << err;
-                return err;
-            }
-        }
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeleteSlotOwner(const std::string& cluster_namespace,
-                                         uint16_t slot) {
-    const std::string key = SlotOwnerKey(cluster_namespace, slot);
+ErrorCode EtcdViewStore::DeleteSegmentDescriptor(
+    const std::string& cluster_namespace, const std::string& segment_id) {
+    const std::string key =
+        SegmentNeutralEntityKey(cluster_namespace, segment_id);
     const std::string end = PrefixEnd(key);
     return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
                                    end.size());
 }
 
-ErrorCode EtcdViewStore::DeleteSlotOwnerIfOwnedBy(
-    const std::string& cluster_namespace, uint16_t slot,
-    const std::string& master_id) {
-    SlotOwner owner;
-    ViewVersionId version = 0;
-    ErrorCode err = LoadSlotOwner(cluster_namespace, slot, owner, version);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-        return ErrorCode::OK;  // already gone; nothing to clean up
-    }
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    if (owner.primary_master_id != master_id) {
-        return ErrorCode::OK;  // now owned by another master; leave it
-    }
-    return DeleteSlotOwner(cluster_namespace, slot);
-}
-
-ErrorCode EtcdViewStore::LoadAllSlotOwners(const std::string& cluster_namespace,
-                                           std::vector<SlotOwner>& out,
-                                           ViewVersionId& version) {
+ErrorCode EtcdViewStore::LoadAllSegmentDescriptors(
+    const std::string& cluster_namespace,
+    std::vector<SegmentDescriptor>& out, ViewVersionId& version) {
     out.clear();
-    const std::string prefix = KvViewPrefix(cluster_namespace);
+    const std::string prefix = SegmentNeutralEntityPrefix(cluster_namespace);
     const std::string end = PrefixEnd(prefix);
     std::string json;
     ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
@@ -290,7 +238,7 @@ ErrorCode EtcdViewStore::LoadAllSlotOwners(const std::string& cluster_namespace,
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
+    std::vector<RangeKvWithRevision> kvs;
     err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
@@ -298,50 +246,47 @@ ErrorCode EtcdViewStore::LoadAllSlotOwners(const std::string& cluster_namespace,
 
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
-        SlotOwner owner;
-        err = DeserializeSlotOwner(kv.second, owner);
+        SegmentDescriptor desc;
+        err = DeserializeSegmentDescriptor(kv.value, desc);
         if (err != ErrorCode::OK) {
             return err;
         }
-        out.push_back(std::move(owner));
+        out.push_back(std::move(desc));
     }
     return ErrorCode::OK;
 }
 
-// ---- Segment view (reserved) ----
+// ---- Per-master segment mount (snapshot/{id}/segments/{seg}) ----
 
-ErrorCode EtcdViewStore::LoadSegmentOwner(const std::string& cluster_namespace,
-                                          const std::string& segment_id,
-                                          SegmentOwner& out,
-                                          ViewVersionId& version) {
-    const std::string key = SegmentOwnerKey(cluster_namespace, segment_id);
-    std::string value;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
-    if (err != ErrorCode::OK) {
-        return err;
+ErrorCode EtcdViewStore::SerializeMountEntry(const MountEntry& entry,
+                                             std::string& out) {
+    try {
+        struct_json::to_json(entry, out);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeMountEntry failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
     }
-    return DeserializeSegmentOwner(value, out);
 }
 
-ErrorCode EtcdViewStore::SaveSegmentOwner(const std::string& cluster_namespace,
-                                          const SegmentOwner& owner) {
-    const std::string key =
-        SegmentOwnerKey(cluster_namespace, owner.segment_id);
-    std::string value;
-    ErrorCode err = SerializeSegmentOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
+ErrorCode EtcdViewStore::DeserializeMountEntry(const std::string& in,
+                                               MountEntry& out) {
+    try {
+        struct_json::from_json(out, in);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeMountEntry failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
     }
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
-ErrorCode EtcdViewStore::SaveSegmentOwnerWithLease(
-    const std::string& cluster_namespace, const SegmentOwner& owner,
-    EtcdLeaseId lease_id) {
+ErrorCode EtcdViewStore::SaveMountEntryWithLease(
+    const std::string& cluster_namespace, const std::string& master_id,
+    const MountEntry& entry, EtcdLeaseId lease_id) {
     const std::string key =
-        SegmentOwnerKey(cluster_namespace, owner.segment_id);
+        SnapshotSegmentMountKey(cluster_namespace, master_id, entry.segment_id);
     std::string value;
-    ErrorCode err = SerializeSegmentOwner(owner, value);
+    ErrorCode err = SerializeMountEntry(entry, value);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -349,19 +294,22 @@ ErrorCode EtcdViewStore::SaveSegmentOwnerWithLease(
                                     value.size(), lease_id);
 }
 
-ErrorCode EtcdViewStore::DeleteSegmentOwner(
-    const std::string& cluster_namespace, const std::string& segment_id) {
-    const std::string key = SegmentOwnerKey(cluster_namespace, segment_id);
+ErrorCode EtcdViewStore::DeleteMountEntry(
+    const std::string& cluster_namespace, const std::string& master_id,
+    const std::string& segment_id) {
+    const std::string key =
+        SnapshotSegmentMountKey(cluster_namespace, master_id, segment_id);
     const std::string end = PrefixEnd(key);
     return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
                                    end.size());
 }
 
-ErrorCode EtcdViewStore::LoadAllSegmentOwners(
-    const std::string& cluster_namespace, std::vector<SegmentOwner>& out,
+ErrorCode EtcdViewStore::LoadAllMountEntries(
+    const std::string& cluster_namespace,
+    std::vector<std::pair<std::string, MountEntry>>& out,
     ViewVersionId& version) {
     out.clear();
-    const std::string prefix = SegmentViewPrefix(cluster_namespace);
+    const std::string prefix = SnapshotPrefix(cluster_namespace);
     const std::string end = PrefixEnd(prefix);
     std::string json;
     ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
@@ -371,20 +319,29 @@ ErrorCode EtcdViewStore::LoadAllSegmentOwners(
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
+    std::vector<RangeKvWithRevision> kvs;
     err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
     }
 
+    // key = snapshot/{master_id}/segments/{segment_id}. Skip any other
+    // snapshot subkey (e.g. future reg/oplog) that may appear in the scan.
+    constexpr char kSegmentsMarker[] = "/segments/";
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
-        SegmentOwner owner;
-        err = DeserializeSegmentOwner(kv.second, owner);
+        const std::size_t pos = kv.key.rfind(kSegmentsMarker);
+        if (pos == std::string::npos || pos <= prefix.size()) {
+            continue;
+        }
+        MountEntry entry;
+        err = DeserializeMountEntry(kv.value, entry);
         if (err != ErrorCode::OK) {
             return err;
         }
-        out.push_back(std::move(owner));
+        const std::string master_id =
+            kv.key.substr(prefix.size(), pos - prefix.size());
+        out.emplace_back(master_id, std::move(entry));
     }
     return ErrorCode::OK;
 }
@@ -451,7 +408,7 @@ ErrorCode EtcdViewStore::LoadAllMasters(
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
+    std::vector<RangeKvWithRevision> kvs;
     err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
@@ -460,153 +417,255 @@ ErrorCode EtcdViewStore::LoadAllMasters(
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
         MasterRegistration reg;
-        err = DeserializeMasterRegistration(kv.second, reg);
+        err = DeserializeMasterRegistration(kv.value, reg);
         if (err != ErrorCode::OK) {
             return err;
         }
+        reg.create_revision = kv.create_revision;
         out.push_back(std::move(reg));
     }
     return ErrorCode::OK;
 }
 
-// ---- Snapshots ----
-
-ErrorCode EtcdViewStore::SaveKvViewSnapshot(const std::string& cluster_namespace,
-                                            const KvViewSnapshot& snapshot) {
-    const std::string key = KvViewSnapshotKey(cluster_namespace);
+ErrorCode EtcdViewStore::SaveClusterMeta(const std::string& cluster_namespace,
+                                         const RingMeta& meta) {
+    const std::string key = ClusterMetaKey(cluster_namespace);
     std::string value;
-    ErrorCode err = SerializeKvViewSnapshot(snapshot, value);
+    ErrorCode err = SerializeRingMeta(meta, value);
     if (err != ErrorCode::OK) {
         return err;
     }
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
-ErrorCode EtcdViewStore::SaveSegmentViewSnapshot(
-    const std::string& cluster_namespace, const SegmentViewSnapshot& snapshot) {
-    const std::string key = SegmentViewSnapshotKey(cluster_namespace);
+ErrorCode EtcdViewStore::LoadClusterMeta(const std::string& cluster_namespace,
+                                         RingMeta& out,
+                                         ViewVersionId& version) {
+    const std::string key = ClusterMetaKey(cluster_namespace);
     std::string value;
-    ErrorCode err = SerializeSegmentViewSnapshot(snapshot, value);
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
     if (err != ErrorCode::OK) {
         return err;
     }
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
+    return DeserializeRingMeta(value, out);
 }
 
-namespace {
-// Content-dedup cache for snapshot writes. `generated_at_ms` changes on every
-// build, so a naive "write every sync cycle" put a ~MB value per cycle per
-// master and exhausted the etcd backend quota with MVCC revisions. Skip the
-// write when the owners content is unchanged since this process last wrote it.
-// Process-local: after a content change each master writes once, which is
-// acceptable (two puts per change instead of one).
-std::mutex g_snapshot_dedup_mutex;
-std::unordered_map<std::string, std::string> g_last_snapshot_content;
-}  // namespace
+// ---- RingSlot 槽位组归属（ring_slots/{rank}）----
 
-ErrorCode EtcdViewStore::BuildAndSaveKvViewSnapshot(
-    const std::string& cluster_namespace, ViewVersionId& version) {
-    std::vector<SlotOwner> owners;
-    ErrorCode err = LoadAllSlotOwners(cluster_namespace, owners, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    // Fingerprint over the owners only (exclude version/generated_at so the
-    // steady state produces a stable string).
-    std::string content;
+ErrorCode EtcdViewStore::SerializeRingSlotAssign(const RingSlotAssign& assign,
+                                                  std::string& out) {
     try {
-        struct_json::to_json(owners, content);
+        struct_json::to_json(assign, out);
     } catch (const std::exception& e) {
-        LOG(WARNING) << "BuildAndSaveKvViewSnapshot: fingerprint failed: "
-                     << e.what();
-        content.clear();
+        LOG(ERROR) << "SerializeRingSlotAssign failed: " << e.what();
+        return ErrorCode::SERIALIZE_FAIL;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        auto& last = g_last_snapshot_content["kv:" + cluster_namespace];
-        if (!content.empty() && last == content) {
-            return ErrorCode::OK;  // unchanged, skip the etcd write
-        }
-        last = content;
-    }
-
-    KvViewSnapshot snapshot;
-    snapshot.version = version;
-    snapshot.generated_at_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    snapshot.slot_owners = std::move(owners);
-    err = SaveKvViewSnapshot(cluster_namespace, snapshot);
-    if (err != ErrorCode::OK) {
-        // 写失败时回滚缓存，下轮重试完整写入。
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        g_last_snapshot_content.erase("kv:" + cluster_namespace);
-    }
-    return err;
+    return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
-    const std::string& cluster_namespace, ViewVersionId& version) {
-    std::vector<SegmentOwner> owners;
-    ErrorCode err = LoadAllSegmentOwners(cluster_namespace, owners, version);
+ErrorCode EtcdViewStore::DeserializeRingSlotAssign(const std::string& in,
+                                                   RingSlotAssign& out) {
+    try {
+        struct_json::from_json(out, in);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeRingSlotAssign failed: " << e.what();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::CreateRingSlotAssign(
+    const std::string& cluster_namespace, const RingSlotAssign& assign) {
+    if (assign.primary_id.empty() || assign.epoch == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::string value;
+    ErrorCode err = SerializeRingSlotAssign(assign, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = RingSlotAssignKey(cluster_namespace, assign.rank);
+    return EtcdHelper::Create(key.data(), key.size(), value.data(),
+                              value.size());
+}
+
+ErrorCode EtcdViewStore::LoadRingSlotAssign(
+    const std::string& cluster_namespace, uint32_t rank, RingSlotAssign& out,
+    ViewVersionId& version) {
+    const std::string key = RingSlotAssignKey(cluster_namespace, rank);
+    std::string value;
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    err = DeserializeRingSlotAssign(value, out);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (out.rank != rank) {
+        LOG(ERROR) << "ring_slots value rank=" << out.rank
+                   << " mismatches key rank=" << rank << ", etcd corrupted";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::LoadAllRingSlotAssigns(
+    const std::string& cluster_namespace,
+    std::vector<RingSlotAssign>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
     if (err != ErrorCode::OK) {
         return err;
     }
 
-    std::string content;
-    try {
-        struct_json::to_json(owners, content);
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "BuildAndSaveSegmentViewSnapshot: fingerprint failed: "
-                     << e.what();
-        content.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        auto& last = g_last_snapshot_content["segment:" + cluster_namespace];
-        if (!content.empty() && last == content) {
-            return ErrorCode::OK;  // unchanged, skip the etcd write
-        }
-        last = content;
-    }
-
-    SegmentViewSnapshot snapshot;
-    snapshot.version = version;
-    snapshot.generated_at_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    snapshot.segment_owners = std::move(owners);
-    err = SaveSegmentViewSnapshot(cluster_namespace, snapshot);
+    std::vector<RangeKvWithRevision> kvs;
+    err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        g_last_snapshot_content.erase("segment:" + cluster_namespace);
+        return err;
     }
-    return err;
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        RingSlotAssign assign;
+        err = DeserializeRingSlotAssign(kv.value, assign);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        uint32_t key_rank = 0;
+        if (!ParseRankFromRingSlotKey(kv.key, prefix, key_rank) ||
+            key_rank != assign.rank) {
+            LOG(ERROR) << "ring_slots key '" << kv.key << "' rank mismatch, "
+                       << "etcd corrupted";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        out.push_back(std::move(assign));
+    }
+    return ErrorCode::OK;
 }
 
-// ---- Watch ----
+ErrorCode EtcdViewStore::CASSwitchRingSlotOwner(
+    const std::string& cluster_namespace, uint32_t rank,
+    uint64_t expected_epoch, const std::string& new_primary_id,
+    SlotState new_state, const std::string& migrating_to_id,
+    RingSlotAssign& out, const std::vector<std::string>* new_standby_ids) {
+    if (new_primary_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
 
-ErrorCode EtcdViewStore::WatchKvView(const std::string& cluster_namespace,
-                                     ViewVersionId start_revision, void* ctx,
-                                     WatchCallback cb) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::WatchWithPrefixFromRevision(prefix.data(), prefix.size(),
-                                                   start_revision, ctx, cb);
+    RingSlotAssign current;
+    ViewVersionId version = 0;
+    ErrorCode err =
+        LoadRingSlotAssign(cluster_namespace, rank, current, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (current.epoch != expected_epoch) {
+        return ErrorCode::STALE_ROUTE;
+    }
+
+    std::string old_value;
+    err = SerializeRingSlotAssign(current, old_value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out = current;
+    out.primary_id = new_primary_id;
+    out.state = static_cast<int32_t>(new_state);
+    out.migrating_to_id = migrating_to_id;
+    out.epoch = expected_epoch + 1;
+    if (new_standby_ids != nullptr) {
+        out.standby_ids = *new_standby_ids;
+    }
+
+    std::string new_value;
+    err = SerializeRingSlotAssign(out, new_value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = RingSlotAssignKey(cluster_namespace, rank);
+    err = EtcdHelper::TxnCompareAndPut(
+        {{key, EtcdHelper::TxnCompareKind::kValueEquals, old_value}},
+        {{key, new_value}});
+    return err == ErrorCode::ETCD_TRANSACTION_FAIL ? ErrorCode::STALE_ROUTE
+                                                    : err;
 }
 
-ErrorCode EtcdViewStore::CancelWatchKvView(const std::string& cluster_namespace) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::CancelWatchWithPrefix(prefix.data(), prefix.size());
-}
+ErrorCode EtcdViewStore::AdoptRankViaCAS(
+    const std::string& cluster_namespace, uint32_t rank,
+    uint64_t expected_epoch, const std::string& new_primary_id,
+    SlotState new_state, const std::string& migrating_to_id,
+    RingSlotAssign& out_assign, const std::vector<std::string>* new_standbys,
+    const char* reason, const std::string& old_owner,
+    bool success_as_warning, bool clear_intent) {
+    // 归属推进组合原语（模板方法在调用方，此处是被复用的「过程骨架」）：
+    // CAS 切换 + 可选幂等删 reshard_intent + 统一结构化日志。五处调用点
+    //（晋升/补位接管/兼管自愈/driver 阶段1-2）的共性提取；竞争让位
+    //（STALE）是正常结果打 INFO，防多 standby 并发时刷 WARNING。
+    // clear_intent 见头文件：driver 流程内推进必须传 false（intent 是其
+    // 断点续传依据），接管语义传 true（残留意图与新视图矛盾）。
+    ErrorCode err = CASSwitchRingSlotOwner(
+        cluster_namespace, rank, expected_epoch, new_primary_id, new_state,
+        migrating_to_id, out_assign, new_standbys);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::STALE_ROUTE) {
+            LOG(INFO) << "rank ownership CAS lost (concurrent winner): "
+                         "rank="
+                      << rank << ", reason=" << reason
+                      << ", attempted_owner=" << new_primary_id;
+        } else {
+            LOG(WARNING) << "rank ownership CAS failed: rank=" << rank
+                         << ", reason=" << reason << ", err=" << err;
+        }
+        return err;
+    }
 
-ErrorCode EtcdViewStore::WaitWatchKvViewStopped(
-    const std::string& cluster_namespace, int timeout_ms) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
-                                                  timeout_ms);
+    // 可选 intent 清理（幂等，key 不存在视为 OK）。失败不阻断接管——
+    // intent 随后由驱动路径（driver 重扫 / 晋升方）再次清理，记 WARNING
+    // 供排查。
+    if (clear_intent) {
+        const ErrorCode del = DeleteReshardIntent(cluster_namespace, rank);
+        if (del != ErrorCode::OK) {
+            LOG(WARNING) << "rank ownership advanced but intent cleanup "
+                            "failed: rank="
+                         << rank << ", reason=" << reason << ", err=" << del
+                         << " (will be retried by promotion paths)";
+        }
+    }
+
+    const char* intent_note = clear_intent
+                                  ? ", reshard_intent cleared (if any)"
+                                  : ", reshard_intent kept (driver in progress)";
+    if (success_as_warning) {
+        LOG(WARNING) << "rank ownership advanced (" << reason
+                     << "): rank=" << rank << ", old_owner=" << old_owner
+                     << ", new_owner=" << out_assign.primary_id
+                     << ", state="
+                     << (new_state == SlotState::kMigrating ? "kMigrating"
+                                                            : "kStable")
+                     << (new_state == SlotState::kMigrating
+                             ? ", migrating_to=" + migrating_to_id
+                             : intent_note)
+                     << ", new_epoch=" << out_assign.epoch;
+    } else {
+        LOG(INFO) << "rank ownership advanced (" << reason
+                 << "): rank=" << rank << ", old_owner=" << old_owner
+                 << ", new_owner=" << out_assign.primary_id
+                 << ", state=" << (new_state == SlotState::kMigrating
+                                       ? "kMigrating"
+                                       : "kStable")
+                 << (new_state == SlotState::kMigrating
+                         ? ", migrating_to=" + migrating_to_id
+                         : intent_note)
+                 << ", new_epoch=" << out_assign.epoch;
+    }
+    return ErrorCode::OK;
 }
 
 // ---- Master membership watch ----
@@ -630,6 +689,125 @@ ErrorCode EtcdViewStore::WaitWatchMastersStopped(
     const std::string prefix = MasterRegistrationPrefix(cluster_namespace);
     return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
                                                   timeout_ms);
+}
+
+// ---- RingSlot ownership watch ----
+
+ErrorCode EtcdViewStore::WatchRingSlots(const std::string& cluster_namespace,
+                                       ViewVersionId start_revision,
+                                       void* ctx, WatchCallback cb) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::WatchWithPrefixFromRevision(prefix.data(), prefix.size(),
+                                                   start_revision, ctx, cb);
+}
+
+ErrorCode EtcdViewStore::CancelWatchRingSlots(
+    const std::string& cluster_namespace) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::CancelWatchWithPrefix(prefix.data(), prefix.size());
+}
+
+ErrorCode EtcdViewStore::WaitWatchRingSlotsStopped(
+    const std::string& cluster_namespace, int timeout_ms) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
+                                                  timeout_ms);
+}
+
+// ---- reshard 意图（reshard_intent/{rank}，§16.19.1）----
+
+namespace {
+
+ErrorCode SerializeReshardIntent(const ReshardIntent& intent,
+                                 std::string& out) {
+    try {
+        struct_json::to_json(intent, out);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeReshardIntent failed: " << e.what();
+        return ErrorCode::SERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode DeserializeReshardIntent(const std::string& in,
+                                    ReshardIntent& out) {
+    try {
+        struct_json::from_json(out, in);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeReshardIntent failed: " << e.what();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
+ErrorCode EtcdViewStore::CreateReshardIntent(
+    const std::string& cluster_namespace, const ReshardIntent& intent) {
+    if (intent.source_primary_id.empty() ||
+        intent.target_primary_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::string value;
+    ErrorCode err = SerializeReshardIntent(intent, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = ReshardIntentKey(cluster_namespace, intent.rank);
+    return EtcdHelper::Create(key.data(), key.size(), value.data(),
+                              value.size());
+}
+
+ErrorCode EtcdViewStore::DeleteReshardIntent(
+    const std::string& cluster_namespace, uint32_t rank) {
+    const std::string key = ReshardIntentKey(cluster_namespace, rank);
+    const std::string end = PrefixEnd(key);
+    // 幂等：key 不存在（已删除 / 从未写入）同样视为成功。
+    const ErrorCode err = EtcdHelper::DeleteRange(
+        key.data(), key.size(), end.data(), end.size());
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ErrorCode::OK;
+    }
+    return err;
+}
+
+ErrorCode EtcdViewStore::LoadAllReshardIntents(
+    const std::string& cluster_namespace,
+    std::vector<ReshardIntent>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix = ReshardIntentPrefix(cluster_namespace);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    std::vector<RangeKvWithRevision> kvs;
+    err = ParseRangeJson(json, kvs);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        ReshardIntent intent;
+        err = DeserializeReshardIntent(kv.value, intent);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        uint32_t key_rank = 0;
+        if (!ParseRankFromRingSlotKey(kv.key, prefix, key_rank) ||
+            key_rank != intent.rank) {
+            LOG(ERROR) << "reshard_intent key '" << kv.key
+                       << "' rank mismatch, etcd corrupted";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        out.push_back(std::move(intent));
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace cvm

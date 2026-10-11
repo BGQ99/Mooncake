@@ -21,6 +21,7 @@
 #endif
 #include <optional>
 #include <ranges>
+#include <map>
 #include <span>
 #include <sched.h>
 #include <thread>
@@ -170,7 +171,7 @@ struct ReplicaTransferSummary {
     ErrorCode first_error = ErrorCode::OK;
 
     void RecordAllocatedReplica(const Replica::Descriptor& replica) {
-        if (replica.is_memory_replica()) {
+        if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
             ++allocated_memory_replicas;
         } else if (replica.is_nof_replica()) {
             ++allocated_nof_replicas;
@@ -195,6 +196,52 @@ struct ReplicaTransferSummary {
             first_error = error;
         }
     }
+};
+
+class MasterClientVSegmentViewProvider final
+    : public vsegment::VSegmentViewProvider {
+   public:
+    explicit MasterClientVSegmentViewProvider(MasterClient* master_client)
+        : master_client_(master_client) {}
+
+    ErrorCode LoadView(const std::string& partition_id,
+                       const std::string& vsegment_id,
+                       vsegment::VSegmentView* view,
+                       std::string* detail) override {
+        if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
+        auto result =
+            master_client_->GetVSegmentView(partition_id, vsegment_id);
+        if (!result) {
+            if (detail) *detail = "failed to load vsegment view from owner";
+            return result.error();
+        }
+        *view = std::move(result.value());
+        return ErrorCode::OK;
+    }
+
+   private:
+    MasterClient* master_client_;
+};
+
+class MasterClientSegmentEndpointResolver final
+    : public vsegment::SegmentEndpointResolver {
+   public:
+    explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
+        : master_client_(master_client) {}
+
+    ErrorCode ResolveLocation(
+        const std::string& segment_id,
+        vsegment::PSegmentLocation* location) override {
+        if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
+        auto result = master_client_->GetPSegmentEndpoint(segment_id);
+        if (!result) return result.error();
+        *location = std::move(result.value());
+        return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
+                                          : ErrorCode::OK;
+    }
+
+   private:
+    MasterClient* master_client_;
 };
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
@@ -576,9 +623,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             // No single-leader master_view is published. In the CVM
             // multi-submaster architecture masters never write master_view;
             // they register under /cvm/<ns>/masters/ instead. Fall back to
-            // the CVM registry to bootstrap the connection. Per-key routing
-            // is loaded afterwards via LoadPartitionRouting() from the
-            // kv_view snapshot in etcd.
+            // the CVM registry to bootstrap the connection. Per-slot routing
+            // is loaded afterwards via LoadPartitionRouting(), which derives
+            // the slot->primary ring locally from cluster_meta + the masters
+            // registry (no persisted kv_view).
             LOG(INFO) << "No master_view in HA backend; trying CVM "
                          "multi-submaster bootstrap from /cvm/ registry";
             auto err =
@@ -868,9 +916,9 @@ void Client::TryLoadRoutingOnce() {
 
 void Client::RoutingRefreshThreadMain() {
     // Refresh cadence aligned with SlotOwnerHeartbeat (5s) and
-    // CvmController::SyncLoop (5s). Slot migration is a low-frequency event,
-    // so a fixed sleep (rather than a fast poll) keeps steady-state etcd load
-    // low while still picking up changes promptly.
+    // CvmController role reconciliation (5s). Slot migration is a
+    // low-frequency event, so a fixed sleep (rather than a fast poll) keeps
+    // steady-state etcd load low while still picking up changes promptly.
     constexpr auto kRefreshInterval = std::chrono::milliseconds(5000);
 
     while (routing_refresh_running_.load()) {
@@ -1205,6 +1253,15 @@ void Client::InitTransferSubmitter() {
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
+    vsegment_view_provider_ =
+        std::make_unique<MasterClientVSegmentViewProvider>(&master_client_);
+    vsegment_endpoint_resolver_ =
+        std::make_unique<MasterClientSegmentEndpointResolver>(&master_client_);
+    vsegment_view_cache_ = std::make_unique<vsegment::VSegmentViewCache>();
+    vsegment_transfer_planner_ =
+        std::make_shared<vsegment::VSegmentTransferPlanner>(
+            vsegment_view_provider_.get(), vsegment_endpoint_resolver_.get(),
+            vsegment_view_cache_.get());
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -1579,20 +1636,38 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    // 编排层整窗：GET_INTERNAL_* 六段之和与本窗的差值即编排层占比
+    SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
-            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+    ErrorCode err = ErrorCode::OK;
+    {
+        SpDiag::PerfPoint pt_find(PerfKey::GET_SINGLE_FIND_REPLICA,
+                                  SpDiag::PerfLevel::MODULE);
+        pt_find.Start();
+        err = FindFirstCompleteReplica(query_result.replicas, replica);
+        pt_find.End(err == ErrorCode::OK ? 0 : -1);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+            }
+            pt_full.End(-1);
+            return tl::unexpected(err);
         }
-        return tl::unexpected(err);
     }
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
+        // status: 0=hit（改写 replica 指向本地 cache，走本地 memcpy）/
+        // -1=miss（走 TE 远读）——miss 率 = badCount/tickCount
+        SpDiag::PerfPoint pt_cache(PerfKey::GET_SINGLE_HOT_CACHE,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_cache.Start();
         cache_used = RedirectToHotCache(object_key, replica);
+        pt_cache.End(cache_used ? 0 : -1);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
@@ -1600,7 +1675,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
+        SpDiag::PerfPoint pt_release(PerfKey::GET_SINGLE_RELEASE_CACHE,
+                                     SpDiag::PerfLevel::MODULE);
+        pt_release.Start();
         hot_cache_->ReleaseHotKey(object_key);
+        pt_release.End(0);
     }
 
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1612,6 +1691,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -1619,6 +1699,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
                              query_result.object_checksum);
     if (!checksum_result) {
+        pt_full.End(-1);
         return tl::unexpected(checksum_result.error());
     }
 
@@ -1626,12 +1707,19 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
     if (ShouldAdmitToHotCache(object_key, cache_used)) {
+        // 仅观测 enqueue 开销与 promote 触发频率；真正的异步拷贝在
+        // hot_cache_handler_ 线程池内执行，不在本窗内。
+        SpDiag::PerfPoint pt_async(PerfKey::GET_SINGLE_ASYNC_CACHE,
+                                   SpDiag::PerfLevel::MODULE);
+        pt_async.Start();
         ProcessSlicesAsync(object_key, slices, replica);
+        pt_async.End(0);
     }
 
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     // Log cache hit statistics
@@ -1640,6 +1728,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
+    pt_full.End(0);
     return {};
 }
 
@@ -1655,8 +1744,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         }
         return tl::unexpected(err);
     }
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "Range read only supported for memory replicas, key="
+    if (!replica.is_memory_replica() && !replica.is_vsegment_replica()) {
+        LOG(ERROR) << "Range read only supported for memory or vsegment "
+                      "replicas, key="
                    << object_key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
@@ -1822,6 +1912,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    // 批量编排层整窗（含 SUBMIT/WAIT 两阶段）；status 0=全部成功 /
+    // -1=至少一个 key 失败
+    SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1829,6 +1924,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
 
@@ -1842,10 +1938,33 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        // The same-node fast path batches direct memory handles by endpoint.
+        // VSegment replicas need view expansion first, so use the general
+        // parallel path when a batch contains one.
+        for (const auto& query_result : query_results) {
+            Replica::Descriptor replica;
+            if (FindFirstCompleteReplica(query_result.replicas, replica) ==
+                    ErrorCode::OK &&
+                replica.is_vsegment_replica()) {
+                prefer_alloc_in_same_node = false;
+                break;
+            }
+        }
+    }
+    if (prefer_alloc_in_same_node) {
+        // prefer_same_node 委托路径：FULL 窗覆盖委托调用本身；子路径内部
+        // （submit_batch / futures[0].get）暂无独立打点。
+        auto pref_results =
+            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        pt_full.End(std::any_of(pref_results.begin(), pref_results.end(),
+                                [](const auto& r) { return !r; })
+                        ? -1
+                        : 0);
+        return pref_results;
     }
 
     // Collect all transfer operations for parallel execution
@@ -1861,6 +1980,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     size_t total_cache_hits = 0;
 
     // Submit all transfers in parallel
+    SpDiag::PerfPoint pt_submit(PerfKey::GET_BATCH_SUBMIT,
+                                SpDiag::PerfLevel::MODULE);
+    pt_submit.Start();
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
@@ -1874,19 +1996,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
-                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+        {
+            SpDiag::PerfPoint pt_find(PerfKey::GET_BATCH_FIND_REPLICA,
+                                      SpDiag::PerfLevel::MODULE);
+            pt_find.Start();
+            ErrorCode err =
+                FindFirstCompleteReplica(query_result.replicas, replica);
+            pt_find.End(err == ErrorCode::OK ? 0 : -1);
+            if (err != ErrorCode::OK) {
+                if (err == ErrorCode::INVALID_REPLICA) {
+                    LOG(ERROR) << "no_complete_replicas_found key=" << key;
+                }
+                results[i] = tl::unexpected(err);
+                continue;
             }
-            results[i] = tl::unexpected(err);
-            continue;
         }
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
+            // status: 0=hit / -1=miss（同 GET_SINGLE_HOT_CACHE 编码）
+            SpDiag::PerfPoint pt_cache(PerfKey::GET_BATCH_HOT_CACHE,
+                                       SpDiag::PerfLevel::KEY_MODULE);
+            pt_cache.Start();
             cache_used = RedirectToHotCache(key, replica);
+            pt_cache.End(cache_used ? 0 : -1);
             if (cache_used) {
                 total_cache_hits++;
             }
@@ -1894,7 +2027,26 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_nof_replica()) {
+        if (replica.is_vsegment_replica()) {
+            if (!vsegment_transfer_planner_) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            std::vector<vsegment::ClientSlice> client_slices;
+            client_slices.reserve(slices_it->second.size());
+            for (const auto& slice : slices_it->second) {
+                client_slices.push_back(
+                    {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+            }
+            auto plan = vsegment_transfer_planner_->Plan(
+                replica.get_vsegment_descriptor(), client_slices);
+            if (!plan) {
+                results[i] = tl::unexpected(plan.error);
+                continue;
+            }
+            future = transfer_submitter_->submitVSegment(
+                plan, TransferRequest::READ);
+        } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
@@ -1911,7 +2063,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
+                SpDiag::PerfPoint pt_release(PerfKey::GET_BATCH_RELEASE_CACHE,
+                                             SpDiag::PerfLevel::MODULE);
+                pt_release.Start();
                 hot_cache_->ReleaseHotKey(key);
+                pt_release.End(0);
             }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
@@ -1925,15 +2081,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
     }
+    pt_submit.End(0);
 
     // Wait for all transfers to complete
+    SpDiag::PerfPoint pt_wait(PerfKey::GET_BATCH_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    pt_wait.Start();
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
         ErrorCode result = future.get();
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
+            SpDiag::PerfPoint pt_release(PerfKey::GET_BATCH_RELEASE_CACHE,
+                                         SpDiag::PerfLevel::MODULE);
+            pt_release.Start();
             hot_cache_->ReleaseHotKey(key);
+            pt_release.End(0);
         }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
@@ -1962,11 +2126,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end() &&
                     ShouldAdmitToHotCache(key, cache_used)) {
+                    // 仅观测 enqueue 开销与 promote 触发频率（同单笔语义）
+                    SpDiag::PerfPoint pt_async(PerfKey::GET_BATCH_ASYNC_CACHE,
+                                               SpDiag::PerfLevel::MODULE);
+                    pt_async.Start();
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    pt_async.End(0);
                 }
             }
         }
     }
+    pt_wait.End(0);
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
@@ -1994,6 +2164,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     } else {
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
+    pt_full.End(std::any_of(results.begin(), results.end(),
+                            [](const auto& r) { return !r; })
+                    ? -1
+                    : 0);
     return results;
 }
 
@@ -2020,6 +2194,44 @@ bool Client::RedirectToHotCache(const std::string& key,
     mem_desc.buffer_descriptor.buffer_address_ =
         reinterpret_cast<uintptr_t>(blk->addr);
     return true;
+}
+
+// 方案二被动层：向 master 上报传输失败副本的坏端点（多 submaster 下内存段
+// 全量挂载于所有 submaster，坏端点影响所有 master 的分配，需广播）。
+// best-effort：上报失败仅告警不阻塞主流程，误报由 worker 重挂载时
+// MountSegment 的 erase 自愈兜底。调用方需在延迟指标采集之后调用，
+// 避免上报 RPC 耗时污染延迟统计。
+void Client::ReportFailedEndpointsToMasters(
+    const std::set<std::string>& failed_endpoints) {
+    if (failed_endpoints.empty()) {
+        return;
+    }
+    const std::vector<std::string> invalid_endpoints(
+        failed_endpoints.begin(), failed_endpoints.end());
+    std::vector<std::string> report_targets;
+    {
+        std::lock_guard<std::mutex> addr_lock(cvm_submaster_addresses_mutex_);
+        report_targets = cvm_submaster_addresses_;
+    }
+    if (!report_targets.empty()) {
+        for (const auto& addr : report_targets) {
+            auto r = master_client_.ReportInvalidReplicaEndpointsTo(
+                addr, invalid_endpoints);
+            if (!r) {
+                LOG(WARNING)
+                    << "report_invalid_endpoints_failed addr=" << addr
+                    << " count=" << invalid_endpoints.size()
+                    << " error=" << r.error();
+            }
+        }
+    } else {
+        auto r = master_client_.ReportInvalidReplicaEndpoints(invalid_endpoints);
+        if (!r) {
+            LOG(WARNING) << "report_invalid_endpoints_failed count="
+                         << invalid_endpoints.size()
+                         << " error=" << r.error();
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
@@ -2074,8 +2286,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    PutStartResult& put_start = start_result.value();
     ReplicaTransferSummary transfer_summary;
-    for (const auto& replica : start_result.value()) {
+    for (const auto& replica : put_start.replicas) {
         transfer_summary.RecordAllocatedReplica(replica);
     }
 
@@ -2085,8 +2298,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // We must deal with disk replica first, then the disk putrevoke/putend can
     // be called surely
     if (storage_backend_) {
-        for (auto it = start_result.value().rbegin();
-             it != start_result.value().rend(); ++it) {
+        for (auto it = put_start.replicas.rbegin();
+             it != put_start.replicas.rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
@@ -2097,15 +2310,34 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+    // 方案二被动层：收集传输失败副本的目标端点，循环后上报 master。
+    // best-effort 归因：TransferWrite 失败也可能源于本地原因（staging 等），
+    // 误报由 worker 重挂载时 MountSegment 的 erase 自愈兜底。
+    // vsegment 副本 Descriptor 仅含逻辑位置，其物理端点经 TransferWrite
+    // 内部解析传输 plan 后回填到 failed_endpoints（条带成员级归因）。
+    std::set<std::string> failed_endpoints;
+    for (const auto& replica : put_start.replicas) {
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_vsegment_replica()) {
             // Transfer data using allocated handles from all replicas
             const auto replica_type = replica.is_memory_replica()
                                           ? ReplicaType::MEMORY
+                                      : replica.is_vsegment_replica()
+                                          ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err =
+                TransferWrite(replica, slices, &failed_endpoints);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
+                if (replica.is_memory_replica()) {
+                    failed_endpoints.insert(replica.get_memory_descriptor()
+                                                .buffer_descriptor
+                                                .transport_endpoint_);
+                } else if (replica.is_nof_replica()) {
+                    failed_endpoints.insert(replica.get_nof_descriptor()
+                                                .buffer_descriptor
+                                                .transport_endpoint_);
+                }
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
@@ -2119,6 +2351,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
 
+    // 方案二被动层：上报坏端点（不改变写语义——FLEXIBLE 部分成功仍成功）。
+    // 放在 put_latency 指标采集之后，避免上报 RPC 耗时污染写延迟统计。
+    ReportFailedEndpointsToMasters(failed_endpoints);
+
     const auto finalize_decision =
         DetermineFinalizeDecision(config, transfer_summary);
 
@@ -2127,7 +2363,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                  SpDiag::PerfLevel::MODULE);
         pt_end.Start();
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            put_start.operation_id);
         pt_end.End(end_result ? 0 : -1);
         if (!end_result) {
             ErrorCode err = end_result.error();
@@ -2138,8 +2375,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, put_start.operation_id);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             pt_full.End(-1);
@@ -2200,12 +2437,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Record transfer latency
+    PutStartResult& upsert_start = start_result.value();
     auto t0 = std::chrono::steady_clock::now();
 
     // Handle disk replicas first
     if (storage_backend_) {
-        for (auto it = start_result.value().rbegin();
-             it != start_result.value().rend(); ++it) {
+        for (auto it = upsert_start.replicas.rbegin();
+             it != upsert_start.replicas.rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 auto disk_descriptor = replica.get_disk_descriptor();
@@ -2215,17 +2453,28 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
-    // Transfer to memory replicas
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica()) {
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+    // 方案二被动层：收集传输失败副本的目标端点。vsegment 副本 Descriptor
+    // 仅含逻辑位置，其物理端点经 TransferWrite 内部解析传输 plan 后回填
+    // 到 failed_endpoints（条带成员级归因）。
+    std::set<std::string> failed_endpoints;
+    // Transfer to memory-class replicas (direct memory or vsegment).
+    for (const auto& replica : upsert_start.replicas) {
+        if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
+            ErrorCode transfer_err =
+                TransferWrite(replica, slices, &failed_endpoints);
             if (transfer_err != ErrorCode::OK) {
-                auto revoke_result =
-                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                if (replica.is_memory_replica()) {
+                    failed_endpoints.insert(replica.get_memory_descriptor()
+                                                .buffer_descriptor.transport_endpoint_);
+                }
+                auto revoke_result = master_client_.UpsertRevoke(
+                    key, ReplicaType::MEMORY, upsert_start.operation_id);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke upsert operation";
+                    ReportFailedEndpointsToMasters(failed_endpoints);
                     return tl::unexpected(revoke_result.error());
                 }
+                ReportFailedEndpointsToMasters(failed_endpoints);
                 return tl::unexpected(transfer_err);
             }
         }
@@ -2240,7 +2489,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     // End upsert operation
     auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
-                                               ReplicaType::MEMORY);
+                                               ReplicaType::MEMORY,
+                                               upsert_start.operation_id);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -2257,6 +2507,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     return {};
 }
+
+// 定义于 PutOperation 类之后（见下），此处仅声明供 BatchUpsert 调用。
+void AggregateBatchFailedEndpoints(const std::vector<PutOperation>& ops,
+                                   std::set<std::string>& out);
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
@@ -2287,7 +2541,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+
+    // 方案二被动层：聚合本批次全部操作的失败端点，批次末尾统一上报
+    // （不阻塞批次内各 key 的传输/收尾关键路径）。PutOperation 类定义在
+    // 本函数之后，须经 AggregateBatchFailedEndpoints 间接访问成员。
+    std::set<std::string> batch_failed_endpoints;
+    AggregateBatchFailedEndpoints(ops, batch_failed_endpoints);
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
+
+    return results;
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2304,10 +2567,18 @@ class PutOperation {
     struct PendingTransferRecord {
         ReplicaType replica_type;
         TransferFuture future;
+        // 方案二被动层：传输失败归因用，目标 worker 的 transport endpoint。
+        // memory/nof 副本单端点；vsegment 副本记录传输 plan 解析出的全部
+        // 条带成员端点（best-effort：无法定位具体失败成员，误报由 worker
+        // 重挂载时 MountSegment 的 erase 自愈兜底）。
+        std::vector<std::string> transport_endpoints;
 
-        PendingTransferRecord(ReplicaType type,
-                              TransferFuture&& transfer_future)
-            : replica_type(type), future(std::move(transfer_future)) {}
+        PendingTransferRecord(
+            ReplicaType type, TransferFuture&& transfer_future,
+            std::vector<std::string> endpoints = {})
+            : replica_type(type),
+              future(std::move(transfer_future)),
+              transport_endpoints(std::move(endpoints)) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -2330,6 +2601,13 @@ class PutOperation {
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
     ReplicaTransferSummary transfer_summary;
+
+    // 方案二被动层：本操作传输失败副本的目标端点集合。memory/nof 按副本
+    // Descriptor 端点归因；vsegment 副本 Descriptor 仅含逻辑位置，由
+    // SubmitTransfers/WaitForTransfers 经 PendingTransferRecord.
+    // transport_endpoints（传输 plan 全部条带成员端点）best-effort 归因。
+    // 批次结束后由调用方聚合上报 master。
+    std::set<std::string> failed_endpoints;
 
     // Error context for debugging
     std::optional<std::string> failure_context;
@@ -2403,6 +2681,16 @@ class PutOperation {
         return state == PutOperationState::SUCCESS && result.has_value();
     }
 };
+
+// 聚合一批操作的失败端点（方案二被动层）。独立于类外的自由函数：
+// Client::BatchUpsert 定义在 PutOperation 类之前，无法直接解引用
+// op.failed_endpoints（不完整类型），经由此前向声明的 helper 间接访问。
+void AggregateBatchFailedEndpoints(const std::vector<PutOperation>& ops,
+                                   std::set<std::string>& out) {
+    for (const auto& op : ops) {
+        out.insert(op.failed_endpoints.begin(), op.failed_endpoints.end());
+    }
+}
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
@@ -2576,11 +2864,20 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
+        op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
             op.SetError(start_responses[i].error(),
                         "Master failed to start upsert operation");
         } else {
             op.replicas = start_responses[i].value();
+            op.RecordAllocatedReplicas();
+            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+                op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                    PutOperationState::MASTER_FAILED,
+                                    "Allocated replicas do not satisfy "
+                                    "requested replica policy");
+                continue;
+            }
             VLOG(1) << "Successfully started upsert for key " << op.key
                     << " with " << op.replicas.size() << " replicas";
         }
@@ -2636,12 +2933,55 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            if (replica.is_memory_replica() || replica.is_nof_replica() ||
+                replica.is_vsegment_replica()) {
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
+                                          : replica.is_vsegment_replica()
+                                              ? ReplicaType::MEMORY
                                               : ReplicaType::NOF_SSD;
+                // 方案二被动层：提交时记录目标端点，供失败归因使用
+                std::vector<std::string> transport_endpoints;
+                if (replica.is_memory_replica()) {
+                    transport_endpoints.push_back(
+                        replica.get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
+                } else if (replica.is_nof_replica()) {
+                    transport_endpoints.push_back(
+                        replica.get_nof_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
+                }
                 std::optional<TransferFuture> submit_result;
-                if (replica.is_nof_replica()) {
+                if (replica.is_vsegment_replica()) {
+                    if (!vsegment_transfer_planner_) {
+                        op.transfer_summary.RecordFailure(
+                            replica_type, ErrorCode::INVALID_PARAMS);
+                        op.AppendFailureContext(
+                            "VSegmentTransferPlanner not initialized");
+                        continue;
+                    }
+                    std::vector<vsegment::ClientSlice> client_slices;
+                    client_slices.reserve(op.slices.size());
+                    for (const auto& slice : op.slices) {
+                        client_slices.push_back(
+                            {reinterpret_cast<uint64_t>(slice.ptr),
+                             slice.size});
+                    }
+                    auto plan = vsegment_transfer_planner_->Plan(
+                        replica.get_vsegment_descriptor(), client_slices);
+                    if (!plan) {
+                        op.transfer_summary.RecordFailure(replica_type,
+                                                          plan.error);
+                        op.AppendFailureContext(plan.detail);
+                        continue;
+                    }
+                    // vsegment 条带成员物理端点，失败时 best-effort 归因
+                    for (const auto& subrequest : plan.requests) {
+                        transport_endpoints.push_back(subrequest.endpoint);
+                    }
+                    submit_result = transfer_submitter_->submitVSegment(
+                        plan, TransferRequest::WRITE);
+                } else if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
                     if (!contiguous_range.has_value()) {
                         std::string failure_context =
@@ -2668,11 +3008,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     op.transfer_summary.RecordFailure(replica_type,
                                                       ErrorCode::TRANSFER_FAIL);
                     op.AppendFailureContext(failure_context);
+                    for (const auto& endpoint : transport_endpoints) {
+                        op.failed_endpoints.insert(endpoint);
+                    }
                     continue;
                 }
 
                 op.pending_transfers.emplace_back(
-                    replica_type, std::move(submit_result.value()));
+                    replica_type, std::move(submit_result.value()),
+                    std::move(transport_endpoints));
             }
         }
 
@@ -2694,6 +3038,12 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
+                // 方案二被动层：异步传输失败时按提交时记录的端点归因
+                // （vsegment 为 plan 解析出的全部条带成员端点，best-effort）
+                for (const auto& endpoint :
+                     pending_transfer.transport_endpoints) {
+                    op.failed_endpoints.insert(endpoint);
+                }
                 std::string error_context =
                     "Transfer " + std::to_string(i) + " failed";
                 op.AppendFailureContext(error_context);
@@ -2928,13 +3278,24 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
 
-        if (!op.IsResolved() && !op.replicas.empty() &&
-            !op.pending_transfers.empty()) {
+        if (op.IsResolved() || op.replicas.empty()) {
+            if (!op.replicas.empty()) {
+                failed_keys.emplace_back(op.key);
+                failed_indices.emplace_back(i);
+            }
+            continue;
+        }
+        const auto decision = DetermineFinalizeDecision(
+            op.ToReplicateConfig(), op.transfer_summary);
+        if (decision.success) {
             successful_object_metas.emplace_back(
                 ObjectMeta{op.key, op.object_checksum});
             successful_indices.emplace_back(i);
-        } else if (op.state != PutOperationState::PENDING &&
-                   !op.replicas.empty()) {
+        } else {
+            op.SetTerminalError(decision.error,
+                                PutOperationState::TRANSFER_FAILED,
+                                op.failure_context.value_or(
+                                    "Replica transfer failed before finalize"));
             failed_keys.emplace_back(op.key);
             failed_indices.emplace_back(i);
         }
@@ -3100,6 +3461,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     merged_ops.reserve(seg_to_ops.size());
     for (auto& seg_to_op : seg_to_ops) {
         auto& op = seg_to_op.second;
+        // 本合并组对应的目标端点（seg_to_ops 的 key 即 transport endpoint）
+        const std::string& seg = seg_to_op.first;
         bool all_transfers_submitted = true;
         std::string failure_context;
         merged_ops.emplace_back(op.key, op.slices);
@@ -3111,9 +3474,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
+            // 方案二被动层：submit 失败按目标端点归因
+            merged_op.failed_endpoints.insert(seg);
         } else {
             merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()));
+                ReplicaType::MEMORY, std::move(submit_result.value()),
+                std::vector<std::string>{seg});
         }
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
@@ -3161,7 +3527,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+
+    // 方案二被动层：聚合合并操作的失败端点，批次末尾统一上报
+    // （WaitForTransfers 已按 record 中的端点归因到 merged_op）。
+    std::set<std::string> batch_failed_endpoints;
+    for (const auto& merged : merged_ops) {
+        batch_failed_endpoints.insert(merged.failed_endpoints.begin(),
+                                       merged.failed_endpoints.end());
+    }
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
+
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
@@ -3193,6 +3570,33 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
+        const bool contains_vsegment = std::any_of(
+            ops.begin(), ops.end(), [](const PutOperation& op) {
+                return !op.IsResolved() &&
+                       std::any_of(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_vsegment_replica();
+                                   });
+            });
+        if (contains_vsegment) {
+            SubmitTransfers(ops);
+            WaitForTransfers(ops);
+            FinalizeBatchPut(ops);
+            auto results = CollectResults(ops);
+            const bool any_succeeded = std::any_of(
+                results.begin(), results.end(),
+                [](const auto& result) { return result.has_value(); });
+            pt_full.End(any_succeeded ? 0 : -1);
+            // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
+            // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
+            std::set<std::string> batch_failed_endpoints;
+            for (const auto& op : ops) {
+                batch_failed_endpoints.insert(op.failed_endpoints.begin(),
+                                              op.failed_endpoints.end());
+            }
+            ReportFailedEndpointsToMasters(batch_failed_endpoints);
+            return results;
+        }
         auto results = BatchPutWhenPreferSameNode(ops);
         const bool any_succeeded =
             std::any_of(results.begin(), results.end(),
@@ -3218,6 +3622,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         std::any_of(results.begin(), results.end(),
                     [](const auto& result) { return result.has_value(); });
     pt_full.End(any_succeeded ? 0 : -1);
+    // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
+    // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
+    std::set<std::string> batch_failed_endpoints;
+    for (const auto& op : ops) {
+        batch_failed_endpoints.insert(op.failed_endpoints.begin(),
+                                      op.failed_endpoints.end());
+    }
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
     return results;
 }
 
@@ -3580,6 +3992,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        // 方案 a：直接用 location 字符串作为 medium 上报。location 形如
+        // "cpu:0" / "cuda:0" / "ssd:0"，planner 的 --required_medium 用相同
+        // 字符串匹配即可。支持混合介质集群：不同 segment 可上报不同 medium。
+        // master 的 PublishSegmentOwnerForCvm 优先用此值，缺省回退集群默认。
+        segment.medium = location;
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -3866,6 +4283,8 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
         return response;
     }
 
+    local_disk_mounted_.store(true);
+    local_disk_offload_enabled_.store(enable_offloading);
     EnsureStorageControlPlaneStarted();
     return response;
 }
@@ -3896,6 +4315,7 @@ tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
                    << response.error();
         return tl::make_unexpected(response.error());
     }
+    ssd_total_capacity_bytes_.store(ssd_total_capacity_bytes);
     return {};
 }
 
@@ -3933,9 +4353,202 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
 }
 
+std::vector<std::string> Client::GetSubmasterAddresses() const {
+    return master_client_.GetSubmasterAddresses();
+}
+
+tl::expected<void, ErrorCode> Client::MountLocalDiskSegmentTo(
+    const std::string& address, bool enable_offloading) {
+    auto response = master_client_.MountLocalDiskSegmentTo(address, client_id_,
+                                                           enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegmentTo failed, addr=" << address
+                   << " error=" << response.error();
+        return response;
+    }
+    local_disk_mounted_.store(true);
+    local_disk_offload_enabled_.store(enable_offloading);
+    EnsureStorageControlPlaneStarted();
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegmentTo(
+    const std::string& address) {
+    return master_client_.UnmountLocalDiskSegmentTo(address, client_id_);
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeatTo(
+    const std::string& address, bool enable_offloading,
+    std::vector<OffloadTaskItem>& offloading_objects) {
+    auto response = master_client_.OffloadObjectHeartbeatTo(
+        address, client_id_, enable_offloading);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::ReportSsdCapacityTo(
+    const std::string& address, int64_t ssd_total_capacity_bytes) {
+    auto response = master_client_.ReportSsdCapacityTo(
+        address, client_id_, ssd_total_capacity_bytes);
+    if (!response) {
+        LOG(WARNING) << "ReportSsdCapacityTo failed, addr=" << address
+                     << " error=" << response.error();
+    }
+    return response;
+}
+
+tl::expected<bool, ErrorCode> Client::PollRemoveAllTo(
+    const std::string& address) {
+    return master_client_.PollRemoveAllTo(address, client_id_);
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+Client::RemoveObjectHeartbeatTo(const std::string& address) {
+    return master_client_.RemoveObjectHeartbeatTo(address, client_id_);
+}
+
+tl::expected<void, ErrorCode> Client::AckRemoveObjectHeartbeatTo(
+    const std::string& address, const std::vector<RemoveTaskItem>& tasks) {
+    return master_client_.AckRemoveObjectHeartbeatTo(address, client_id_,
+                                                      tasks);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccessRouted(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    // 旧签名重载：无来源信息（source 为空），转发到双投实现。
+    std::vector<SourcedOffloadTask> sourced_tasks;
+    sourced_tasks.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        sourced_tasks.push_back(SourcedOffloadTask{task, std::string()});
+    }
+    return NotifyOffloadSuccessRouted(sourced_tasks, metadatas);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccessRouted(
+    const std::vector<SourcedOffloadTask>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    const auto addresses = master_client_.GetSubmasterAddresses();
+    if (addresses.empty()) {
+        // 单 master 模式（路由表未加载）：走当前连接，与非定向等价。
+        std::vector<OffloadTaskItem> plain_tasks;
+        plain_tasks.reserve(tasks.size());
+        for (const auto& st : tasks) {
+            plain_tasks.push_back(st.task);
+        }
+        return master_client_.NotifyOffloadSuccess(client_id_, plain_tasks,
+                                                   metadatas);
+    }
+
+    // 多 submaster：双投清理协议。按目标地址分组：
+    // - 成功通知投 owner（建副本）；source 非空且 != owner 时双投
+    //   source（master 侧"仅清理"语义）。
+    // - NACK（data_size<0）只投 source（任务状态只在 source 上）。
+    // - owner 未解析投 source；source 也空才回退当前连接。
+    if (tasks.size() != metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::map<std::string,
+             std::pair<std::vector<OffloadTaskItem>,
+                       std::vector<StorageObjectMetadata>>>
+        grouped;
+    std::vector<OffloadTaskItem> fallback_tasks;
+    std::vector<StorageObjectMetadata> fallback_metadatas;
+    size_t dual_delivery_count = 0;
+    size_t unresolved_count = 0;
+    const auto add_to_group =
+        [&grouped](const std::string& addr, const OffloadTaskItem& task,
+                   const StorageObjectMetadata& metadata) {
+            auto& [g_tasks, g_metas] = grouped[addr];
+            g_tasks.push_back(task);
+            g_metas.push_back(metadata);
+        };
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const auto& st = tasks[i];
+        const bool is_nack = metadatas[i].data_size < 0;
+        auto owner =
+            master_client_.ResolveSubmasterFor(st.task.tenant_id, st.task.key);
+        const auto& source = st.source_address;
+        if (is_nack) {
+            // NACK：清理语义，任务状态只在 source 上。
+            if (!source.empty()) {
+                add_to_group(source, st.task, metadatas[i]);
+            } else {
+                fallback_tasks.push_back(st.task);
+                fallback_metadatas.push_back(metadatas[i]);
+            }
+            continue;
+        }
+        if (owner) {
+            add_to_group(*owner, st.task, metadatas[i]);
+            if (!source.empty() && source != *owner) {
+                // 双投：slot 已从 source 迁往 owner，source 上的任务
+                // 状态（源副本 refcnt pin）需要"仅清理"通知闭环。
+                add_to_group(source, st.task, metadatas[i]);
+                ++dual_delivery_count;
+            }
+        } else if (!source.empty()) {
+            // owner 未解析：投 source。source 侧 slot 校验决定建副本
+            // （路由表滞后，slot 实际还在 source）或清理（已迁移）。
+            add_to_group(source, st.task, metadatas[i]);
+            ++unresolved_count;
+        } else {
+            fallback_tasks.push_back(st.task);
+            fallback_metadatas.push_back(metadatas[i]);
+            ++unresolved_count;
+        }
+    }
+    if (dual_delivery_count > 0 || unresolved_count > 0) {
+        VLOG(1) << "NotifyOffloadSuccessRouted: tasks=" << tasks.size()
+                << " dual_delivery=" << dual_delivery_count
+                << " unresolved=" << unresolved_count;
+    }
+
+    std::optional<ErrorCode> first_error;
+    for (const auto& [address, group] : grouped) {
+        const auto& [g_tasks, g_metas] = group;
+        auto result = master_client_.NotifyOffloadSuccessTo(
+            address, client_id_, g_tasks, g_metas);
+        if (!result) {
+            LOG(WARNING) << "NotifyOffloadSuccessTo failed, addr=" << address
+                         << " error=" << result.error()
+                         << " tasks=" << g_tasks.size();
+            if (!first_error) {
+                first_error = result.error();
+            }
+        }
+    }
+    if (!fallback_tasks.empty()) {
+        auto result = master_client_.NotifyOffloadSuccess(client_id_,
+                                                          fallback_tasks,
+                                                          fallback_metadatas);
+        if (!result && !first_error) {
+            first_error = result.error();
+        }
+    }
+    if (first_error) {
+        return tl::make_unexpected(*first_error);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    promotion_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeatTo(
+    const std::string& address,
+    std::vector<PromotionTaskItem>& promotion_objects) {
+    auto response = master_client_.PromotionObjectHeartbeatTo(address, client_id_);
     if (!response) {
         return tl::make_unexpected(response.error());
     }
@@ -3989,6 +4602,29 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
 }
 
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStartTo(const std::string& address, const std::string& key,
+                              const std::string& tenant_id, uint64_t size,
+                              const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStartTo(address, client_id_, key,
+                                                tenant_id, size,
+                                                preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccessTo(
+    const std::string& address, const std::string& key,
+    const std::string& tenant_id) {
+    return master_client_.NotifyPromotionSuccessTo(address, client_id_, key,
+                                                   tenant_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailureTo(
+    const std::string& address, const std::string& key,
+    const std::string& tenant_id) {
+    return master_client_.NotifyPromotionFailureTo(address, client_id_, key,
+                                                   tenant_id);
+}
+
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
                                  std::vector<Slice>& slices) {
     return TransferWrite(memory_descriptor, slices);
@@ -4032,16 +4668,16 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
     };
 
-    // currently only memory source replica is supported
-    if (!source.is_memory_replica()) {
+    if (!source.is_memory_replica() && !source.is_vsegment_replica()) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
                    << ", key=" << key << ", error=invalid_replica_type";
         revoke_lambda();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source)) {
+    // A local memory source can be transferred zero-copy. A vsegment source
+    // is remote and striped, so read it into registered staging memory first.
+    if (source.is_memory_replica() && !IsReplicaOnLocalMemory(source)) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
                    << ", key=" << key
                    << ", error=source_replica_not_in_local_memory";
@@ -4049,12 +4685,35 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
     }
 
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    auto slices = split_into_slices(buffer, buffer_descriptor.size_);
+    std::optional<BufferHandle> staging;
+    std::vector<Slice> slices;
+    if (source.is_memory_replica()) {
+        const auto& buffer_descriptor =
+            source.get_memory_descriptor().buffer_descriptor;
+        void* buffer =
+            reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
+        slices = split_into_slices(buffer, buffer_descriptor.size_);
+    } else {
+        if (!replica_transfer_staging_allocator_) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key
+                       << ", error=staging_allocator_unavailable";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        const auto length =
+            source.get_vsegment_descriptor().length;
+        staging = replica_transfer_staging_allocator_->allocate(length);
+        if (!staging) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        slices = split_into_slices(*staging);
+        if (TransferRead(source, slices) != ErrorCode::OK) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+    }
 
     // Transfer to each target
     for (const auto& target : targets) {
@@ -4327,34 +4986,99 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               std::set<std::string>* failed_endpoints) {
+    // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
+    // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
+    // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
+    const bool is_read = (op_code == TransferRequest::READ);
+    SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_TRANSFER_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_submit(PerfKey::GET_SINGLE_TRANSFER_SUBMIT,
+                                SpDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_wait(PerfKey::GET_SINGLE_TRANSFER_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    if (is_read) pt_full.Start();
+
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
+        if (is_read) pt_full.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
     std::optional<TransferFuture> future;
-    if (replica_descriptor.is_nof_replica()) {
+    // vsegment 传输 plan 解析出的条带成员物理端点，失败时 best-effort 归因
+    // （无法定位具体失败成员，全部上报；误报由 worker 重挂载自愈兜底）。
+    std::vector<std::string> vsegment_plan_endpoints;
+    if (replica_descriptor.is_vsegment_replica()) {
+        if (!vsegment_transfer_planner_) {
+            LOG(ERROR) << "VSegmentTransferPlanner not initialized";
+            if (is_read) pt_full.End(-1);
+            return ErrorCode::INVALID_PARAMS;
+        }
+        std::vector<vsegment::ClientSlice> client_slices;
+        client_slices.reserve(slices.size());
+        for (const auto& slice : slices) {
+            client_slices.push_back(
+                {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+        }
+        auto plan = vsegment_transfer_planner_->Plan(
+            replica_descriptor.get_vsegment_descriptor(), client_slices);
+        if (!plan) {
+            LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
+            if (is_read) pt_full.End(-1);
+            return plan.error;
+        }
+        for (const auto& subrequest : plan.requests) {
+            vsegment_plan_endpoints.push_back(subrequest.endpoint);
+        }
+        if (is_read) pt_submit.Start();
+        future = transfer_submitter_->submitVSegment(plan, op_code);
+        if (is_read) pt_submit.End(future ? 0 : -1);
+    } else if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
+            if (is_read) pt_full.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
+        if (is_read) pt_submit.Start();
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
                                              contiguous_range->size);
+        if (is_read) pt_submit.End(future ? 0 : -1);
     } else {
+        if (is_read) pt_submit.Start();
         future =
             transfer_submitter_->submit(replica_descriptor, slices, op_code);
+        if (is_read) pt_submit.End(future ? 0 : -1);
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        if (failed_endpoints) {
+            for (const auto& endpoint : vsegment_plan_endpoints) {
+                failed_endpoints->insert(endpoint);
+            }
+        }
+        if (is_read) pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    return future->get();
+    if (is_read) pt_wait.Start();
+    const ErrorCode transfer_result = future->get();
+    if (transfer_result != ErrorCode::OK && failed_endpoints) {
+        for (const auto& endpoint : vsegment_plan_endpoints) {
+            failed_endpoints->insert(endpoint);
+        }
+    }
+    if (is_read) {
+        const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+        pt_wait.End(pt_status);
+        pt_full.End(pt_status);
+    }
+    return transfer_result;
 }
 
 ErrorCode Client::TransferReadInternal(
@@ -4363,6 +5087,33 @@ ErrorCode Client::TransferReadInternal(
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (replica_descriptor.is_vsegment_replica()) {
+        if (!vsegment_transfer_planner_) return ErrorCode::INVALID_PARAMS;
+        auto replica = replica_descriptor.get_vsegment_descriptor();
+        uint64_t length = 0;
+        std::vector<vsegment::ClientSlice> client_slices;
+        client_slices.reserve(slices.size());
+        for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<uint64_t>::max() - length)
+                return ErrorCode::INVALID_PARAMS;
+            length += slice.size;
+            client_slices.push_back(
+                {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+        }
+        if (src_offset > replica.length || length > replica.length - src_offset)
+            return ErrorCode::INVALID_PARAMS;
+        if (src_offset > std::numeric_limits<uint64_t>::max() -
+                             replica.logical_offset)
+            return ErrorCode::INVALID_PARAMS;
+        replica.logical_offset += src_offset;
+        replica.length = length;
+        auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
+        if (!plan) return plan.error;
+        auto future = transfer_submitter_->submitVSegment(
+            plan, TransferRequest::READ);
+        return future ? future->get() : ErrorCode::TRANSFER_FAIL;
     }
 
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
@@ -4378,12 +5129,19 @@ ErrorCode Client::TransferReadInternal(
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                std::vector<Slice>& slices,
+                                std::set<std::string>* failed_endpoints) {
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
+                        failed_endpoints);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices) {
+    // 读传输整窗（size 校验 + TransferData 读分支）；内部 GET_SINGLE_
+    // TRANSFER_FULL 为其子窗，差值即校验开销
+    SpDiag::PerfPoint pt_read(PerfKey::GET_SINGLE_TRANSFER_READ,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_read.Start();
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -4397,16 +5155,22 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     } else if (replica_descriptor.is_local_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
         total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_vsegment_replica()) {
+        total_size = replica_descriptor.get_vsegment_descriptor().length;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
     if (slices_size < total_size) {
         LOG(ERROR) << "Slice size " << slices_size << " is smaller than total "
                    << "size " << total_size;
+        pt_read.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    const ErrorCode read_result =
+        TransferData(replica_descriptor, slices, TransferRequest::READ);
+    pt_read.End(read_result == ErrorCode::OK ? 0 : -1);
+    return read_result;
 }
 
 ErrorCode Client::TransferReadRange(
@@ -4686,6 +5450,28 @@ void Client::RefreshSubmasterAddresses() {
                                  << " error=" << r.error();
                 }
             }
+            // LOCAL_DISK 段对称补挂：新 submaster 上线后其 slot 的 offload
+            // 决策需要本 client 的 LocalDiskSegment；不补挂则首个心跳周期
+            // 内该 master 的任务拉取会 SEGMENT_NOT_FOUND（靠定向恢复兜底，
+            // 延迟一个心跳周期）。补挂后重报容量，恢复其 SSD 记账分母。
+            if (local_disk_mounted_.load()) {
+                const bool enable_offloading =
+                    local_disk_offload_enabled_.load();
+                auto r = master_client_.MountLocalDiskSegmentTo(
+                    addr, client_id_, enable_offloading);
+                if (!r) {
+                    LOG(WARNING)
+                        << "mount_local_disk_segment_to_new_submaster_failed"
+                        << " addr=" << addr << " error=" << r.error();
+                } else {
+                    const int64_t capacity = ssd_total_capacity_bytes_.load();
+                    if (capacity > 0) {
+                        (void)master_client_.ReportSsdCapacityTo(addr,
+                                                                 client_id_,
+                                                                 capacity);
+                    }
+                }
+            }
         }
     }
 
@@ -4702,6 +5488,18 @@ void Client::RefreshSubmasterAddresses() {
                     LOG(WARNING)
                         << "unmount_segment_from_removed_submaster_failed addr="
                         << addr << " id=" << seg_id << " error=" << r.error();
+                }
+            }
+            // LOCAL_DISK 段对称卸载：被移除的 submaster 不再是任何 slot 的
+            // owner，其容量记账若不清理将永久泄漏（重复计数会污染
+            // SSD_FREE_RATIO_FIRST 分配策略）。
+            if (local_disk_mounted_.load()) {
+                auto r = master_client_.UnmountLocalDiskSegmentTo(addr,
+                                                                  client_id_);
+                if (!r) {
+                    LOG(WARNING)
+                        << "unmount_local_disk_segment_from_removed_submaster"
+                        << "_failed addr=" << addr << " error=" << r.error();
                 }
             }
         }

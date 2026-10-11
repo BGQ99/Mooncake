@@ -4,9 +4,13 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
+#include <charconv>
 #include <future>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -17,12 +21,35 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "etcd_helper.h"
+#include "cvm/etcd_view_store.h"
+#include "cvm/slot_hash.h"
 #include "partition/kv_hash_map.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
+
 namespace mooncake {
+
+namespace {
+
+std::optional<uint16_t> ParsePartitionSlot(
+    const std::string& partition_id) {
+    uint32_t value = 0;
+    const char* begin = partition_id.data();
+    const char* end = begin + partition_id.size();
+    const auto [ptr, error] = std::from_chars(begin, end, value);
+    if (partition_id.empty() || error != std::errc{} || ptr != end ||
+        value >= cvm::kSlotCount) {
+        return std::nullopt;
+    }
+    return static_cast<uint16_t>(value);
+}
+
+}  // namespace
 
 template <auto Method>
 struct RpcNameTraits;
@@ -40,6 +67,31 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVSegmentView> {
+    static constexpr const char* value = "GetVSegmentView";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
+    static constexpr const char* value = "GetPSegmentEndpoint";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutStart> {
+    static constexpr const char* value = "VSegmentPutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutEnd> {
+    static constexpr const char* value = "VSegmentPutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutRevoke> {
+    static constexpr const char* value = "VSegmentPutRevoke";
 };
 
 template <>
@@ -93,37 +145,13 @@ struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutStart> {
-    static constexpr const char* value = "VChunkPutStart";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutEnd> {
-    static constexpr const char* value = "VChunkPutEnd";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutRevoke> {
-    static constexpr const char* value = "VChunkPutRevoke";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetVChunk> {
-    static constexpr const char* value = "GetVChunk";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::ReleaseVChunkReadLease> {
-    static constexpr const char* value = "ReleaseVChunkReadLease";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::RemoveVChunk> {
-    static constexpr const char* value = "RemoveVChunk";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetVChunkRuntimeInfo> {
-    static constexpr const char* value = "GetVChunkRuntimeInfo";
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
+    static constexpr const char* value = "BatchPutRevoke";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
-    static constexpr const char* value = "BatchPutRevoke";
+struct RpcNameTraits<&WrappedMasterService::ReportInvalidReplicaEndpoints> {
+    static constexpr const char* value = "ReportInvalidReplicaEndpoints";
 };
 
 template <>
@@ -254,6 +282,11 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
     static constexpr const char* value = "MountLocalDiskSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
 };
 
 template <>
@@ -575,6 +608,74 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
+    const std::string& tenant_id, const std::string& key, Args... args) {
+    auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+
+    if (!result && (result.error() == ErrorCode::SLOT_NOT_OWNED ||
+                    result.error() == ErrorCode::STALE_ROUTE)) {
+        // 环已变化（成员增删）或分区路由 epoch 过期（owner 推导两模型
+        // 切换的瞬态 / vsegment manager 尚未随心跳安装）：都是路由态过期，
+        // 刷新路由 + 重切到新 owner，重试一次。
+        // 节流告警（防刷屏）：重试本身高频（启动瞬态/切换窗口），仅首条
+        // 立即打、其后至多 60s 一条并带窗口内累计数，绝不逐次打印。
+        static std::atomic<uint64_t> route_retry_count{0};
+        static std::atomic<int64_t> last_route_retry_warn_ms{0};
+        route_retry_count.fetch_add(1, std::memory_order_relaxed);
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        int64_t last_ms = last_route_retry_warn_ms.load(
+            std::memory_order_relaxed);
+        if ((last_ms == 0 || now_ms - last_ms >= 60000) &&
+            last_route_retry_warn_ms.compare_exchange_strong(
+                last_ms, now_ms, std::memory_order_relaxed)) {
+            const uint64_t suppressed = route_retry_count.exchange(
+                0, std::memory_order_relaxed);
+            LOG(WARNING) << "routed RPC hit stale routing (SLOT_NOT_OWNED/"
+                         << "STALE_ROUTE), retried after refresh: "
+                         << suppressed << " retries since last notice";
+        }
+        // 重试整窗（含 RefreshSubmasterRouting 同步 etcd 全表重载 +
+        // SwitchToSubmaster 建连 + 二次 RPC）。正常≈0，飙升即迁移动荡。
+        // 与上面 60s 节流 WARNING 互补：日志看拐点，本点看分布。
+        SpDiag::PerfPoint pt_retry(PerfKey::CVM_ROUTE_STALE_RETRY,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_retry.Start();
+        if (RefreshSubmasterRouting() == ErrorCode::OK &&
+            SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+            auto retry_result =
+                invoke_rpc<ServiceMethod, ReturnType>(args...);
+            pt_retry.End(retry_result ? 0 : -1);
+            return retry_result;
+        }
+        pt_retry.End(-1);
+    } else if (!result && result.error() == ErrorCode::SLOT_MIGRATING) {
+        // owner 已 expected 但元数据尚未 import/replay 完成：环不变，退避
+        // （有界）后原地重试，等待元数据就绪。
+        // 迁移窗口期退避总时长（含 sleep + 重试 RPC），DEBUG 级：
+        // 仅迁移窗口可见，平时零流量。
+        SpDiag::PerfPoint pt_backoff(PerfKey::CVM_ROUTE_BACKOFF,
+                                     SpDiag::PerfLevel::DEBUG);
+        pt_backoff.Start();
+        constexpr int kMaxRetries = 3;
+        for (int i = 0; i < kMaxRetries; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20 << i));
+            auto attempt = invoke_rpc<ServiceMethod, ReturnType>(args...);
+            if (!attempt || attempt.error() != ErrorCode::SLOT_MIGRATING) {
+                pt_backoff.End(attempt ? 0 : -1);
+                return attempt;
+            }
+            result = std::move(attempt);
+        }
+        pt_backoff.End(-1);  // 耗尽重试仍 MIGRATING
+    }
+
+    return result;
+}
+
 MasterClient::~MasterClient() = default;
 
 void MasterClient::WarmupRpcPool() {
@@ -705,23 +806,37 @@ std::optional<std::string> MasterClient::ResolveSubmaster(
     return submaster;
 }
 
-void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
-    const std::string old_address = client_accessor_.GetAddress();
-    client_accessor_.GetOrCreateClientPool(address);
-    if (old_address != address) {
-        LOG(INFO) << "SwitchToSubmasterByAddress: [" << old_address << "] -> ["
-                  << address << "]";
+std::optional<std::string> MasterClient::ResolveSubmasterFor(
+    const std::string& tenant_id, const std::string& key) const {
+    // 路由表未加载（单 master 模式）：直接 nullopt，调用方回退非定向。
+    // miss 不打日志——批量分组场景由调用方聚合计数，避免逐 key 刷屏。
+    if (partition_router_.Size() == 0) {
+        return std::nullopt;
     }
+    const TenantId tenant(tenant_id);
+    return partition_router_.ResolveSubmasterQuiet(
+        partition::KvHashMap::Compute(tenant, key));
+}
+
+void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
+    client_accessor_.GetOrCreateClientPool(address);
 }
 
 ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
                                           const std::string& key) {
+    // 路由打点（读写共键）：status 0=hit 切换(含建连) / 2=miss 失败。
+    // 单 master 表空路径不激活（未 Start 的点析构干净），避免零流量稀释；
+    // miss 率 = badCount/tickCount，延迟分布即多 submaster 路由开销
+    // （含 GetOrCreateClientPool 新 submaster 首次建连成本）。
+    SpDiag::PerfPoint pt_switch(PerfKey::CVM_ROUTE_SWITCH,
+                                SpDiag::PerfLevel::KEY_MODULE);
     // Routing not loaded (single-master mode): keep the current connection so
     // existing behavior is preserved. Check Size() before ResolveSubmaster to
     // avoid its per-miss WARNING log firing on every single-key request.
     if (partition_router_.Size() == 0) {
         return ErrorCode::OK;
     }
+    pt_switch.Start();
 
     const TenantId tenant(tenant_id);
     const uint16_t slot = partition::KvHashMap::Compute(tenant, key);
@@ -730,13 +845,50 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
         LOG(WARNING) << "SwitchToSubmaster miss: tenant=" << tenant_id
                      << " key=" << key << " slot=" << slot
                      << " (slot has no owner in routing table)";
+        pt_switch.End(2);
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     SwitchToSubmasterByAddress(*submaster);
     LOG(INFO) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
               << " slot=" << slot << " -> submaster=" << *submaster;
+    pt_switch.End(0);
     return ErrorCode::OK;
+}
+
+tl::expected<std::string, ErrorCode>
+MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
+    std::string cluster_namespace;
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        cluster_namespace = routing_cluster_namespace_;
+    }
+    // No routing configuration means an intentional legacy single-master
+    // deployment. An empty slot table alone is not sufficient evidence: it
+    // also occurs during startup and failed refreshes.
+    if (cluster_namespace.empty()) return std::string{};
+
+    if (auto slot = ParsePartitionSlot(partition_id)) {
+        auto target = partition_router_.ResolveSubmaster(*slot);
+        if (!target) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return *target;
+    }
+
+    partition::PartitionRoute route;
+    ViewVersionId version = 0;
+    auto error = cvm::EtcdViewStore::LoadPartitionRoute(
+        cluster_namespace, partition_id, route, version);
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    if (route.partition_id.partition_id != partition_id ||
+        route.owner_submaster_id.empty() ||
+        route.state !=
+            static_cast<int32_t>(partition::PartitionState::kActive)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    return route.owner_submaster_id;
 }
 
 std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
@@ -774,8 +926,9 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(
-        object_key, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::ExistKey,
+                                            bool>(
+        tenant_id_.value(), object_key, object_key, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -881,6 +1034,87 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     return GetReplicaList(object_key, tenant_id_.value());
 }
 
+tl::expected<vsegment::VSegmentView, ErrorCode>
+MasterClient::GetVSegmentView(const std::string& partition_id,
+                              const std::string& vsegment_id) {
+    auto target = ResolveVSegmentSubmaster(partition_id);
+    if (!target) return tl::make_unexpected(target.error());
+    if (!target->empty()) {
+        return invoke_rpc_to<&WrappedMasterService::GetVSegmentView,
+                             vsegment::VSegmentView>(*target, partition_id,
+                                                     vsegment_id);
+    }
+    return invoke_rpc<&WrappedMasterService::GetVSegmentView,
+                      vsegment::VSegmentView>(partition_id, vsegment_id);
+}
+
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+MasterClient::GetPSegmentEndpoint(const std::string& segment_id) {
+    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint,
+                      vsegment::PSegmentLocation>(segment_id);
+}
+
+vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    auto invoke = [&]()
+        -> tl::expected<vsegment::VSegmentPutStartResult, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutStart,
+                              vsegment::VSegmentPutStartResult>(
+                partition_id, route_epoch, operation_id, length,
+                profile_name);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutStart,
+                             vsegment::VSegmentPutStartResult>(
+            *target, partition_id, route_epoch, operation_id, length,
+            profile_name);
+    };
+    auto result = invoke();
+    if (result) return std::move(result.value());
+    return {result.error(), operation_id, {}, "vsegment PutStart RPC failed"};
+}
+
+ErrorCode MasterClient::VSegmentPutEnd(
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(replica.partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutEnd,
+                              ErrorCode>(replica, route_epoch, operation_id,
+                                         object_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutEnd, ErrorCode>(
+            *target, replica, route_epoch, operation_id, object_id);
+    };
+    auto result = invoke();
+    return result ? result.value() : result.error();
+}
+
+ErrorCode MasterClient::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutRevoke,
+                              ErrorCode>(partition_id, vsegment_id,
+                                         route_epoch, operation_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutRevoke,
+                             ErrorCode>(*target, partition_id, vsegment_id,
+                                        route_epoch, operation_id);
+    };
+    auto result = invoke();
+    return result ? result.value() : result.error();
+}
+
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
@@ -893,9 +1127,9 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id,
-                                                     trace_id, client_id_);
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
+        tenant_id, object_key, object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -956,7 +1190,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     return results;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 MasterClient::PutStart(const std::string& key,
                        const std::vector<size_t>& slice_lengths,
                        const ReplicateConfig& config) {
@@ -975,9 +1209,10 @@ MasterClient::PutStart(const std::string& key,
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::PutStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value(), trace_id);
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::PutStart, PutStartResult>(
+        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
+        tenant_id_.value(), trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1049,7 +1284,8 @@ MasterClient::BatchPutStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const std::string& operation_id) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
 
@@ -1061,8 +1297,10 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value(), trace_id);
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutEnd,
+                                            void>(
+        tenant_id_.value(), object_meta.key, client_id_, object_meta,
+        replica_type, tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1122,7 +1360,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type,
+    const std::string& operation_id) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
@@ -1132,122 +1371,12 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutRevoke,
+                                            void>(
+        tenant_id_.value(), key, client_id_, key, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
-}
-
-tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
-    const std::string& tenant_id, const std::string& key, uint64_t total_size,
-    int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
-                             VChunkMetadataRecord>(tenant_id, key, total_size,
-                                                   now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
-                            VChunkMetadataRecord>(tenant_id, key, total_size,
-                                                  now_ms);
-    }
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-        tenant_id, key, vchunk_id, now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-            tenant_id, key, vchunk_id, now_ms);
-    }
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-        tenant_id, key, vchunk_id);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-            tenant_id, key, vchunk_id);
-    }
-    return result;
-}
-
-tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
-    const std::string& tenant_id, const std::string& key) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    auto result = invoke_rpc<&WrappedMasterService::GetVChunk,
-                             VChunkReadLease>(tenant_id, key);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::GetVChunk,
-                            VChunkReadLease>(tenant_id, key);
-    }
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& lease_id) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return invoke_rpc<&WrappedMasterService::ReleaseVChunkReadLease, void>(
-        lease_id);
-}
-
-tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    auto result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-        tenant_id, key, now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-            tenant_id, key, now_ms);
-    }
-    return result;
-}
-
-tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
-    return invoke_rpc<&WrappedMasterService::GetVChunkRuntimeInfo,
-                      VChunkRuntimeInfo>();
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
@@ -1296,7 +1425,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     return results;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 MasterClient::UpsertStart(const std::string& key,
                           const std::vector<size_t>& slice_lengths,
                           const ReplicateConfig& config) {
@@ -1314,9 +1443,10 @@ MasterClient::UpsertStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::UpsertStart, PutStartResult>(
+        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
+        tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1386,7 +1516,8 @@ MasterClient::BatchUpsertStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const std::string& operation_id) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
 
@@ -1397,8 +1528,10 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
+                                            void>(
+        tenant_id_.value(), object_meta.key, client_id_, object_meta,
+        replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1456,7 +1589,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type,
+    const std::string& operation_id) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
 
@@ -1466,8 +1600,10 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::UpsertRevoke, void>(
+        tenant_id_.value(), key, client_id_, key, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1527,8 +1663,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(
-        key, force, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::Remove, void>(
+        tenant_id_.value(), key, key, force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1769,6 +1905,10 @@ std::string MasterClient::GetCurrentAddress() const {
     return client_accessor_.GetAddress();
 }
 
+std::vector<std::string> MasterClient::GetSubmasterAddresses() const {
+    return partition_router_.GetAllPrimaryAddresses();
+}
+
 tl::expected<PingResponse, ErrorCode> MasterClient::PingTo(
     const std::string& address) {
     ScopedVLogTimer timer(1, "MasterClient::PingTo");
@@ -1836,6 +1976,32 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegmentTo(
+    const std::string& address, const UUID& client_id,
+    bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegmentTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::MountLocalDiskSegment, void>(
+            address, client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegmentTo(
+    const std::string& address, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegmentTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            address, client_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return CreateCopyTask(key, tenant_id_.value(), targets);
@@ -1886,12 +2052,40 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+MasterClient::OffloadObjectHeartbeatTo(const std::string& address,
+                                       const UUID& client_id,
+                                       bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::OffloadObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::OffloadObjectHeartbeat,
+                      std::vector<OffloadTaskItem>>(address, client_id,
+                                                    enable_offloading);
+    return result;
+}
+
 tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
     ScopedVLogTimer timer(1, "MasterClient::PollRemoveAll");
     timer.LogRequest("client_id=", client_id_);
 
     auto result =
         invoke_rpc<&WrappedMasterService::PollRemoveAll, bool>(client_id_);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::PollRemoveAllTo(
+    const std::string& address, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::PollRemoveAllTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::PollRemoveAll, bool>(address,
+                                                                   client_id);
     timer.LogResponse("should_remove_all=",
                       result.has_value() ? result.value() : false);
     return result;
@@ -1904,6 +2098,33 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
     return invoke_rpc<&WrappedMasterService::ReportSsdCapacity, void>(
         client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacityTo(
+    const std::string& address, const UUID& client_id,
+    int64_t ssd_total_capacity_bytes) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportSsdCapacityTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
+    return invoke_rpc_to<&WrappedMasterService::ReportSsdCapacity, void>(
+        address, client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportInvalidReplicaEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportInvalidReplicaEndpoints");
+    timer.LogRequest("endpoints_count=", endpoints.size());
+    return invoke_rpc<&WrappedMasterService::ReportInvalidReplicaEndpoints,
+                     void>(endpoints);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportInvalidReplicaEndpointsTo(
+    const std::string& address, const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportInvalidReplicaEndpointsTo");
+    timer.LogRequest("address=", address, ", endpoints_count=",
+                     endpoints.size());
+    return invoke_rpc_to<&WrappedMasterService::ReportInvalidReplicaEndpoints,
+                         void>(address, endpoints);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
@@ -1931,6 +2152,22 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccessTo(
+    const std::string& address, const UUID& client_id,
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccessTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", tasks_count=", tasks.size(),
+                     ", metadatas_count=", metadatas.size());
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyOffloadSuccess, void>(
+            address, client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 MasterClient::GetOffloadEndpoints() {
     ScopedVLogTimer timer(1, "MasterClient::GetOffloadEndpoints");
@@ -1950,12 +2187,31 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
                       std::vector<PromotionTaskItem>>(client_id);
 }
 
+tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+MasterClient::PromotionObjectHeartbeatTo(const std::string& address,
+                                         const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+    return invoke_rpc_to<&WrappedMasterService::PromotionObjectHeartbeat,
+                        std::vector<PromotionTaskItem>>(address, client_id);
+}
+
 tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
 MasterClient::RemoveObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveObjectHeartbeat");
     timer.LogRequest("client_id=", client_id.first, ":", client_id.second);
     return invoke_rpc<&WrappedMasterService::RemoveObjectHeartbeat,
                       std::vector<RemoveTaskItem>>(client_id);
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+MasterClient::RemoveObjectHeartbeatTo(const std::string& address,
+                                      const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::RemoveObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id.first,
+                     ":", client_id.second);
+    return invoke_rpc_to<&WrappedMasterService::RemoveObjectHeartbeat,
+                         std::vector<RemoveTaskItem>>(address, client_id);
 }
 
 tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeat(
@@ -1965,6 +2221,16 @@ tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeat(
                      " tasks=", tasks.size());
     return invoke_rpc<&WrappedMasterService::AckRemoveObjectHeartbeat, void>(
         client_id, tasks);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeatTo(
+    const std::string& address, const UUID& client_id,
+    const std::vector<RemoveTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "MasterClient::AckRemoveObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id.first,
+                     ":", client_id.second, " tasks=", tasks.size());
+    return invoke_rpc_to<&WrappedMasterService::AckRemoveObjectHeartbeat,
+                         void>(address, client_id, tasks);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
@@ -2022,6 +2288,51 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
     auto result =
         invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
             client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+MasterClient::PromotionAllocStartTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionAllocStartTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id,
+                     ", size=", size,
+                     ", preferred_count=", preferred_segments.size());
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::PromotionAllocStart,
+                     PromotionAllocStartResponse>(address, client_id, key,
+                                                  tenant_id, size,
+                                                  preferred_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccessTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionSuccessTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyPromotionSuccess, void>(
+            address, client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailureTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionFailureTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyPromotionFailure, void>(
+            address, client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }

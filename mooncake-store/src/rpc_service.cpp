@@ -8,7 +8,6 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "common.h"
 #include "ha_metric_manager.h"
 #include "master_admin_service.h"
 #include "master_metric_manager.h"
@@ -329,6 +328,40 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return result;
 }
 
+tl::expected<vsegment::VSegmentView, ErrorCode>
+WrappedMasterService::GetVSegmentView(const std::string& partition_id,
+                                      const std::string& vsegment_id) {
+    return master_service_.GetVSegmentView(partition_id, vsegment_id);
+}
+
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
+    return master_service_.GetPSegmentEndpoint(segment_id);
+}
+
+vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    return master_service_.VSegmentPutStart(partition_id, route_epoch,
+                                            operation_id, length,
+                                            profile_name);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutEnd(
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    return master_service_.VSegmentPutEnd(replica, route_epoch, operation_id,
+                                          object_id);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    return master_service_.VSegmentPutRevoke(partition_id, vsegment_id,
+                                             route_epoch, operation_id);
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id,
@@ -456,7 +489,7 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
@@ -474,13 +507,24 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
     auto result = execute_rpc(
         "PutStart", PerfKey::MASTER_RPC_PUT_START,
         [&] {
-            return WithWriteTenant(tenant_id,
-                                   master_service_.IsTenantQuotaEnabled(),
-                                   [&](const TenantId& resolved_tenant_id) {
-                                       return master_service_.PutStart(
-                                           client_id, key, resolved_tenant_id,
-                                           slice_length, config);
-                                   });
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<PutStartResult, ErrorCode> {
+                    auto vsegment = master_service_.TryVSegmentPutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!vsegment) return tl::make_unexpected(vsegment.error());
+                    if (vsegment->has_value()) return std::move(**vsegment);
+                    auto descriptors = master_service_.PutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!descriptors) {
+                        return tl::make_unexpected(descriptors.error());
+                    }
+                    return PutStartResult{{},
+                                          std::move(descriptors.value())};
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -505,7 +549,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id, uint64_t client_trace_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    uint64_t client_trace_id, const std::string& operation_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -524,7 +569,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
                                              client_id, object_meta,
-                                             resolved_tenant_id, replica_type);
+                                             resolved_tenant_id, replica_type,
+                                             operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -548,84 +594,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     return result;
 }
 
-tl::expected<VChunkMetadataRecord, ErrorCode>
-WrappedMasterService::VChunkPutStart(const std::string& tenant_id,
-                                     const std::string& key,
-                                     uint64_t total_size, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            return master_service_.VChunkPutStart(resolved_tenant_id, key,
-                                                  total_size, false, now_ms);
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.VChunkPutEnd(
-                resolved_tenant_id, key, vchunk_id, now_ms);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutRevoke(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.VChunkPutRevoke(
-                resolved_tenant_id, key, vchunk_id);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-tl::expected<VChunkReadLease, ErrorCode> WrappedMasterService::GetVChunk(
-    const std::string& tenant_id, const std::string& key) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            return master_service_.AcquireVChunkReadLease(
-                resolved_tenant_id, key, getCurrentTimeInMilli());
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::ReleaseVChunkReadLease(
-    const std::string& lease_id) {
-    const auto error = master_service_.ReleaseVChunkReadLease(lease_id);
-    return error == ErrorCode::OK
-               ? tl::expected<void, ErrorCode>{}
-               : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.RemoveVChunk(
-                resolved_tenant_id, key, now_ms);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-VChunkRuntimeInfo WrappedMasterService::GetVChunkRuntimeInfo() {
-    return master_service_.GetVChunkRuntimeInfo();
-}
-
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const std::string& operation_id) {
     return execute_rpc(
         "PutRevoke",
         PerfKey::MASTER_RPC_PUT_REVOKE,
@@ -636,7 +607,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutRevoke(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             replica_type, operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -858,7 +829,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
                                   const ReplicateConfig& config,
@@ -867,13 +838,19 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
         "UpsertStart",
         PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
-            return WithWriteTenant(tenant_id,
-                                   master_service_.IsTenantQuotaEnabled(),
-                                   [&](const TenantId& resolved_tenant_id) {
-                                       return master_service_.UpsertStart(
-                                           client_id, key, resolved_tenant_id,
-                                           slice_length, config);
-                                   });
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<PutStartResult, ErrorCode> {
+                    auto descriptors = master_service_.UpsertStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!descriptors) {
+                        return tl::make_unexpected(descriptors.error());
+                    }
+                    return PutStartResult{{},
+                                          std::move(descriptors.value())};
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -885,7 +862,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const std::string& operation_id) {
     return execute_rpc(
         "UpsertEnd",
         PerfKey::MASTER_RPC_UPSERT_END,
@@ -896,7 +874,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertEnd(
                                              client_id, object_meta,
-                                             resolved_tenant_id, replica_type);
+                                             resolved_tenant_id, replica_type,
+                                             operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -909,7 +888,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const std::string& operation_id) {
     return execute_rpc(
         "UpsertRevoke",
         PerfKey::MASTER_RPC_UPSERT_REVOKE,
@@ -920,7 +899,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertRevoke(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             replica_type, operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -1734,6 +1713,28 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "UnmountLocalDiskSegment");
+    timer.LogRequest("action=unmount_local_disk_segment");
+    LOG(INFO) << "Unmount local disk segment, client id is : " << client_id;
+    auto result = master_service_.UnmountLocalDiskSegment(client_id);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ReportInvalidReplicaEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "ReportInvalidReplicaEndpoints");
+    timer.LogRequest("action=report_invalid_replica_endpoints, count=",
+                     endpoints.size());
+    auto result = master_service_.ReportInvalidReplicaEndpoints(endpoints);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
@@ -1904,13 +1905,20 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
 void WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+        vsegment_partitions) {
     master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments);
+        objects, initial_oplog_sequence_id, segments, vsegment_partitions);
 }
 
 void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     master_service_.SetCvmLeaseId(lease_id);
+}
+
+void WrappedMasterService::SetCvmController(
+    cvm::CvmController* controller) {
+    master_service_.SetCvmController(controller);
 }
 
 ErrorCode WrappedMasterService::StartSlotOwnerHeartbeat() {
@@ -1927,6 +1935,10 @@ ErrorCode WrappedMasterService::StartInterMasterRpc() {
 
 void WrappedMasterService::StopInterMasterRpc() {
     master_service_.StopInterMasterRpc();
+}
+
+uint32_t WrappedMasterService::GetOwnedSlotCount() const {
+    return master_service_.GetOwnedSlotCount();
 }
 
 tl::expected<InterMasterHandshakeResponse, ErrorCode>
@@ -2026,6 +2038,70 @@ WrappedMasterService::InterMasterUpsertStart(
         [] {}, [] {});
 }
 
+tl::expected<SlotMetadataExport, ErrorCode>
+WrappedMasterService::InterMasterExportSlot(
+    uint16_t slot, const std::string& requester_master_id) {
+    return execute_rpc(
+        "InterMasterExportSlot",
+        [&] {
+            return master_service_.InterMasterExportSlot(slot,
+                                                         requester_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("slot=", slot,
+                             ", requester=", requester_master_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<bool, ErrorCode>
+WrappedMasterService::InterMasterAckSlotImported(
+    uint16_t slot, const std::string& importer_master_id) {
+    return execute_rpc(
+        "InterMasterAckSlotImported",
+        [&] {
+            return master_service_.InterMasterAckSlotImported(
+                slot, importer_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("slot=", slot, ", importer=", importer_master_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+WrappedMasterService::InterMasterExportSlotBatch(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& requester_master_id) {
+    return execute_rpc(
+        "InterMasterExportSlotBatch",
+        [&] {
+            return master_service_.InterMasterExportSlotBatch(
+                first_slot, last_slot, requester_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("range=[", first_slot, ",", last_slot,
+                             "], requester=", requester_master_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<bool, ErrorCode>
+WrappedMasterService::InterMasterAckSlotRangeImported(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& importer_master_id) {
+    return execute_rpc(
+        "InterMasterAckSlotRangeImported",
+        [&] {
+            return master_service_.InterMasterAckSlotRangeImported(
+                first_slot, last_slot, importer_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("range=[", first_slot, ",", last_slot,
+                             "], importer=", importer_master_id);
+        },
+        [] {}, [] {});
+}
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -2055,6 +2131,19 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterUpsertStart>(
         &wrapped_master_service);
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传).
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterExportSlot>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterAckSlotImported>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterExportSlotBatch>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterAckSlotRangeImported>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
@@ -2063,6 +2152,18 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetPSegmentEndpoint>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::VSegmentPutRevoke>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
@@ -2074,22 +2175,6 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetVChunk>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::ReleaseVChunkReadLease>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveVChunk>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetVChunkRuntimeInfo>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);
@@ -2218,6 +2303,15 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    // 上次会话遗漏注册：UnmountLocalDiskSegment（worker 侧 RefreshSubmasterAddresses
+    // removed 分支定向调用，未注册时运行时报 method not found）。
+    server.register_handler<
+        &mooncake::WrappedMasterService::UnmountLocalDiskSegment>(
+        &wrapped_master_service);
+    // 方案二被动层：client 传输失败后的坏端点上报。
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReportInvalidReplicaEndpoints>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

@@ -19,6 +19,7 @@
 #include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
+#include "vsegment/vsegment_metrics.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -299,6 +300,10 @@ bool MasterAdminServer::Start() {
                         << ", view_version="
                         << snapshot.leader_view->view_version;
                 }
+                log_stream << ", owned_slots="
+                           << (snapshot.service
+                                   ? snapshot.service->GetOwnedSlotCount()
+                                   : 0u);
                 LOG(INFO) << log_stream.str();
                 if (metric_report_stop_sem_.try_acquire_for(
                         std::chrono::seconds(kMetricReportIntervalSeconds))) {
@@ -362,6 +367,8 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    metrics = AppendMetricSections(
+        std::move(metrics), vsegment::VSegmentMetrics::Instance().Serialize());
     auto tenant_metrics = BuildTenantQuotaMetricsText();
     if (tenant_metrics.empty()) {
         return metrics;

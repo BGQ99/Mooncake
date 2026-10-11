@@ -195,26 +195,26 @@ class CvmMembershipCoordinator : public cvm::CvmServiceDelegate {
         stop_serve_signal_ = std::move(signal);
     }
 
-    // Blocks until either a role change or a kv-view change is pending, then
-    // clears both so each change is consumed exactly once. The caller re-reads
-    // CvmController::GetCurrentRole() as the source of truth after waking; a
-    // standby uses the wake-up to re-bind its replay sources.
-    void WaitForRoleOrViewChange() {
+    // Blocks until either a role change or a membership (member set) change is
+    // pending, then clears both so each change is consumed exactly once. The
+    // caller re-reads CvmController::GetCurrentRole() as the source of truth
+    // after waking; a standby uses the wake-up to re-bind its replay sources.
+    void WaitForRoleOrMembershipChange() {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this] {
-            return has_pending_role_ || has_pending_view_;
+            return has_pending_role_ || has_pending_membership_;
         });
         has_pending_role_ = false;
-        has_pending_view_ = false;
+        has_pending_membership_ = false;
     }
 
     void OnSlotAcquired(uint16_t /*slot*/) override {}
     void OnSlotReleased(uint16_t /*slot*/) override {}
 
-    void OnKvViewChanged() override {
+    void OnMembershipChanged() override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            has_pending_view_ = true;
+            has_pending_membership_ = true;
         }
         cv_.notify_all();
     }
@@ -258,7 +258,7 @@ class CvmMembershipCoordinator : public cvm::CvmServiceDelegate {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool has_pending_role_{false};
-    bool has_pending_view_{false};
+    bool has_pending_membership_{false};
     std::function<void()> stop_serve_signal_;
 };
 
@@ -277,7 +277,7 @@ std::optional<MasterView> BuildCvmObservedLeader(
     }
     MasterView view;
     view.leader_address = primary;
-    view.view_version = cvm_controller->GetKvViewVersion();
+    view.view_version = 0;  // 无持久化 kv_view；版本不再用于路由。
     return view;
 }
 
@@ -422,8 +422,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 server.init_ibv();
             }
 
-            const ViewVersionId view_version =
-                cvm_controller ? cvm_controller->GetKvViewVersion() : 0;
+            const ViewVersionId view_version = 0;  // 无持久化 kv_view 版本。
             mooncake::WrappedMasterServiceConfig wrapped_config(config,
                                                                  view_version);
             // In HA serving-primary mode, snapshot bootstrap belongs to
@@ -440,23 +439,30 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             if (cvm_controller) {
                 wrapped_master_service->SetCvmLeaseId(
                     cvm_controller->GetLeaseId());
+                // ring_slots 缓存读取（§16.15.5）：slot 归属解析走缓存优先
+                //（miss 回退环推导），supervisor 与 service 同进程直连。
+                wrapped_master_service->SetCvmController(cvm_controller.get());
             }
 
             // Restore from standby if we have context.
             if (promotion_ctx.applied_seq_id > 0 ||
                 !promotion_ctx.objects.empty() ||
-                !promotion_ctx.segments.empty()) {
+                !promotion_ctx.segments.empty() ||
+                !promotion_ctx.vsegment_partitions.empty()) {
                 wrapped_master_service->RestoreFromStandby(
                     promotion_ctx.objects, promotion_ctx.applied_seq_id,
-                    promotion_ctx.segments);
+                    promotion_ctx.segments,
+                    promotion_ctx.vsegment_partitions);
             }
 
             mooncake::RegisterRpcService(server, *wrapped_master_service);
 
             async_simple::Future<coro_rpc::err_code> ec = server.async_start();
             if (ec.hasResult()) {
-                LOG(ERROR) << "Failed to start master service: "
-                           << ec.result().value();
+                const coro_rpc::err_code& start_err = ec.result().value();
+                LOG(ERROR) << "Failed to start master service: code="
+                           << start_err.val() << ", reason="
+                           << std::string(start_err.message());
                 DeactivateServingState(admin_server, label_reconciler);
                 EnterStandbyMode(admin_server, *standby_controller,
                                  accept_standby_runtime_updates,
@@ -522,7 +528,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                              accept_standby_runtime_updates,
                              cvm_controller);
             if (cvm_controller) {
-                cvm_membership_coordinator.WaitForRoleOrViewChange();
+                cvm_membership_coordinator.WaitForRoleOrMembershipChange();
             } else {
                 // Unreachable: target_role is kPrimary when cvm_controller is
                 // null. Sleep defensively to avoid a tight loop.

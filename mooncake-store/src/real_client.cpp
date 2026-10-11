@@ -830,6 +830,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
+    client_->SetReplicaTransferStagingAllocator(client_buffer_allocator_);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -3524,6 +3525,11 @@ RealClient::batch_get_buffer_internal(
     valid_ops.reserve(keys.size());
 
     auto local_endpoints = client_->GetLocalEndpoints();
+    // prep 循环整窗：循环内 SELECT/ALLOC 两个子点的父窗。
+    // 平行于已有 breakdown_log 手动 t_prep 计时，但始终生效（不受开关门控）。
+    SpDiag::PerfPoint pt_prep(PerfKey::GET_BATCH_INTERNAL_PREPARATION,
+                              SpDiag::PerfLevel::MODULE);
+    pt_prep.Start();
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto &key = keys[i];
 
@@ -3632,6 +3638,7 @@ RealClient::batch_get_buffer_internal(
             .buffer_handle = std::move(buffer_handle),
             .slices = std::move(slices)});
     }
+    pt_prep.End(0);
 
     if (breakdown_log) t_prep = std::chrono::steady_clock::now();
 
@@ -7279,6 +7286,13 @@ RealClient::batch_get_into_offload_object_internal(
         return result;
     }
     if (elapsed_time >= batchGetResp->gc_ttl_ms) {
+        // 纯计数信号（紧邻 Start+End）：owner 端租约超时（OBJECT_HAS_LEASE）
+        // 从错误日志升级为可统计信号；发生率 = 本点 tickCount /
+        // GET_SSD_OFFLOAD_RPC tickCount。时长无意义（≈几十 ns）。
+        SpDiag::PerfPoint pt_lease(PerfKey::GET_SSD_LEASE_EXPIRED,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_lease.Start();
+        pt_lease.End(-1);
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};

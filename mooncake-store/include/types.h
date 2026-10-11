@@ -309,6 +309,10 @@ enum class ErrorCode : int32_t {
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
     CLIENT_NOT_FOUND = -103,          ///< Client not found.
+    VSEGMENT_STATIC_QUOTA_INSUFFICIENT =
+        -104,  ///< Partition quota cannot satisfy the configured layout.
+    VSEGMENT_CREATING =
+        -105,  ///< A single-flight vsegment creation is in progress.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
@@ -378,6 +382,9 @@ enum class ErrorCode : int32_t {
     SLOT_NOT_OWNED =
         -1012,  ///< The key's slot is not owned by this master (KV partition
                 ///< rebalanced); the client should re-route.
+    SLOT_MIGRATING =
+        -1013,  ///< The key's slot is owned (ring-derived) but its metadata is
+                ///< still being imported; the client should back off and retry.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.
@@ -415,6 +422,18 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    // vsegment / Partition routing errors (Range: -1800 to -1899)
+    NOT_OWNER = -1800,            ///< Wrong SubMaster; response carries owner
+                                  ///< and route epoch.
+    STALE_ROUTE = -1801,          ///< route_epoch is stale; refresh KV PT and
+                                  ///< retry.
+    MIGRATION_IN_PROGRESS = -1802,  ///< Partition is switching owners; PutStart
+                                    ///< may bounded-retry.
+    STALE_ALLOCATOR_EPOCH = -1803,  ///< allocator_epoch is stale; retry with the
+                                    ///< same allocation_id.
+    VSEGMENT_NOT_FOUND = -1804,   ///< VSegmentView is missing.
+    VSEGMENT_INVALID = -1805,     ///< VSegmentView failed validation.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -462,9 +481,15 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    // 物理介质标识，由 client 在 MountSegment 时从 location 参数提取并上报
+    // （如 "cpu:0" / "cuda:0" / "ssd:0"）。PublishSegmentOwnerForCvm 优先用
+    // 此值填充 SegmentDescriptor.medium，缺省回退 master 的
+    // --cvm_segment_default_medium。支持混合介质集群：不同 segment 可上报
+    // 不同 medium，planner 按 profile.required_medium 自动过滤。
+    std::string medium{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id, medium);
 
 /**
  * @brief Allocation strategy type for segment allocation

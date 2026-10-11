@@ -10,8 +10,6 @@
 
 #include "config_helper.h"
 #include "types.h"
-#include "vchunk_config.h"
-#include "vchunk_metadata_store.h"
 
 namespace mooncake {
 
@@ -92,6 +90,11 @@ struct MasterConfig {
     // HTTP server disabled.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：本集群 segment 的物理介质标识与「vsegment 专用且空」声明。
+    // 见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
@@ -150,8 +153,6 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
-    VChunkConfig vchunk_config{};
-    std::string vchunk_etcd_endpoints;
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
@@ -252,6 +253,10 @@ class MasterServiceSupervisorConfig {
     // HTTP server disabled.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
@@ -294,8 +299,6 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
-    VChunkConfig vchunk_config{};
-    std::string vchunk_etcd_endpoints;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     bool strict_replica_allocation = false;
@@ -424,6 +427,9 @@ class MasterServiceSupervisorConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
 
         enable_metrics_report_to_backend =
             config.enable_metrics_report_to_backend;
@@ -489,10 +495,6 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
-        vchunk_config = config.vchunk_config;
-        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
-                                    ? config.etcd_endpoints
-                                    : config.vchunk_etcd_endpoints;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -633,14 +635,25 @@ class WrappedMasterServiceConfig {
     // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
     std::string master_id;
     // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
-    // HTTP server disabled; set a non-zero port to expose /kv_view,
-    // /segment_view and /health for inspection.
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
     // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
     // standby。
     uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -676,8 +689,6 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
-    VChunkConfig vchunk_config{};
-    std::string vchunk_etcd_endpoints;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -748,6 +759,9 @@ class WrappedMasterServiceConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -807,10 +821,6 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
-        vchunk_config = config.vchunk_config;
-        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
-                                    ? config.etcd_endpoints
-                                    : config.vchunk_etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -884,6 +894,9 @@ class WrappedMasterServiceConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
@@ -916,8 +929,6 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
-        vchunk_config = config.vchunk_config;
-        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
     }
 };
 
@@ -986,8 +997,6 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
-    VChunkConfig vchunk_config_{};
-    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -1129,17 +1138,6 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
         enable_multi_tenants_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_vchunk_config(VChunkConfig config) {
-        vchunk_config_ = std::move(config);
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_vchunk_metadata_store(
-        std::shared_ptr<VChunkMetadataStore> store) {
-        vchunk_metadata_store_ = std::move(store);
         return *this;
     }
 
@@ -1372,14 +1370,25 @@ class MasterServiceConfig {
     // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
     std::string master_id;
     // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
-    // HTTP server disabled; set a non-zero port to expose /kv_view,
-    // /segment_view and /health for inspection.
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
     // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
     // standby。
     uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -1415,9 +1424,6 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
-    VChunkConfig vchunk_config{};
-    std::string vchunk_etcd_endpoints;
-    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1483,6 +1489,9 @@ class MasterServiceConfig {
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
         submaster_count = config.submaster_count;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
@@ -1521,12 +1530,6 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
-        vchunk_config = config.vchunk_config;
-        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
-        if (vchunk_config.enabled && !vchunk_etcd_endpoints.empty()) {
-            vchunk_metadata_store = std::make_shared<EtcdVChunkMetadataStore>(
-                vchunk_etcd_endpoints, vchunk_config, cluster_id);
-        }
     }
 
     // Static factory method to create a builder
@@ -1593,10 +1596,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
-    config.vchunk_config = vchunk_config_;
-    config.vchunk_metadata_store = vchunk_metadata_store_;
-    config.vchunk_config = vchunk_config_;
-    config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;
 }
 

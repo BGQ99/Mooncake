@@ -9,7 +9,9 @@
 #include <vector>
 
 #include "replica.h"
+#include "vsegment/vsegment_manager.h"
 #include "types.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake {
 
@@ -89,8 +91,11 @@ struct SlotMetadataExport {
     uint16_t slot{0};
     std::string source_master_id;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<vsegment::PartitionVSegmentSnapshot, 1>
+        vsegment_partition;
 
-    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects);
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects,
+             vsegment_partition);
 };
 
 /**
@@ -102,8 +107,10 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             vsegment_partitions);
 };
 
 /**

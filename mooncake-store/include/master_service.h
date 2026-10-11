@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,7 +38,6 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "vchunk_master_manager.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -49,6 +49,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "vsegment/vsegment_service.h"
 
 namespace mooncake {
 
@@ -162,6 +163,10 @@ class MasterService {
     // standby; the supervisor injects the lease id it granted and drives the
     // heartbeat around serve start/stop.
     void SetCvmLeaseId(EtcdLeaseId lease_id);
+    // supervisor 注入其 CvmController（同一进程内），供 slot 归属解析读
+    // ring_slots 缓存（§16.15.5 缓存优先、miss 回退环推导）。与 lease
+    // 注入同生命周期（serve phase 前设置，长期有效，不撤销）。
+    void SetCvmController(cvm::CvmController* controller);
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 
@@ -180,6 +185,37 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+    void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
+        vsegment_service_ = std::move(service);
+    }
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+    recovered_vsegment_snapshots() const {
+        return recovered_vsegment_snapshots_;
+    }
+    void ClearRecoveredVSegmentSnapshots() {
+        recovered_vsegment_snapshots_.clear();
+    }
+    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& partition_id, const std::string& vsegment_id);
+    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
+    vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name = {});
+    ErrorCode VSegmentPutEnd(const VSegmentDescriptor& replica,
+                             uint64_t route_epoch,
+                             const std::string& operation_id,
+                             const std::string& object_id);
+    ErrorCode VSegmentPutRevoke(const std::string& partition_id,
+                                const std::string& vsegment_id,
+                                uint64_t route_epoch,
+                                const std::string& operation_id);
+
+    tl::expected<std::optional<PutStartResult>, ErrorCode>
+    TryVSegmentPutStart(const UUID& client_id, const std::string& key,
+                        const TenantId& tenant_id, uint64_t slice_length,
+                        const ReplicateConfig& config);
 
     // Inter-master allocation forwarding (CVM plan B phase 2). Called by
     // WrappedMasterService when a slot-owning peer asks this submaster
@@ -231,6 +267,49 @@ class MasterService {
                            const std::string& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config);
 
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传，
+    // 替代 etcd slot_meta 中转)。新 owner 通过墙向旧 owner 拉取 `slot` 的对象
+    // 元数据导出；旧 owner 序列化并返回 SlotMetadataExport，但直到收到
+    // InterMasterAckSlotImported 才删除本地元数据。二者均为 peer-trust，直读
+    // 本地 metadata_shards_，不再经 etcd。
+    tl::expected<SlotMetadataExport, ErrorCode> InterMasterExportSlot(
+        uint16_t slot, const std::string& requester_master_id);
+
+    // 新 owner 导入完成后通知旧 owner 删除本地元数据（并清空 staged 导出
+    // 缓存）。幂等；返回 true 表示曾有 staged 项。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
+        uint16_t slot, const std::string& importer_master_id);
+
+    // ----- 段级批量迁移（§16.19.2，P4 reshard）-----
+
+    // 源侧批量导出：[first_slot, last_slot] 闭区间快照（staged 优先，缺失时
+    // 即时构建——kMigrating 冻结写后快照稳定）。与单 slot 版不同，不做
+    // 「必须已失去归属」门控：reshard 期间源仍持有归属（barrier 冻结写），
+    // 快照由冻结保证稳定；切 owner 后源仍持有未 ack 的本地数据，亦可导出
+    //（幂等，ack 前不删）。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
+                               const std::string& requester_master_id);
+
+    // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
+    //（DropSlotMetadataRange）。源未观察到归属已切走时返回
+    // SLOT_MIGRATING（目标稍后重试，重发无损）。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotRangeImported(
+        uint16_t first_slot, uint16_t last_slot,
+        const std::string& importer_master_id);
+
+    // 写路径校验（§16.19.3）：读路径继续走 CheckSlotServiceability（源
+    // kMigrating 期间仍服务读）；写路径统一走本方法——ready/expected 判定
+    // 之上叠加「本段正被迁出（kMigrating 且 migrating_to 非本机）→ 冻结写」
+    // 的 barrier 语义。客户端对 SLOT_MIGRATING 按总时长上界退避 + 重拉路由。
+    ErrorCode CheckSlotWritable(uint16_t slot) const;
+
+    // 幽灵写瞬态节流告警（§16.14.6 验证辅助，30s 一条防刷屏）：ring_slots
+    // 模型已启用（HasSeenRingSlotsModel）但本 slot 的归属缓存未命中 →
+    // 数据面判定正在走旧环回退，可能与 etcd 真实归属不一致（幽灵写）。
+    // where = 调用点定位（如 "CheckSlotWritable"/"ResolveSlotOwner"）。
+    void MaybeWarnGhostFallback(const char* where, uint16_t slot) const;
+
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
      *        unit tests can drive a single eviction cycle synchronously
@@ -252,29 +331,6 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
-
-    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
-        const TenantId& tenant_id, const std::string& key,
-        uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
-        const std::set<std::string>& excluded_segments = {});
-    ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
-                           const std::string& vchunk_id, int64_t now_ms);
-    ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
-                              const std::string& key,
-                              const std::string& vchunk_id);
-    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
-        const TenantId& tenant_id, const std::string& key) const;
-    tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
-        const TenantId& tenant_id, const std::string& key) const;
-    tl::expected<VChunkReadLease, ErrorCode> AcquireVChunkReadLease(
-        const TenantId& tenant_id, const std::string& key, int64_t now_ms);
-    ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
-    ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
-                           int64_t now_ms);
-    VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
-    tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
-                                                       size_t max_scan);
-    VChunkMetricsSnapshot GetVChunkMetrics() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -538,11 +594,13 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                const TenantId& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -559,7 +617,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -598,18 +657,21 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      const TenantId& tenant_id, ReplicaType replica_type)
+                      const TenantId& tenant_id, ReplicaType replica_type,
+                      const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -793,6 +855,30 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Unmounts a worker's LOCAL_DISK segment from this master.
+     *
+     * 清理该 client 的 LocalDiskSegment（ssd 容量记账、offloading 队列），
+     * 与 MountLocalDiskSegment 对称。多 submaster 下由 worker 在 submaster
+     * 退出集群时定向调用（RefreshSubmasterAddresses removed 分支），保证
+     * 容量记账对称闭合；不清理对象元数据（LOCAL_DISK 副本由 TTL reaper
+     * 与 ScanMeta 恢复路径管理）。幂等：client 无段时返回 OK。
+     */
+    auto UnmountLocalDiskSegment(const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief 被动坏端点上报（方案二被动层）。
+     *
+     * client 传输失败后上报目标 transport_endpoint，master 将其写入
+     * invalid_replica_endpoints_（transport_endpoint + 对应 segment_name
+     * 双形式），供分配过滤（AllocateAndInsertMetadata 的排除集）与读路径
+     * （IsReplicaReadable）跳过。自愈闭环：worker 重启后 MountSegment
+     * 成功即 erase，端点恢复可用。幂等；批量写与单笔写共用。
+     */
+    auto ReportInvalidReplicaEndpoints(const std::vector<std::string>& endpoints)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -951,7 +1037,9 @@ class MasterService {
     void RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<vsegment::PartitionVSegmentSnapshot>&
+            vsegment_partitions = {});
 
     /**
      * @brief Query the status of a task
@@ -1294,6 +1382,10 @@ class MasterService {
             return HasReplica(&Replica::fn_is_memory_replica);
         }
 
+        bool HasVSegmentReplica() const {
+            return HasReplica(&Replica::fn_is_vsegment_replica);
+        }
+
         bool HasNoFReplica() const {
             return HasReplica(&Replica::fn_is_nof_replica);
         }
@@ -1308,6 +1400,10 @@ class MasterService {
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
+                if (replica.is_vsegment_replica()) {
+                    return replica.get_vsegment_descriptor().vsegment_id ==
+                           segment_name;
+                }
                 auto names = replica.get_segment_names();
                 for (auto& name_opt : names) {
                     if (name_opt == segment_name) {
@@ -1531,6 +1627,9 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
+    void ReleaseVSegmentReplicaState(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
@@ -1754,7 +1853,8 @@ class MasterService {
 
     auto PutEndInternal(const UUID& client_id, const ObjectMeta& object_meta,
                         const TenantId& tenant_id, ReplicaType replica_type,
-                        uint32_t write_batch_size, bool overwrite)
+                        uint32_t write_batch_size, bool overwrite,
+                        const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -2333,13 +2433,24 @@ class MasterService {
     const std::string cvm_http_host_;
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调）。
     const uint32_t submaster_count_;
-    // Publishes this submaster's slot ownership to etcd for the KV partition
-    // view. Only started in HA mode when a stable master_id is configured.
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：本集群 segment 的物理介质标识与「vsegment 专用且空」声明。
+    // 见 MasterServiceConfig 同名字段说明。
+    const std::string cvm_segment_default_medium_;
+    const bool cvm_segments_vsegment_exclusive_;
+    // Drives slot-metadata handoff for this submaster (deterministic ring; no
+    // etcd publication). Only started in HA mode when a stable master_id is
+    // configured.
     std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
     // Inter-master RPC client (CVM multi-submaster coordination): etcd-driven
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
+    std::shared_ptr<vsegment::VSegmentService> vsegment_service_;
+    // Decoded before Partition ownership is activated. The route lifecycle
+    // consumes the matching state when it creates each local manager.
+    std::vector<vsegment::PartitionVSegmentSnapshot>
+        recovered_vsegment_snapshots_;
 
     // ----- Inter-master allocation forwarding (CVM plan B phase 2) -----
 
@@ -2383,20 +2494,50 @@ class MasterService {
     // registration lifecycle (auto-removed on lease expiry). 0 until the
     // supervisor injects it via SetCvmLeaseId().
     EtcdLeaseId cvm_lease_id_{0};
-    // 读路径 slot 所有权校验位图（A1）。由心跳 resolver 与晋升路径更新，
-    // GetReplicaList / BatchGetReplicaList 读路径校验，非 owner 拒绝服务。
-    // owned_slots_ready_ 为 false 表示 partition 未启用或尚未解析过，放行。
+    // supervisor 注入的同进程 CvmController（弱引用，supervisor 拥有）；
+    // ring_slots 缓存读取（§16.15.5）。仅 serve phase 前设置一次。
+    cvm::CvmController* cvm_controller_{nullptr};
+    // 幽灵写告警节流（§16.14.6 验证辅助）：「模型已启用（HasSeenRing
+    // SlotsModel）但当前缓存空 → 写判定走了旧环回退」是危险瞬态，
+    // 数据面 QPS 高，30s 一条防刷屏。mutable：const 判定路径（CheckSlot
+    // Writable / ResolveSlotOwnerMasterId）打点。0 = 未打过。
+    mutable std::atomic<int64_t> last_ghost_fallback_warn_ms_{0};
+    // 两级 slot 状态（确定性哈希方案 §15.6）：
+    //   expected_owned_ = ring 推导「应拥有」的 slot（by ResolveOwnedSlotsForCvm）
+    //   ready_owned_    = 元数据已就绪（import/replay 完成）可服务
+    // 读路径以 ready_owned_ 判权；expected && !ready 即「迁移中」（Phase 4 拒
+    // 绝为 SLOT_MIGRATING）。owned_slots_ready_ 表示 expected 是否已解析过，
+    // 为 false 时 partition 未启用或尚未解析，读路径放行。
     mutable std::shared_mutex owned_slots_mutex_;
-    std::vector<bool> owned_slot_lookup_;
+    std::vector<bool> expected_owned_;
+    std::vector<bool> ready_owned_;
     bool owned_slots_ready_{false};
     // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
     bool owned_slot_count_logged_{false};
     std::size_t last_logged_owned_count_{0};
-    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把 segment owner 原始
-    // 记录同步到 etcd（segment_view/<id>），供 CvmController 聚合生成 segment
-    // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。
+    // vsegment reconcile 周期聚合统计（防刷屏，验证辅助）：每周期累计
+    // scanned/owned/foreign/no_route/load_fail/reconcile_fail/stale_cas 七项，
+    // 仅当与上一周期不同才打一条 INFO（变更触发，稳态静默）；绝不逐
+    // partition 打印。心跳线程与 per-slot acquire（RPC 线程）并发调用下
+    // 最多漏/重一条诊断行，无害（同 last_phase_outcome_ 约定）。
+    static constexpr int kVSegStatCount = 7;
+    std::atomic<uint32_t> vseg_stat_last_[kVSegStatCount]{};
+    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把中立描述符
+    // segments/<seg_id> + 每 master 挂载记录 snapshot/<master_id>/segments/
+    // <seg_id> 同步到 etcd，CvmHttpServer 据此聚合出 segment 视图。仅在 etcd
+    // HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
+    // 方案一 A（te_endpoint 代际替换）：worker 每次进程启动都以新 client_id
+    // 重挂段，P2PHANDSHAKE 协议下 te_endpoint 端口随进程变化。MountSegment
+    // 尾部调用本方法：检测「同 segment_name + 同 host_id + 不同 te_endpoint」
+    // 的旧代残留（worker 重启前的死段）并立即清理——内存段两阶段卸载 +
+    // etcd 挂载记录/描述符（RemoveSegmentOwnerForCvm）+ invalid 集合卫生，
+    // 不等 TTL reaper 过期。设计假设：同一 host 的同 name worker 单进程
+    // 部署（进程内所有段共享同一 te_endpoint；跨 boot 端口必变）。
+    // 非 P2PHANDSHAKE 协议（te_endpoint 为固定 hostname，跨 boot 不变）
+    // 检测条件不成立，自动 no-op，由 TTL reaper 与方案一 B 兜底。
+    void EvictStaleGenerationForHost(const Segment& incoming);
     // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
     // master 列表，按一致性哈希环（cvm::ResolveOwnedSlotsOnRing）计算本机
     // 应拥有的 slot 集合。etcd 读取失败时沿用上一轮结果（sticky），避免
@@ -2405,19 +2546,93 @@ class MasterService {
     std::vector<uint16_t> ResolveOwnedSlotsForCvm();
     // sticky 缓存：最近一次成功解析的 owned slot 集合（etcd 抖动时沿用）。
     std::vector<uint16_t> cvm_last_resolved_owned_slots_;
+    // 归属变更日志（P1）：缓存最近一次解析到的 primary 成员列表（已排序去重），
+    // 用于在成员增删时打印 joined/left 根因，仅变化时打印一次。
+    std::vector<std::string> cvm_last_primary_ids_;
+    // Revision of the membership read used to derive this local ring.
+    ViewVersionId cvm_ring_revision_{0};
+    // 迁移旧环（Phase 3）：成员列表发生变化「前」的 primary 列表，供
+    // ImportSlotMetadata 推导 gained slot 的上一任 owner（旧 owner 直传）。
+    // 仅在 membership 变化时更新，保持不变时维持旧值以支持 acquire 重试。
+    std::vector<std::string> cvm_prev_primary_ids_;
+    // 当前存活的全部 master_id（含 primary 与 standby）。由
+    // ResolveOwnedSlotsForCvm 在 LoadAllMasters 成功时刷新，供
+    // ImportSlotMetadata 判断旧 owner 是否已消亡（消亡则无法 RPC 拉取，
+    // 改走空元数据 + 客户端重建，避免对死节点无限拉取刷屏）。
+    std::vector<std::string> cvm_alive_master_ids_;
     mutable std::mutex cvm_resolver_mutex_;
-    // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
-    // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再
-    // 从本地 metadata_shards_ 擦除；ImportSlotMetadata 从 etcd 读回并物化到
-    // 本地 metadata_shards_。数据字节始终留在 segment，不搬移。两者均由
-    // SlotOwnerHeartbeat 的 on_slot_released / on_slot_acquired 钩子在心跳
-    // 线程调用。
+    // live primary → live primary 的 slot 元数据交接（确定性哈希方案 §15.7，
+    // RPC 直传替代 etcd slot_meta 中转）。
+    //   ExportSlotMetadata(slot)  —— on_release 钩子：收集该 slot 对象元数据
+    //      并缓存到 pending_slot_exports_（不删本地，等新 owner 拉取 + ack）。
+    //   ImportSlotMetadata(slot)   —— on_acquire 钩子：推导旧 owner（旧环），
+    //      经 InterMasterRpc 直传拉取 export 并物化到本地，成功后回 ack。
+    // 数据字节始终留在 segment，不搬移。二者均运行在心跳线程。
     ErrorCode ExportSlotMetadata(uint16_t slot);
     ErrorCode ImportSlotMetadata(uint16_t slot);
-    // A1：读路径 slot 所有权校验。UpdateOwnedSlots 由心跳 resolver 与晋升路径
-    // 调用，把最新 owned slot 集合写入位图；OwnsSlot 供读路径查询（未就绪放行）。
-    void UpdateOwnedSlots(const std::vector<uint16_t>& slots);
+
+    // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
+    // require_not_owned（默认 true，§15 单 slot 交接语义）：要求本机已失去
+    // slot 归属才允许导出；P4 reshard 批量导出传 false——源仍持有归属
+    //（kMigrating 冻结写保证快照稳定；切 owner 后源仍持有未 ack 数据，
+    // 重拉幂等）。
+    tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
+        uint16_t slot, bool require_not_owned = true) const;
+    // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
+    ErrorCode DropSlotMetadataLocal(uint16_t slot);
+    // 段级批量版 DropSlotMetadataLocal（§16.16.5，P4 reshard ack 后的源侧
+    // 清理）：[first_slot, last_slot] 闭区间单趟扫描清理，避免逐 slot 反复
+    // 全量扫描 metadata 分片（rank 段可达数千 slot）。
+    ErrorCode DropSlotMetadataRange(uint16_t first_slot, uint16_t last_slot);
+    // RPC 直传的 staged 导出缓存：旧 owner 在 on_release 时把导出结果放这里，
+    // 等新 owner InterMasterExportSlot 拉取；收到 AckSlotImported 后删除缓存
+    // 并清理本地元数据。
+    std::unordered_map<uint16_t, SlotMetadataExport> pending_slot_exports_;
+    mutable std::mutex pending_slot_exports_mutex_;
+
+    // ----- P4 reshard：段级批量迁移 + 目标侧 driver（§16.16 / §16.19）-----
+
+    // reshard driver 线程：扫描 reshard_intent 中 target==本机的意图，
+    // 驱动「CAS kMigrating → CAS kStable 切 owner → 段级拉快照+安装 →
+    // 段级 ack → 删 intent」五阶段（断点续传：意图持久化在 etcd，重启后
+    // 重扫；任意阶段崩溃后按 ring_slots 当前状态重入，全链路幂等）。
+    // 目标驱动（coordinator = target）而非设计稿的源驱动：原生认领
+    //（§16.15.3 步 1，认领者是 standby、无 inter-master RPC 载体）与
+    // 管理员迁移共用同一条目标侧状态机；源只承担「冻结写 + 响应批量
+    // Export/Ack RPC」的被动角色。
+    void ReshardDriverLoop();
+    // 执行单个意图。返回 true = 已完成（含 ack）或意图失效，调用方删 intent。
+    bool DriveReshardIntent(const cvm::ReshardIntent& intent);
+    // 从源拉取 rank 段快照并安装（install 主体复用 ImportSlotMetadata 抽取
+    // 的 InstallSlotMetadataExport）。调用前置：owner CAS 已完成（源 ack 前
+    // 保留全部数据，重拉幂等）；快照稳定由 kMigrating 冻结写 + 切 owner 后
+    // 源停服共同保证。安装前重读 LoadRingSlotAssign 校验 owner 仍是本机。
+    ErrorCode ImportSlotRangeFrom(const std::string& source_master_id,
+                                   uint32_t rank, uint16_t first_slot,
+                                   uint16_t last_slot);
+    // 安装单个 SlotMetadataExport（vsegment 状态 + 对象元数据 + 账务），
+    // 从 ImportSlotMetadata 抽取的复用主体。effective_route 为调用方解析好的
+    // 目标路由（§15 路径传成员环推导路由；rank 路径传 LoadRingSlotAssign 的
+    // 显式路由，owner 必须是本机）。安装后调用 RefreshVSegmentOwnership 激活。
+    ErrorCode InstallSlotMetadataExport(
+        const SlotMetadataExport& export_payload,
+        const partition::PartitionRoute& effective_route);
+    std::thread reshard_driver_thread_;
+    std::atomic<bool> reshard_driver_running_{false};
+    // 防同 rank 并发驱动：进行中的 (rank -> 目标 epoch)。
+    std::mutex reshard_inflight_mutex_;
+    std::map<uint32_t, uint64_t> reshard_inflight_;
+    // A1：读路径 slot 所有权校验。UpdateExpectedSlots 由心跳 resolver 与晋升
+    // 路径调用，写 expected_owned_ 位图（ring 推导的应拥有集合）；MarkSlotsReady
+    // 把已完成元数据导入的 slot 置入 ready_owned_。OwnsSlot 读 ready_owned_。
+    // Gained slots become ready only after object/vsegment import succeeds.
+    void UpdateExpectedSlots(const std::vector<uint16_t>& slots);
+    void MarkSlotsReady(const std::vector<uint16_t>& slots);
     bool OwnsSlot(uint16_t slot) const;
+    // 读/写路径 slot 可服务性校验（Phase 4）：ready_owned_ → OK；expected 但
+    // !ready → SLOT_MIGRATING（新 owner 正在导入元数据）；否则 → SLOT_NOT_OWNED。
+    ErrorCode CheckSlotServiceability(uint16_t slot) const;
+    ErrorCode CheckVSegmentServiceability(const std::string& partition_id) const;
     // 读路径转发：解析任意 slot 的 owner master_id（基于一致性哈希环与
     // etcd 中的 primary master 列表）。解析失败返回 nullopt。供 GetReplicaList
     // / BatchGetReplicaList 在 OwnsSlot 失败时向 slot owner 转发请求。
@@ -2432,7 +2647,6 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                              const TenantId& tenant_id);
-    bool OwnsVChunkSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -2479,24 +2693,6 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
-    VChunkMasterManager vchunk_manager_;
-    bool vchunk_enabled_{false};
-    uint64_t vchunk_reaper_interval_ms_{1000};
-    size_t vchunk_reaper_max_scan_{128};
-    std::atomic<bool> vchunk_reaper_running_{false};
-    bool vchunk_recovery_pending_{false};
-    struct VChunkRemoteReadLease {
-        VChunkMasterManager::ReadHandle handle;
-        int64_t expires_at_ms{0};
-    };
-    std::mutex vchunk_read_leases_mutex_;
-    std::unordered_map<std::string, VChunkRemoteReadLease>
-        vchunk_read_leases_;
-    std::thread vchunk_reaper_thread_;
-    std::mutex vchunk_reaper_mutex_;
-    std::condition_variable vchunk_reaper_cv_;
-    void StartVChunkReaper();
-    void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
@@ -2657,6 +2853,7 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);
@@ -2672,6 +2869,11 @@ class MasterService {
 
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
+    // Guards invalid_replica_endpoints_. The read path (IsReplicaReadable, on
+    // GetReplicaList) runs on many threads without snapshot_mutex_, while the
+    // set is written during standby restore / remount / mount. A shared_mutex
+    // lets concurrent readers proceed and serializes writers.
+    mutable std::shared_mutex invalid_endpoints_mutex_;
 
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.

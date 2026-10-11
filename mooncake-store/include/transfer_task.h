@@ -18,6 +18,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
+#include "vsegment/vsegment_transfer.h"
 #include "rpc_types.h"
 #include "storage_backend.h"
 #include "client_metric.h"
@@ -581,6 +582,10 @@ class TransferSubmitter {
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code, const OperationOptions& options = {});
 
+    std::optional<TransferFuture> submitVSegment(
+        const vsegment::VSegmentTransferPlan& plan,
+        TransferRequest::OpCode op_code);
+
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
@@ -624,7 +629,6 @@ class TransferSubmitter {
     bool memcpy_enabled_;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
-
     /**
      * @brief Select the optimal transfer strategy
      */
