@@ -418,37 +418,47 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     }
     std::sort(primary_ids.begin(), primary_ids.end());
 
-    // Prefer the authoritative slot owner table published by CvmController;
-    // fall back to the consistent-hash ring used by the masters themselves.
-    std::unordered_map<uint16_t, std::string> owner_by_slot;
-    std::vector<mooncake::cvm::SlotOwner> slot_owners;
-    const ErrorCode slot_err = mooncake::cvm::EtcdViewStore::LoadAllSlotOwners(
-        cluster_namespace, slot_owners, version);
-    if (slot_err == ErrorCode::OK) {
-        for (const auto& owner : slot_owners) {
-            if (owner.state ==
-                    static_cast<int32_t>(mooncake::cvm::SlotState::kStable) &&
-                !owner.primary_master_id.empty()) {
-                owner_by_slot[owner.slot] = owner.primary_master_id;
-            }
-        }
+    // Prefer the authoritative ring_slots route published by CvmController
+    // (§16 ring_slots model, same derivation as client PartitionRouter);
+    // fall back to the consistent-hash ring used by the masters themselves
+    // (§15 legacy).
+    uint32_t group_count = 0;
+    mooncake::cvm::RingMeta ring_meta;
+    if (mooncake::cvm::EtcdViewStore::LoadClusterMeta(cluster_namespace,
+                                                     ring_meta, version) ==
+        ErrorCode::OK) {
+        group_count = std::max<uint32_t>(1, ring_meta.slot_group_count);
     }
-    const bool has_owner_table = !owner_by_slot.empty();
+    std::vector<mooncake::cvm::RingSlotAssign> assigns;
+    std::vector<std::string> rank_to_primary;
+    const ErrorCode slot_err =
+        mooncake::cvm::EtcdViewStore::LoadAllRingSlotAssigns(
+            cluster_namespace, assigns, version);
+    if (slot_err == ErrorCode::OK && group_count > 0) {
+        rank_to_primary =
+            mooncake::cvm::BuildRankToPrimary(assigns, group_count);
+    }
+    const bool has_owner_table = !rank_to_primary.empty();
     LOG(INFO) << "cfm_endpoint: CVM namespace '" << cluster_namespace
               << "' has " << primary_ids.size() << " primary submaster(s), "
-              << (has_owner_table ? owner_by_slot.size() : 0) << " slot owners"
+              << (has_owner_table ? assigns.size() : 0)
+              << " ring_slots records"
               << (has_owner_table ? "" : " (falling back to hash ring)");
 
     return [address_by_master = std::move(address_by_master),
             primary_ids = std::move(primary_ids),
-            owner_by_slot = std::move(owner_by_slot), has_owner_table](
-               const TenantId& tenant,
-               const std::string& key) -> std::optional<std::string> {
+            rank_to_primary = std::move(rank_to_primary), group_count,
+            has_owner_table](const TenantId& tenant,
+                             const std::string& key)
+        -> std::optional<std::string> {
         const uint16_t slot = mooncake::cvm::KeySlot(tenant, key);
         std::string owner;
         if (has_owner_table) {
-            const auto it = owner_by_slot.find(slot);
-            if (it != owner_by_slot.end()) owner = it->second;
+            const uint32_t rank =
+                mooncake::cvm::SlotToRank(slot, group_count);
+            if (rank < rank_to_primary.size()) {
+                owner = rank_to_primary[rank];
+            }
         }
         if (owner.empty()) {
             owner = mooncake::cvm::ResolveSlotOwnerOnRing(primary_ids, slot);
