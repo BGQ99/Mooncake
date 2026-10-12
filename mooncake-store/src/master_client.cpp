@@ -571,18 +571,29 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
+            // 巨尾归因（二）：连接池取用（含首连/重连）+ 请求提交。
+            // PerfPoint 驻留协程帧，跨 co_await 挂起按墙钟时间计量。
+            SpDiag::PerfPoint pt_send(PerfKey::CVM_RPC_BATCH_SEND,
+                                      SpDiag::PerfLevel::MODULE);
+            pt_send.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            pt_send.End(ret.has_value() ? 0 : -1);
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
                 co_return std::vector<tl::expected<ResultType, ErrorCode>>(
                     input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
             }
+            // 巨尾归因（三）：等待响应（网络 RTT + 服务端 handler 整窗）。
+            SpDiag::PerfPoint pt_result(PerfKey::CVM_RPC_BATCH_RESULT_GET,
+                                        SpDiag::PerfLevel::MODULE);
+            pt_result.Start();
             auto result = co_await std::move(ret.value());
+            pt_result.End(result ? 0 : -1);
             if (!result) {
                 const ErrorCode err_code =
                     (result.error().code == coro_rpc::errc::timed_out)
@@ -850,8 +861,10 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
     }
 
     SwitchToSubmasterByAddress(*submaster);
-    LOG(INFO) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
-              << " slot=" << slot << " -> submaster=" << *submaster;
+    // 每次单 key RPC 一条：随 QPS 刷屏，降为 VLOG(1)。
+    // 命中延迟分布已由 CVM_ROUTE_SWITCH 打点覆盖，日志仅调试用。
+    VLOG(1) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
+            << " slot=" << slot << " -> submaster=" << *submaster;
     pt_switch.End(0);
     return ErrorCode::OK;
 }
@@ -893,25 +906,40 @@ MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
 
 std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
+    // 巨尾归因（残差段）：BatchQuery 总时长减去 RouteRefresh/RpcSend/ResultGet
+    // 的残差主要由本函数承担（slot→owner 分组 + 描述日志构建）。
+    // status: 0=全部命中 / 2=存在无 owner 的 key（与 RouteSwitch miss=2 对齐）。
+    SpDiag::PerfPoint pt_group(PerfKey::CVM_RPC_BATCH_ROUTE_GROUP,
+                               SpDiag::PerfLevel::MODULE);
+    pt_group.Start();
     std::map<std::string, std::vector<size_t>> groups;
     const TenantId tenant(tenant_id);
+    bool has_miss = false;
     for (size_t i = 0; i < keys.size(); ++i) {
         const uint16_t slot = partition::KvHashMap::Compute(tenant, keys[i]);
         auto submaster = partition_router_.ResolveSubmaster(slot);
+        if (!submaster) has_miss = true;
         groups[submaster.value_or("")].push_back(i);
     }
 
-    std::string group_desc;
-    for (const auto& [submaster, indices] : groups) {
-        if (!group_desc.empty()) {
-            group_desc += ", ";
+    // 每批一条的分组描述日志会随 QPS 刷屏且拖慢热路径（含在 RouteGroup
+    // 打点窗口内），降为 VLOG(1)；描述串构建同样用 VLOG_IS_ON 门控，
+    // 关闭时零开销。
+    if (VLOG_IS_ON(1)) {
+        std::string group_desc;
+        for (const auto& [submaster, indices] : groups) {
+            if (!group_desc.empty()) {
+                group_desc += ", ";
+            }
+            group_desc += (submaster.empty() ? std::string("<none>")
+                                             : submaster);
+            group_desc += ":" + std::to_string(indices.size());
         }
-        group_desc += (submaster.empty() ? std::string("<none>") : submaster);
-        group_desc += ":" + std::to_string(indices.size());
+        VLOG(1) << "GroupKeysBySubmaster: tenant=" << tenant_id
+                << " total_keys=" << keys.size() << " groups=" << groups.size()
+                << " [" << group_desc << "]";
     }
-    LOG(INFO) << "GroupKeysBySubmaster: tenant=" << tenant_id
-              << " total_keys=" << keys.size() << " groups=" << groups.size()
-              << " [" << group_desc << "]";
+    pt_group.End(has_miss ? 2 : 0);
     return groups;
 }
 

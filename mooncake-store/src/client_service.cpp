@@ -1509,7 +1509,14 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             LOG(WARNING) << "BatchQuery: SLOT_NOT_OWNED in batch of "
                          << object_keys.size()
                          << " keys, refreshing slot routing and retrying once";
+            // 巨尾归因（一）：路由刷新整窗。正常 0 tick；若 ~4s 巨尾样本在此段
+            // 出现且 avg 达秒级，则尾延迟源于 etcd 路由全表重载。
+            SpDiag::PerfPoint pt_refresh(
+                PerfKey::CVM_BATCH_QUERY_ROUTE_REFRESH,
+                SpDiag::PerfLevel::MODULE);
+            pt_refresh.Start();
             TryLoadRoutingOnce();
+            pt_refresh.End(0);
             response =
                 master_client_.BatchGetReplicaList(object_keys, tenant_id);
         }
