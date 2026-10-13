@@ -6497,9 +6497,20 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
 
         std::vector<ObjectIdentity> promotion_candidates;
         std::vector<io_pattern::AccessRecord> io_accesses;
+        // 锁获取归因：snapshot_mutex_ 共享锁 + shard 读锁（MetadataShardAccessorRO）。
+        // 写者（MountSegment/快照/晋升）持锁时在此排队 → 尾延迟来源。
+        SpDiag::PerfPoint pt_shard_lock(PerfKey::MASTER_GET_SHARD_LOCK,
+                                        SpDiag::PerfLevel::SUB_SYSTEM);
+        pt_shard_lock.Start();
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
+            pt_shard_lock.End(0);
+
+            // 副本构建归因：锁全部拿到之后的逐 key 元数据查找 + 响应组装。
+            SpDiag::PerfPoint pt_build(PerfKey::MASTER_GET_REPLICA_BUILD,
+                                       SpDiag::PerfLevel::SUB_SYSTEM);
+            pt_build.Start();
             const auto tenant_it = shard->tenants.find(normalized_tenant);
             for (size_t original_idx = key_list_heads[shard_idx];
                  original_idx != kInvalidKeyIndex;
@@ -6596,6 +6607,7 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                      .operation = io_pattern::IoOperation::kGet,
                      .is_hit = true});
             }
+            pt_build.End(0);
         }
 
         for (const auto& object_id : promotion_candidates) {

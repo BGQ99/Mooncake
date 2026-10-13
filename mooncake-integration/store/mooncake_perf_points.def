@@ -171,6 +171,10 @@ PERF_KEY_DEF(MASTER_PUT_ALLOCATE_MEM,     "master_service.cpp::AllocateAndInsert
 PERF_KEY_DEF(MASTER_PUT_ALLOCATE_NOF,     "master_service.cpp::AllocateAndInsertMetadata", "AllocateNoF")
 PERF_KEY_DEF(MASTER_PUT_SHARD_LOCK,       "master_service.cpp::PutStart",        "AcquireShardLock")
 PERF_KEY_DEF(MASTER_SNAPSHOT_LOCK,        "master_service.cpp::SnapshotThreadFunc", "AcquireSnapshotLock")
+// Batch get 服务端归因：锁获取（snapshot_mutex_ 共享锁 + shard 读锁）vs
+// 副本构建（逐 key 元数据查找 + 响应组装）。对照 449µs avg / 24.6µs min。
+PERF_KEY_DEF(MASTER_GET_SHARD_LOCK,       "master_service.cpp::BatchGetReplicaListLocal", "AcquireShardLock")
+PERF_KEY_DEF(MASTER_GET_REPLICA_BUILD,    "master_service.cpp::BatchGetReplicaListLocal", "ReplicaBuild")
 
 // --- 后台线程 ---
 PERF_KEY_DEF(MASTER_BG_BATCH_EVICT,       "master_service.cpp::BatchEvict",          "BatchEvict")

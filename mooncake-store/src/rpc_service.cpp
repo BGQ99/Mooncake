@@ -386,14 +386,17 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         total_keys);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto item_start = sample ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
-        results.emplace_back(
-            master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
-        if (sample) {
+    if (sample) {
+        // 采样诊断路径：仅当 ShouldSampleHiFreqLog 命中时才逐 key 计时。
+        // 历史问题：此处 GetReplicaList 调用此前未被 sample 门控，每个
+        // 批量请求都先被串行做一遍逐 key 查询（16 key ≈ 400µs），而结果
+        // 随后被下方批量结果整体覆盖——纯浪费，直接解释 449µs avg 与
+        // 24.6µs min 的 18 倍差距。
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto item_start = std::chrono::steady_clock::now();
+            results.emplace_back(
+                master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
             const auto item_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - item_start)
