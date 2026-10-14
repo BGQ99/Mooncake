@@ -6518,6 +6518,11 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
     key_list_heads.fill(kInvalidKeyIndex);
     std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
     {
+        // 路由阶段归因：16 key 的 MakeScopedKey 字符串构造 +
+        // object_group_ids_ 哈希查找，group_routing_mutex_ 共享锁持有。
+        SpDiag::PerfPoint pt_group_route(PerfKey::MASTER_GET_GROUP_ROUTE,
+                                         SpDiag::PerfLevel::SUB_SYSTEM);
+        pt_group_route.Start();
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
         for (size_t i = keys.size(); i > 0; --i) {
             const size_t original_idx = i - 1;
@@ -6531,6 +6536,7 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
             next_key_indexes[original_idx] = key_list_heads[shard_idx];
             key_list_heads[shard_idx] = original_idx;
         }
+        pt_group_route.End(0);
     }
 
     const size_t start_shard = randomIndex(kNumShards);
@@ -6665,9 +6671,15 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
             pt_promo.End(0);
         }
         if (io_pattern_runtime_) {
+            // io_pattern 记录归因：逐 key RecordAccess（930 访问模式统计），
+            // 每次带 shard 访问计 1 tick。位于 pt_build 之外的未覆盖段。
+            SpDiag::PerfPoint pt_io_record(PerfKey::MASTER_GET_IO_RECORD,
+                                           SpDiag::PerfLevel::SUB_SYSTEM);
+            pt_io_record.Start();
             for (const auto& access : io_accesses) {
                 io_pattern_runtime_->RecordAccess(access.object.key, access);
             }
+            pt_io_record.End(0);
         }
     }
 

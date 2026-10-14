@@ -388,10 +388,10 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     if (sample) {
         // 采样诊断路径：仅当 ShouldSampleHiFreqLog 命中时才逐 key 计时。
-        // 历史问题：此处 GetReplicaList 调用此前未被 sample 门控，每个
-        // 批量请求都先被串行做一遍逐 key 查询（16 key ≈ 400µs），而结果
-        // 随后被下方批量结果整体覆盖——纯浪费，直接解释 449µs avg 与
-        // 24.6µs min 的 18 倍差距。
+        // 历史问题：此处逐 key 循环此前未被 sample 门控，结果随即被批量
+        // 结果整体覆盖——纯浪费。实测仅贡献 ~20µs/请求（构建本身 2.5µs/
+        // shard），handler 的 ~415µs 大头在服务调用内部其余段，归因见
+        // GroupRoute/RecordAccess/HandlerConvert 三子点。
         results.reserve(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto item_start = std::chrono::steady_clock::now();
@@ -411,13 +411,23 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    results = WithRequestTenantBatch(
-        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
-                                               : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchGetReplicaList(keys,
-                                                       resolved_tenant_id);
-        });
+    {
+        // 服务调用整窗归因：WithRequestTenantBatch 配额包装 +
+        // BatchGetReplicaList 的 slot 归属拆分（逐 key KeySlot 哈希 +
+        // owner 解析 + 转发分组）+ Local 内部各子段。handler 436µs 与
+        // 已覆盖子段（~20µs）的残差应在此窗内闭合。
+        SpDiag::PerfPoint pt_convert(PerfKey::MASTER_RPC_RESP_CONVERT,
+                                     SpDiag::PerfLevel::SUB_SYSTEM);
+        pt_convert.Start();
+        results = WithRequestTenantBatch(
+            master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                                   : TenantId::kDefaultValue,
+            keys.size(), [&](const TenantId& resolved_tenant_id) {
+                return master_service_.BatchGetReplicaList(keys,
+                                                           resolved_tenant_id);
+            });
+        pt_convert.End(0);
+    }
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {

@@ -175,6 +175,16 @@ PERF_KEY_DEF(MASTER_SNAPSHOT_LOCK,        "master_service.cpp::SnapshotThreadFun
 // 副本构建（逐 key 元数据查找 + 响应组装）。对照 449µs avg / 24.6µs min。
 PERF_KEY_DEF(MASTER_GET_SHARD_LOCK,       "master_service.cpp::BatchGetReplicaListLocal", "AcquireShardLock")
 PERF_KEY_DEF(MASTER_GET_REPLICA_BUILD,    "master_service.cpp::BatchGetReplicaListLocal", "ReplicaBuild")
+// 二轮归因（锁 74ns / 构建 2.5µs 已排除，剩余 ~415µs 在未覆盖段）：
+// GroupRoute:    group_routing_mutex_ 路由阶段整窗（16 key 的 MakeScopedKey
+//                字符串构造 + object_group_ids_ 哈希查找，每请求 1 tick）。
+// RecordAccess:  io_pattern_runtime_->RecordAccess 逐 key 记录（每 shard 访问
+//                1 tick，930 特性访问模式统计的潜在重活）。
+// HandlerConvert: rpc 层响应转换+序列化整窗（16 个 GetReplicaListResponse →
+//                批量响应结构 + struct_pack，每请求 1 tick）。
+PERF_KEY_DEF(MASTER_GET_GROUP_ROUTE,      "master_service.cpp::BatchGetReplicaListLocal", "GroupRoute")
+PERF_KEY_DEF(MASTER_GET_IO_RECORD,        "master_service.cpp::BatchGetReplicaListLocal", "RecordAccess")
+PERF_KEY_DEF(MASTER_RPC_RESP_CONVERT,     "rpc_service.cpp::BatchGetReplicaList", "HandlerConvert")
 
 // --- 后台线程 ---
 PERF_KEY_DEF(MASTER_BG_BATCH_EVICT,       "master_service.cpp::BatchEvict",          "BatchEvict")
