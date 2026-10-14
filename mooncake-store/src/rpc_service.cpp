@@ -535,6 +535,16 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (!result) {
+        // 兜底失败归因：PutStart 的所有失败路径（tenant 解析、slot 校验、
+        // 配额拒绝 TENANT_QUOTA_EXCEEDED、OBJECT_ALREADY_EXISTS、oplog
+        // 持久化等内部静默 return）在 handler 层统一可见。日志量 = 失败
+        // 请求数（本轮基准 778 条），不在成功路径、无刷屏风险。
+        LOG(WARNING) << "PutStart failed: key=" << key
+                     << " tenant=" << tenant_id
+                     << " slice_length=" << slice_length
+                     << " error=" << toString(result.error());
+    }
     if (sample) {
         const auto latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -582,6 +592,14 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    if (!result) {
+        // 兜底失败归因：PutEnd 失败（含 PutEndInternal 静默的 SLOT_NOT_OWNED
+        // 路径）意味着对象停留在未完成态，客户端必须感知具体原因。
+        LOG(WARNING) << "PutEnd failed: key=" << object_meta.key
+                     << ", tenant=" << tenant_id
+                     << ", replica_type=" << replica_type
+                     << ", error=" << toString(result.error());
+    }
     if (sample) {
         const auto latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(

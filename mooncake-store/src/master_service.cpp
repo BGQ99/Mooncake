@@ -2825,8 +2825,13 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
     // 方案一 B（etcd lease 兜底）处理，宁可漏清理也不误杀。
     if (incoming.name.empty() || incoming.te_endpoint.empty() ||
         incoming.host_id.empty()) {
+        LOG(WARNING) << "stale_generation_evict_skip reason=missing_identity"
+                     << ", segment_name=" << incoming.name
+                     << ", endpoint=" << incoming.te_endpoint
+                     << ", host_id=" << incoming.host_id;
         return;
     }
+    const auto evict_t0 = std::chrono::steady_clock::now();
 
     struct StaleSegInfo {
         UUID id;
@@ -2850,6 +2855,9 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
         std::vector<std::pair<Segment, UUID>> all_segments;
         if (segment_access.GetAllSegmentsWithOwner(all_segments) !=
             ErrorCode::OK) {
+            LOG(WARNING) << "stale_generation_evict_skip reason=list_failed"
+                         << ", segment_name=" << incoming.name
+                         << ", host_id=" << incoming.host_id;
             return;
         }
         for (auto& [seg, cid] : all_segments) {
@@ -2881,7 +2889,11 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
     LOG(WARNING) << "stale_generation_evict host_id=" << incoming.host_id
                  << ", segment_name=" << incoming.name
                  << ", new_endpoint=" << incoming.te_endpoint
-                 << ", stale_count=" << stale.size();
+                 << ", stale_count=" << stale.size()
+                 << ", detect_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - evict_t0)
+                        .count();
 
     // 阶段 2（段锁释放后）：清理对象元数据。与 TTL reaper 的锁序一致
     //（snapshot shared lock 持有下调用，内部不获取 snapshot 锁）。
@@ -2905,8 +2917,21 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
     // 阶段 4（无锁）：同步清理 etcd（挂载记录 + 最后挂载者卸载时的描述符）。
     // 多 submaster 下各自独立 evict 本机内存态；RemoveSegmentOwnerForCvm
     // 内部按「是否仍有其它 master 挂载」决定是否删描述符，天然防误删。
-    for (const auto& info : stale) {
-        RemoveSegmentOwnerForCvm(info.id);
+    // 此段是 MountSegment 30s 卡顿的头号嫌疑（逐段同步 etcd 事务），
+    // 单独计时。
+    {
+        const auto etcd_t0 = std::chrono::steady_clock::now();
+        for (const auto& info : stale) {
+            RemoveSegmentOwnerForCvm(info.id);
+        }
+        LOG(WARNING) << "stale_generation_evict_etcd_done"
+                     << ", segment_name=" << incoming.name
+                     << ", host_id=" << incoming.host_id
+                     << ", stale_count=" << stale.size()
+                     << ", etcd_ms="
+                     << std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - etcd_t0)
+                            .count();
     }
 
     // 阶段 5：invalid 集合卫生——死端点/段名不再有对应段，从排除集中清除，
@@ -3554,6 +3579,10 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // 30s RPC 超时卡顿归因：挂载是低频端点，结束时输出一次性 breakdown
+    // 日志，覆盖 snapshot 锁获取+注册表 / OpLog / 配额重算 / 视图发布 /
+    // 旧代清理各段耗时。
+    const auto mount_t0 = std::chrono::steady_clock::now();
     ErrorCode mount_result = ErrorCode::OK;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
@@ -3610,6 +3639,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                       << ", segment_name=" << segment.name;
         }
     }
+    const auto t_registry = std::chrono::steady_clock::now();
 
     // 幂等重挂载不产生新的元数据变更，segment 首次挂载时已记录
     // SEGMENT_MOUNT OpLog，重复追加只会让 OpLog 无谓增长。
@@ -3627,9 +3657,11 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                                        std::string(bytes.begin(), bytes.end()));
     }
     UpdateClientHostId(client_id, segment.host_id);
+    const auto t_oplog = std::chrono::steady_clock::now();
     if (mount_result == ErrorCode::OK) {
         RecomputeTenantEffectiveQuotas();
     }
+    const auto t_quota = std::chrono::steady_clock::now();
     // segment（重）挂载成功后，该 endpoint 不再视为 invalid。升主恢复
     // （RestoreFromStandbySnapshot）在 client 尚未重挂时会把 segment 的
     // transport_endpoint/name 标记进 invalid_replica_endpoints_，若此处不清除，
@@ -3643,10 +3675,24 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         invalid_replica_endpoints_.erase(UuidToString(segment.id));
     }
     PublishSegmentOwnerForCvm(segment);
+    const auto t_publish = std::chrono::steady_clock::now();
     // 方案一 A：新代段挂载完成后，立即清理同 host 同 name 的旧代死段
     //（P2PHANDSHAKE 重启场景：端口已换、旧端点无监听），不等 TTL reaper。
     // 此时段锁已释放，helper 内部独立走两阶段卸载 + etcd 清理。
     EvictStaleGenerationForHost(segment);
+    const auto t_stale = std::chrono::steady_clock::now();
+    const auto ms = [](std::chrono::steady_clock::time_point a,
+                       std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a)
+            .count();
+    };
+    LOG(INFO) << "mount_segment_breakdown segment_name=" << segment.name
+              << ", registry_ms=" << ms(mount_t0, t_registry)
+              << ", oplog_ms=" << ms(t_registry, t_oplog)
+              << ", quota_ms=" << ms(t_oplog, t_quota)
+              << ", publish_ms=" << ms(t_quota, t_publish)
+              << ", stale_evict_ms=" << ms(t_publish, t_stale)
+              << ", total_ms=" << ms(mount_t0, t_stale);
     return {};
 }
 
@@ -7269,6 +7315,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             return result;
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
+            // 配额拒绝上下文：handler 兜底日志只含错误码，此处补 charge
+            // 数值与驱逐重试信息，用于判断配额缺口大小。
+            LOG(WARNING)
+                << "tenant_quota_reject tenant="
+                << object_id.tenant_id.value() << ", key=" << key
+                << ", charge_bytes=" << requested_quota_charge
+                << ", evict_retries=" << kMaxTenantQuotaEvictionRetries;
             MasterMetricManager::instance().inc_tenant_quota_reject(
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
@@ -8193,6 +8246,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             return result;
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
+            // 配额拒绝上下文：handler 兜底日志只含错误码，此处补 charge
+            // 数值与驱逐重试信息，用于判断配额缺口大小。
+            LOG(WARNING)
+                << "tenant_quota_reject tenant="
+                << object_id.tenant_id.value() << ", key=" << key
+                << ", charge_bytes=" << requested_quota_charge
+                << ", evict_retries=" << kMaxTenantQuotaEvictionRetries;
             MasterMetricManager::instance().inc_tenant_quota_reject(
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
