@@ -5,6 +5,8 @@
 #include <limits>
 #include <thread>
 
+#include "master_perf.h"
+
 namespace mooncake::io_pattern {
 namespace {
 
@@ -96,19 +98,50 @@ void IoPatternRuntime::ReportInferenceMetrics(const InferenceMetrics& metrics) {
 void IoPatternRuntime::RecordAccess(const std::string& key,
                                     const AccessRecord& record) {
     const auto start = std::chrono::steady_clock::now();
-    const auto dropped_before = collector_->dropped();
-    collector_->RecordAccess(key, record);
-    observability_.RecordCollectLatency(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count());
-    const auto dropped_after = collector_->dropped();
+    // 锁分段打点：每段 Start/End 包住整次调用（含锁获取）。详见
+    // mooncake_perf_points.def 中 MASTER_IO_* 的注释。
+    uint64_t dropped_before = 0;
+    {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_DROPPED_BEFORE,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
+        dropped_before = collector_->dropped();
+        pt.End(0);
+    }
+    {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_COLLECTOR_RECORD,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
+        collector_->RecordAccess(key, record);
+        pt.End(0);
+    }
+    {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_COLLECT_LATENCY,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
+        observability_.RecordCollectLatency(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+        pt.End(0);
+    }
+    uint64_t dropped_after = 0;
+    {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_DROPPED_AFTER,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
+        dropped_after = collector_->dropped();
+        pt.End(0);
+    }
     if (dropped_after > dropped_before)
         observability_.RecordReportDrop(dropped_after - dropped_before);
 
     PolicyFeedbackSample feedback;
     bool has_feedback = false;
     {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_FEEDBACK_UPDATE,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         std::lock_guard lock(feedback_state_mutex_);
         ++feedback_accesses_;
         feedback_hits_ += record.is_hit;
@@ -131,8 +164,15 @@ void IoPatternRuntime::RecordAccess(const std::string& key,
             feedback_hits_ = 0;
             has_feedback = true;
         }
+        pt.End(0);
     }
-    if (has_feedback) RecordFeedback(feedback);
+    if (has_feedback) {
+        SpDiag::PerfPoint pt(PerfKey::MASTER_IO_FEEDBACK_RECORD,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
+        RecordFeedback(feedback);
+        pt.End(0);
+    }
 }
 
 void IoPatternRuntime::RecordStorageMetric(const StorageMetric& metric) {

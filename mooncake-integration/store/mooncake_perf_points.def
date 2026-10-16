@@ -184,6 +184,20 @@ PERF_KEY_DEF(MASTER_GET_REPLICA_BUILD,    "master_service.cpp::BatchGetReplicaLi
 //                批量响应结构 + struct_pack，每请求 1 tick）。
 PERF_KEY_DEF(MASTER_GET_GROUP_ROUTE,      "master_service.cpp::BatchGetReplicaListLocal", "GroupRoute")
 PERF_KEY_DEF(MASTER_GET_IO_RECORD,        "master_service.cpp::BatchGetReplicaListLocal", "RecordAccess")
+// io_pattern RecordAccess 内部锁分段（query 阻塞点归因）。
+// DroppedBefore/After 本征 ~100ns（仅读 dropped_ 计数）：avg 显著偏高 =
+//     collector mutex 被后台路径（GetSnapshot/FlushReports/MergeSnapshot）持有。
+// CollectorRecord = collector 锁等待 + 临界区（reporter 嵌套锁 + notify_one
+//                  + std::function 堆分配 + key_metrics_ 哈希 + windows deque）。
+// CollectLatency  = observability mutex，本征极小，偏高即跨 Record* 路径竞争。
+// FeedbackUpdate  = feedback_state_mutex_ 临界区；FeedbackRecord 为 64 次访问
+//                  触发一次的二次加锁（feedback_.Record + tuner_.Tune 调优）。
+PERF_KEY_DEF(MASTER_IO_DROPPED_BEFORE,   "runtime.cpp::RecordAccess", "IoDroppedBefore")
+PERF_KEY_DEF(MASTER_IO_COLLECTOR_RECORD, "runtime.cpp::RecordAccess", "IoCollectorRecord")
+PERF_KEY_DEF(MASTER_IO_COLLECT_LATENCY,  "runtime.cpp::RecordAccess", "IoCollectLatency")
+PERF_KEY_DEF(MASTER_IO_DROPPED_AFTER,    "runtime.cpp::RecordAccess", "IoDroppedAfter")
+PERF_KEY_DEF(MASTER_IO_FEEDBACK_UPDATE,  "runtime.cpp::RecordAccess", "IoFeedbackUpdate")
+PERF_KEY_DEF(MASTER_IO_FEEDBACK_RECORD,  "runtime.cpp::RecordAccess", "IoFeedbackRecord")
 PERF_KEY_DEF(MASTER_RPC_RESP_CONVERT,     "rpc_service.cpp::BatchGetReplicaList", "HandlerConvert")
 
 // --- 后台线程 ---
