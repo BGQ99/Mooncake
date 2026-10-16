@@ -198,6 +198,23 @@ PERF_KEY_DEF(MASTER_IO_COLLECT_LATENCY,  "runtime.cpp::RecordAccess", "IoCollect
 PERF_KEY_DEF(MASTER_IO_DROPPED_AFTER,    "runtime.cpp::RecordAccess", "IoDroppedAfter")
 PERF_KEY_DEF(MASTER_IO_FEEDBACK_UPDATE,  "runtime.cpp::RecordAccess", "IoFeedbackUpdate")
 PERF_KEY_DEF(MASTER_IO_FEEDBACK_RECORD,  "runtime.cpp::RecordAccess", "IoFeedbackRecord")
+// 单 key GetReplicaListLocal owner 路径归因（与 batch 路径 MASTER_GET_* 分开
+// 统计，避免两种路径混在同一 slot）。
+// Total:  全函数（含 RecordAccess 与残差：metrics 计数、resp 构造、io_access
+//         组装）。Total - Core - MASTER_IO_* 即未覆盖残差。
+// Core:   owner 7 段整体：snapshot 读锁 → shard 读锁 → client 读锁 →
+//         alive clients 复制 → replica 构建 → lease 刷新 → promotion 入队；
+//         早退路径（OBJECT_NOT_FOUND / REPLICA_IS_NOT_READY）同样结束本点。
+// SnapLock:   snapshot_mutex_ 共享锁单独计时，偏高 = 写者（快照/挂载）持锁排队。
+// ShardLock:  MetadataAccessorRO 构造 = shard 共享锁 + tenant/metadata/
+//             processing 三次哈希查找（构造函数无法拆分，比 batch 路径的
+//             ShardLock 多含 ~百 ns 级查找开销）。
+// ClientLock: client_mutex_ 共享锁单独计时（alive clients 复制前的排队）。
+PERF_KEY_DEF(MASTER_GET_LOCAL_TOTAL,       "master_service.cpp::GetReplicaListLocal", "GetLocalTotal")
+PERF_KEY_DEF(MASTER_GET_LOCAL_CORE,        "master_service.cpp::GetReplicaListLocal", "GetLocalCore")
+PERF_KEY_DEF(MASTER_GET_LOCAL_SNAP_LOCK,   "master_service.cpp::GetReplicaListLocal", "GetLocalSnapLock")
+PERF_KEY_DEF(MASTER_GET_LOCAL_SHARD_LOCK,  "master_service.cpp::GetReplicaListLocal", "GetLocalShardLock")
+PERF_KEY_DEF(MASTER_GET_LOCAL_CLIENT_LOCK, "master_service.cpp::GetReplicaListLocal", "GetLocalClientLock")
 PERF_KEY_DEF(MASTER_RPC_RESP_CONVERT,     "rpc_service.cpp::BatchGetReplicaList", "HandlerConvert")
 
 // --- 后台线程 ---

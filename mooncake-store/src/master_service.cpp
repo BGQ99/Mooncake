@@ -6272,7 +6272,27 @@ ErrorCode MasterService::VSegmentPutRevoke(
 
 auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // 单 key get 全函数归因：入口 → 响应返回（含 RecordAccess）。
+    // 层级：Total ⊃ Core（owner 7 段）+ MASTER_IO_*（RecordAccess）+ 残差。
+    SpDiag::PerfPoint pt_total(PerfKey::MASTER_GET_LOCAL_TOTAL,
+                               SpDiag::PerfLevel::KEY_MODULE);
+    pt_total.Start();
+    // owner 路径 7 段整体归因：snapshot 读锁 → shard 读锁 → client 读锁 →
+    // alive clients 复制 → replica 构建 → lease 刷新 → promotion 入队。
+    SpDiag::PerfPoint pt_core(PerfKey::MASTER_GET_LOCAL_CORE,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_core.Start();
+    // snapshot_mutex_ 读锁单独归因：写者（快照持久化/挂载）持锁时在此排队。
+    // defer_lock + 显式 lock() 使锁获取可单独计时，锁生存期不变。
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_,
+                                                    std::defer_lock);
+    {
+        SpDiag::PerfPoint pt_snap(PerfKey::MASTER_GET_LOCAL_SNAP_LOCK,
+                                  SpDiag::PerfLevel::SUB_SYSTEM);
+        pt_snap.Start();
+        shared_lock.lock();
+        pt_snap.End(0);
+    }
     const std::string& key = object_id.user_key;
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
@@ -6280,12 +6300,21 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     io_pattern::AccessRecord io_access;
     bool record_io_access = false;
     {
+        // shard 读锁归因：MetadataAccessorRO 构造 = shard mutex 共享锁 +
+        // tenant/metadata/processing 三次哈希查找。构造函数无法将锁与查找
+        // 拆分，故本点比 batch 路径的 ShardLock 多含 ~百 ns 级查找开销。
+        SpDiag::PerfPoint pt_shard(PerfKey::MASTER_GET_LOCAL_SHARD_LOCK,
+                                   SpDiag::PerfLevel::SUB_SYSTEM);
+        pt_shard.Start();
         MetadataAccessorRO accessor(this, object_id);
+        pt_shard.End(0);
 
         MasterMetricManager::instance().inc_total_get_nums();
 
         if (!accessor.Exists()) {
             VLOG(1) << "key=" << key << ", info=object_not_found";
+            pt_core.End(0);
+            pt_total.End(0);
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
@@ -6293,7 +6322,15 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
         // Build the set of currently alive client UUIDs
         std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
         {
-            std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+            // client_mutex_ 读锁单独归因：写者（client 上下线）持锁时在此排队。
+            std::shared_lock<std::shared_mutex> client_lock(client_mutex_,
+                                                            std::defer_lock);
+            SpDiag::PerfPoint pt_client(
+                PerfKey::MASTER_GET_LOCAL_CLIENT_LOCK,
+                SpDiag::PerfLevel::SUB_SYSTEM);
+            pt_client.Start();
+            client_lock.lock();
+            pt_client.End(0);
             for (const auto& [client_id, host] : client_host_id_) {
                 alive_clients.insert(client_id);
             }
@@ -6313,9 +6350,13 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
             if (metadata.AllReplicas([](const Replica& replica) {
                     return replica.status() == ReplicaStatus::REMOVED;
                 })) {
+                pt_core.End(0);
+                pt_total.End(0);
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+            pt_core.End(0);
+            pt_total.End(0);
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
 
@@ -6385,9 +6426,13 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
         TryPushPromotionQueue(object_id);
         pt_promo.End(0);
     }
+    // Core 覆盖至 promotion 入队；RecordAccess 由 MASTER_IO_* 单独归因，
+    // 计入 Total（Total - Core - MASTER_IO_* = 未覆盖残差）。
+    pt_core.End(0);
     if (record_io_access && io_pattern_runtime_) {
         io_pattern_runtime_->RecordAccess(key, io_access);
     }
+    pt_total.End(0);
     return resp;
 }
 
