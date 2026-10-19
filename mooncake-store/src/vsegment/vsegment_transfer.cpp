@@ -1,6 +1,7 @@
 #include "vsegment/vsegment_transfer.h"
 
 #include <limits>
+#include <unordered_map>
 
 namespace mooncake::vsegment {
 
@@ -119,17 +120,29 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
     auto resolved = ResolveTransfer(view, replica.logical_offset,
                                     replica.length, slices);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
+    // Resolve each distinct psegment only once per Plan. The sub-request count
+    // grows with (length / stripe_size) while the number of distinct segments
+    // is bounded by member_count, so with a small stripe this loop used to
+    // issue dozens of identical GetPSegmentEndpoint RPCs for the same three
+    // answers (e.g. 128 calls for a 512 KiB object with member_count = 3).
+    // The cache is local to this call: no lifetime or invalidation concerns.
+    std::unordered_map<std::string, PSegmentLocation> endpoints;
     for (auto& request : resolved.requests) {
-        PSegmentLocation location;
-        auto result = endpoint_resolver_->ResolveLocation(request.segment_id,
-                                                          &location);
-        if (result != ErrorCode::OK || location.endpoint.empty()) {
-            plan.error = result == ErrorCode::OK ? ErrorCode::SEGMENT_NOT_FOUND
-                                                 : result;
-            plan.detail = "cannot resolve endpoint for " + request.segment_id;
-            plan.requests.clear();
-            return plan;
+        auto [entry, inserted] = endpoints.try_emplace(request.segment_id);
+        if (inserted) {
+            auto result = endpoint_resolver_->ResolveLocation(
+                request.segment_id, &entry->second);
+            if (result != ErrorCode::OK || entry->second.endpoint.empty()) {
+                plan.error = result == ErrorCode::OK
+                                 ? ErrorCode::SEGMENT_NOT_FOUND
+                                 : result;
+                plan.detail =
+                    "cannot resolve endpoint for " + request.segment_id;
+                plan.requests.clear();
+                return plan;
+            }
         }
+        const PSegmentLocation& location = entry->second;
         if (request.physical_offset >
             std::numeric_limits<uint64_t>::max() - location.base_address) {
             plan.error = ErrorCode::INVALID_PARAMS;
@@ -138,8 +151,9 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
             return plan;
         }
         request.physical_offset += location.base_address;
-        plan.requests.push_back(
-            {std::move(request), std::move(location.endpoint)});
+        // NOTE: endpoint is shared by every sub-request of this segment, so it
+        // must be copied rather than moved.
+        plan.requests.push_back({std::move(request), location.endpoint});
     }
     return plan;
 }
