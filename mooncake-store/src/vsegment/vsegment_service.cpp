@@ -3,8 +3,48 @@
 #include "vsegment/vsegment_metrics.h"
 
 namespace mooncake::vsegment {
+namespace {
 
-void VSegmentService::RefreshMetrics() {
+int64_t SteadyClockNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+void VSegmentService::RefreshMetrics(bool force) {
+    const auto interval_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            metrics_refresh_interval_)
+            .count();
+    const auto now_ns = SteadyClockNowNs();
+
+    // Hot path: one atomic load when the throttle window has not elapsed.
+    if (!force && interval_ns > 0) {
+        const auto last_ns =
+            last_metrics_refresh_ns_.load(std::memory_order_relaxed);
+        if (last_ns != 0 && now_ns - last_ns < interval_ns) return;
+    }
+
+    std::unique_lock<std::mutex> refresh_lock(metrics_refresh_mutex_,
+                                              std::defer_lock);
+    if (force) {
+        // Ownership changes must observe the refresh after they happen, so
+        // wait for any in-flight scan instead of skipping it.
+        refresh_lock.lock();
+    } else {
+        // Only one caller performs the scan; other concurrent callers keep
+        // the previous gauge values and return immediately.
+        if (!refresh_lock.try_lock()) return;
+        if (interval_ns > 0) {
+            const auto recheck_ns = SteadyClockNowNs();
+            const auto last_ns =
+                last_metrics_refresh_ns_.load(std::memory_order_relaxed);
+            if (last_ns != 0 && recheck_ns - last_ns < interval_ns) return;
+        }
+    }
+
     std::vector<std::shared_ptr<VSegmentManager>> managers;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -25,6 +65,8 @@ void VSegmentService::RefreshMetrics() {
     }
     VSegmentMetrics::Instance().SetCapacity(total, free, reservations,
                                             committed, pending);
+    last_metrics_refresh_ns_.store(SteadyClockNowNs(),
+                                   std::memory_order_relaxed);
 }
 
 std::shared_ptr<VSegmentManager> VSegmentService::FindPartition(
@@ -92,7 +134,7 @@ ErrorCode VSegmentService::AddPartition(
     // already-durable views must remain reserved, and the next ownership
     // reconciliation can safely retry only the missing count.
     result = manager->EnsureInitialVSegments(detail);
-    RefreshMetrics();
+    RefreshMetrics(true);
     return result;
 }
 
@@ -110,7 +152,7 @@ ErrorCode VSegmentService::RemovePartition(const std::string& partition_id,
     }
     // Destruction outside the registry lock waits for any asynchronous
     // creation without blocking unrelated Partitions.
-    RefreshMetrics();
+    RefreshMetrics(true);
     return ErrorCode::OK;
 }
 
@@ -190,7 +232,7 @@ ErrorCode VSegmentService::ReconcileObjectReferences(
     const auto result = manager->ReconcileObjectReferences(references, detail);
     if (result != ErrorCode::OK)
         VSegmentMetrics::Instance().IncRecoveryFailure();
-    RefreshMetrics();
+    RefreshMetrics(true);
     return result;
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,8 +20,12 @@ namespace mooncake::vsegment {
 // routed to that SubMaster; Partition migration removes/adds the whole manager.
 class VSegmentService final : public VSegmentViewProvider {
    public:
-    explicit VSegmentService(PartitionPhysicalQuotaSnapshot quota_snapshot)
-        : quota_snapshot_(std::move(quota_snapshot)) {}
+    explicit VSegmentService(
+        PartitionPhysicalQuotaSnapshot quota_snapshot,
+        std::chrono::milliseconds metrics_refresh_interval =
+            std::chrono::seconds(1))
+        : quota_snapshot_(std::move(quota_snapshot)),
+          metrics_refresh_interval_(metrics_refresh_interval) {}
 
     ErrorCode AddPartition(
         const std::string& partition_id, uint64_t route_epoch,
@@ -85,7 +91,11 @@ class VSegmentService final : public VSegmentViewProvider {
                        std::string* detail = nullptr) override;
 
    private:
-    void RefreshMetrics();
+    // Recomputes the process-local gauges from all owned managers.
+    // Non-forced calls are throttled by metrics_refresh_interval_ so the
+    // Put/Commit/Abort/Release hot path does not pay an O(partitions)
+    // scan on every request. Ownership changes pass force=true.
+    void RefreshMetrics(bool force = false);
     std::shared_ptr<VSegmentManager> FindPartition(
         const std::string& partition_id);
 
@@ -94,6 +104,9 @@ class VSegmentService final : public VSegmentViewProvider {
     std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<VSegmentManager>>
         partitions_;
+    std::chrono::milliseconds metrics_refresh_interval_;
+    std::atomic<int64_t> last_metrics_refresh_ns_{0};
+    std::mutex metrics_refresh_mutex_;
 };
 
 }  // namespace mooncake::vsegment
