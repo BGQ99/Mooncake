@@ -6429,9 +6429,14 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     // Core 覆盖至 promotion 入队；RecordAccess 由 MASTER_IO_* 单独归因，
     // 计入 Total（Total - Core - MASTER_IO_* = 未覆盖残差）。
     pt_core.End(0);
-    if (record_io_access && io_pattern_runtime_) {
-        io_pattern_runtime_->RecordAccess(key, io_access);
-    }
+    // P99 诊断：临时禁用 get 路径 RecordAccess（内部 collector/observability/
+    // feedback_state 多把 mutex 是疑似锁竞争点）。禁用后 io_pattern 仅丢失
+    // get 侧访问统计输入，驱逐/准入决策退化为无该输入，功能路径不受影响。
+    // if (record_io_access && io_pattern_runtime_) {
+    //     io_pattern_runtime_->RecordAccess(key, io_access);
+    // }
+    (void)record_io_access;
+    (void)io_access;
     pt_total.End(0);
     return resp;
 }
