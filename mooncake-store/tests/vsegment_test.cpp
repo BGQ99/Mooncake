@@ -153,11 +153,13 @@ class TestEndpointResolver : public SegmentEndpointResolver {
    public:
     ErrorCode ResolveLocation(const std::string& segment_id,
                               PSegmentLocation* location) override {
+        ++resolves;
         location->endpoint = "endpoint://" + segment_id;
         location->base_address = base_address;
         return ErrorCode::OK;
     }
     uint64_t base_address{4096};
+    int resolves{0};
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -549,6 +551,26 @@ TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
     auto cached = planner.Plan(replica, {{2000, 96}});
     ASSERT_TRUE(cached);
     EXPECT_EQ(provider.loads, 1);
+}
+
+TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+
+    // 512 bytes over 64-byte stripes = 8 sub-requests, but only 2 distinct
+    // psegments (member_count = 2). The resolver must be hit once per
+    // distinct segment, not once per sub-request.
+    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
+    auto plan = planner.Plan(replica, {{1000, 512}});
+    ASSERT_TRUE(plan) << plan.detail;
+    ASSERT_EQ(plan.requests.size(), 8u);
+    EXPECT_EQ(endpoints.resolves, 2);
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
