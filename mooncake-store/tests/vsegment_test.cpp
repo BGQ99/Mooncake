@@ -22,6 +22,17 @@
 namespace mooncake::vsegment {
 namespace {
 
+uint64_t MetricValue(const std::string& name) {
+    const auto text = VSegmentMetrics::Instance().Serialize();
+    // Match the sample line only: "# TYPE <name> gauge" must not match.
+    const std::string prefix = "\n" + name + " ";
+    const auto pos = text.find(prefix);
+    if (pos == std::string::npos) return std::numeric_limits<uint64_t>::max();
+    const auto begin = pos + prefix.size();
+    const auto end = text.find('\n', begin);
+    return std::stoull(text.substr(begin, end - begin));
+}
+
 struct LegacySlotMetadataExport {
     uint16_t slot{0};
     std::string source_master_id;
@@ -1329,6 +1340,66 @@ TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
     EXPECT_EQ(service.RemovePartition("partition-1", 9), ErrorCode::OK);
     EXPECT_EQ(service.LoadView("partition-1", view.vsegment_id, &view),
               ErrorCode::STALE_ROUTE);
+}
+
+TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+
+    // A long window makes non-forced refreshes deterministic no-ops.
+    VSegmentService service(snapshot, std::chrono::hours(1));
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 512u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    // Non-forced refresh is throttled: the new reservation is not visible.
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 512u);
+
+    // An ownership change forces a refresh: the removed Partition is gone.
+    ASSERT_EQ(service.RemovePartition("partition-1", 9), ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 0u);
+}
+
+TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+
+    VSegmentService service(snapshot, std::chrono::milliseconds(0));
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    // Zero interval disables throttling: the reservation is visible.
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
 }
 
 TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
