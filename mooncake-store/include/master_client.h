@@ -17,6 +17,7 @@
 
 #include "environ.h"
 #include "client_metric.h"
+#include "mooncake_logging.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -71,6 +72,22 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
 
 inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
     RpcClientPool::PoolConfig config;
+    // Pool-level sizing & idle collection (MC_YLT_RPC_POOL_*). This config
+    // feeds the request-serving accessors (client_accessor_ /
+    // targeted_accessor_). Without this wiring the env vars only reached the
+    // heartbeat-only client_pools_, and request pools silently ran with
+    // coro_io defaults (idle_timeout=30s), whose idle collector closes free
+    // connections every 30s and causes periodic latency spikes when requests
+    // race with the cleanup window.
+    config.max_connection =
+        Environ::Get().GetYltRpcPoolMaxConnection(config.max_connection);
+    config.idle_timeout = std::chrono::milliseconds(
+        Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+            config.idle_timeout.count()));
+    config.short_connect_idle_timeout = std::chrono::milliseconds(
+        Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+            config.short_connect_idle_timeout.count()));
+
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
@@ -86,6 +103,11 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
         config.client_config.connect_timeout_duration =
             std::chrono::milliseconds(std::atoll(connect_ms));
     }
+    MC_LOG(INFO) << "Master RPC pool config: max_connection="
+                 << config.max_connection << " idle_timeout_ms="
+                 << config.idle_timeout.count()
+                 << " short_connect_idle_timeout_ms="
+                 << config.short_connect_idle_timeout.count();
     return config;
 }
 
