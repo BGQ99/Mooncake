@@ -174,7 +174,6 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
-      suspended_flag_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
@@ -188,8 +187,13 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
 
 UbWorkerPool::~UbWorkerPool() {
     if (workers_running_) {
+        // 先持锁更新退出条件，再通知：若先 notify 后置位，被唤醒的 worker
+        // 检查条件时 flag 尚未生效会回睡，此后再无通知，join() 将挂死。
+        {
+            std::lock_guard<std::mutex> lock(cond_mutex_);
+            workers_running_.store(false, std::memory_order_release);
+        }
         cond_var_.notify_all();
-        workers_running_.store(false);
         for (auto& entry : worker_thread_) entry.join();
     }
 }
@@ -331,9 +335,17 @@ int UbWorkerPool::submitPostSend(
                                                std::memory_order_relaxed);
         slice_queue_lock_[shard_id].unlock();
     }
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
+    // 提交计数在 cond_mutex_ 临界区内更新：与 worker 的 predicate wait
+    // （wait_for(lock, pred)）构成完整的检查/更新/通知协调。旧实现的
+    // suspended_flag_ + 裸 notify 存在两个丢失唤醒窗口（flag 置位前提交
+    // 不通知；wait 启动前到达的 notify 因 cv 无记忆而丢失），导致空闲
+    // worker 睡满 1s 才轮询到新任务。
+    {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        submitted_slice_count_.fetch_add(submitted_slice_count,
+                                         std::memory_order_release);
+    }
+    cond_var_.notify_all();
     return 0;
 }
 
@@ -600,9 +612,16 @@ void UbWorkerPool::transferWorker(int thread_id) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
-                suspended_flag_.fetch_add(1);
-                cond_var_.wait_for(lock, std::chrono::seconds(1));
-                suspended_flag_.fetch_sub(1);
+                // predicate wait：条件已在锁内重查，提交与唤醒的竞态窗口
+                // 关闭。保留 1s 超时作兜底——redispatch() 重入本地队列不
+                // 递增 submitted_slice_count_，纯 wait 在该场景会永久睡眠。
+                cond_var_.wait_for(lock, std::chrono::seconds(1), [this] {
+                    return !workers_running_.load(std::memory_order_acquire) ||
+                           processed_slice_count_.load(
+                               std::memory_order_acquire) !=
+                               submitted_slice_count_.load(
+                                   std::memory_order_acquire);
+                });
                 last_wait_ts = curr_wait_ts;
             }
             continue;

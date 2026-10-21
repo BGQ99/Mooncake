@@ -16,10 +16,12 @@
 #define UB_CONTEXT_H
 
 #include <atomic>
+#include <condition_variable>
 #include <fcntl.h>
 #include <fstream>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,7 +70,6 @@ class UbWorkerPool {
     const int numa_socket_id_;
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
-    std::atomic<int> suspended_flag_;
     std::atomic<int> redispatch_counter_;
     std::mutex cond_mutex_;
     std::condition_variable cond_var_;

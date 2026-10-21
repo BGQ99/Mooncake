@@ -1,4 +1,4 @@
-#include "master_client.h"
+﻿#include "master_client.h"
 
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
@@ -621,8 +621,15 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
-    const std::string& tenant_id, const std::string& key, Args... args) {
+    RoutedCallTiming* timing, const std::string& tenant_id,
+    const std::string& key, Args... args) {
+    const auto t_routed_start = std::chrono::steady_clock::now();
     auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+    if (timing) {
+        timing->rpc_first_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - t_routed_start)
+                                   .count();
+    }
 
     if (!result && (result.error() == ErrorCode::SLOT_NOT_OWNED ||
                     result.error() == ErrorCode::STALE_ROUTE)) {
@@ -655,10 +662,32 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
         SpDiag::PerfPoint pt_retry(PerfKey::CVM_ROUTE_STALE_RETRY,
                                    SpDiag::PerfLevel::KEY_MODULE);
         pt_retry.Start();
-        if (RefreshSubmasterRouting() == ErrorCode::OK &&
-            SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        const auto t_refresh = std::chrono::steady_clock::now();
+        const bool refresh_ok =
+            RefreshSubmasterRouting() == ErrorCode::OK;
+        if (timing) {
+            timing->route_refresh_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_refresh)
+                    .count();
+            ++timing->retry_count;
+        }
+        if (refresh_ok && SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+            if (timing) {
+                timing->retry_switch_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_refresh)
+                    .count() - timing->route_refresh_us;
+            }
+            const auto t_retry = std::chrono::steady_clock::now();
             auto retry_result =
                 invoke_rpc<ServiceMethod, ReturnType>(args...);
+            if (timing) {
+                timing->rpc_retry_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t_retry)
+                        .count();
+            }
             pt_retry.End(retry_result ? 0 : -1);
             return retry_result;
         }
@@ -672,14 +701,30 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
                                      SpDiag::PerfLevel::DEBUG);
         pt_backoff.Start();
         constexpr int kMaxRetries = 3;
+        const auto t_backoff = std::chrono::steady_clock::now();
         for (int i = 0; i < kMaxRetries; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20 << i));
             auto attempt = invoke_rpc<ServiceMethod, ReturnType>(args...);
+            if (timing) {
+                ++timing->backoff_count;
+            }
             if (!attempt || attempt.error() != ErrorCode::SLOT_MIGRATING) {
+                if (timing) {
+                    timing->backoff_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t_backoff)
+                            .count();
+                }
                 pt_backoff.End(attempt ? 0 : -1);
                 return attempt;
             }
             result = std::move(attempt);
+        }
+        if (timing) {
+            timing->backoff_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_backoff)
+                    .count();
         }
         pt_backoff.End(-1);  // 耗尽重试仍 MIGRATING
     }
@@ -956,7 +1001,8 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::ExistKey,
                                             bool>(
-        tenant_id_.value(), object_key, object_key, tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), object_key, object_key,
+        tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1148,17 +1194,64 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
-    ErrorCode switch_err = SwitchToSubmaster(tenant_id, object_key);
+    // query 逐段归因（对齐 get_into_breakdown 风格）：switch（路由解析+建连）
+    // 与 routed（RPC 含重试/退避）分段。与 invoke_rpc 内层的
+    // master_rpc_client_breakdown（pool_lookup/rpc_call/result_get）互补。
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t switch_us = 0;
+    RoutedCallTiming timing;
+
+    ErrorCode switch_err;
+    {
+        const auto t_switch = std::chrono::steady_clock::now();
+        switch_err = SwitchToSubmaster(tenant_id, object_key);
+        switch_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_switch)
+                .count();
+    }
     if (switch_err != ErrorCode::OK) {
         timer.LogResponse("error_code=", switch_err);
+        MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key
+                     << "] switch_us[" << switch_us << "] rpc_first_us[0]"
+                     << "] total_us["
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count()
+                     << "] retry_count[0] backoff_count[0] status[switch_fail_"
+                     << static_cast<int>(switch_err) << "]";
         return tl::make_unexpected(switch_err);
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
-        tenant_id, object_key, object_key, tenant_id, trace_id, client_id_);
+        &timing, tenant_id, object_key, object_key, tenant_id, trace_id,
+        client_id_);
     timer.LogResponseExpected(result);
+
+    const char* status = "ok";
+    if (!result && timing.backoff_count > 0) {
+        status = "backoff_exhausted";
+    } else if (!result) {
+        status = "rpc_fail";
+    } else if (timing.retry_count > 0) {
+        status = "retry_ok";
+    } else if (timing.backoff_count > 0) {
+        status = "backoff_ok";
+    }
+    MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key << "] switch_us["
+                 << switch_us << "] rpc_first_us[" << timing.rpc_first_us
+                 << "] route_refresh_us[" << timing.route_refresh_us
+                 << "] retry_switch_us[" << timing.retry_switch_us
+                 << "] rpc_retry_us[" << timing.rpc_retry_us << "] backoff_us["
+                 << timing.backoff_us << "] total_us["
+                 << std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count()
+                 << "] retry_count[" << timing.retry_count
+                 << "] backoff_count[" << timing.backoff_count << "] status["
+                 << status << "]";
     return result;
 }
 
@@ -1239,8 +1332,8 @@ MasterClient::PutStart(const std::string& key,
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::PutStart, PutStartResult>(
-        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
-        tenant_id_.value(), trace_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
+        total_slice_length, config, tenant_id_.value(), trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1327,8 +1420,8 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutEnd,
                                             void>(
-        tenant_id_.value(), object_meta.key, client_id_, object_meta,
-        replica_type, tenant_id_.value(), trace_id, operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
+        object_meta, replica_type, tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1401,8 +1494,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutRevoke,
                                             void>(
-        tenant_id_.value(), key, client_id_, key, replica_type,
-        tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
+        replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1473,8 +1566,8 @@ MasterClient::UpsertStart(const std::string& key,
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertStart, PutStartResult>(
-        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
-        tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
+        total_slice_length, config, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1558,8 +1651,8 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
                                             void>(
-        tenant_id_.value(), object_meta.key, client_id_, object_meta,
-        replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
+        object_meta, replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1630,8 +1723,8 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertRevoke, void>(
-        tenant_id_.value(), key, client_id_, key, replica_type,
-        tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
+        replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1692,7 +1785,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     }
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::Remove, void>(
-        tenant_id_.value(), key, key, force, tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, key, force,
+        tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }

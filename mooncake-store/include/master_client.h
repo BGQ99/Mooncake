@@ -33,6 +33,21 @@ namespace mooncake {
 
 static const std::string kDefaultMasterAddress = "localhost:50051";
 
+// 单 key 定向 RPC（InvokeRoutedWithSlotRetry）的分段计时。
+// 各窗口边界由模板填充；仅调用方传入指针时才有计时开销。
+// 对应日志：query_rpc_breakdown（GetReplicaList 消费）。
+struct RoutedCallTiming {
+    int64_t rpc_first_us = 0;     // 首次 RPC 窗（含连接池取用+协程等待）
+    int64_t route_refresh_us = 0;  // SLOT_NOT_OWNED/STALE_ROUTE 重试的
+                                   // etcd 路由全表重载窗
+    int64_t retry_switch_us = 0;   // 重试前的 submaster 重切窗
+    int64_t rpc_retry_us = 0;      // 二次 RPC 窗
+    int64_t backoff_us = 0;        // SLOT_MIGRATING 有界退避总窗
+                                   // （sleep+重试 RPC）
+    int retry_count = 0;           // 路由刷新重试次数（0/1）
+    int backoff_count = 0;         // 迁移退避重试次数（0-3）
+};
+
 namespace detail {
 
 template <typename Variant, typename T>
@@ -981,7 +996,8 @@ class MasterClient {
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> InvokeRoutedWithSlotRetry(
-        const std::string& tenant_id, const std::string& key, Args... args);
+        RoutedCallTiming* timing, const std::string& tenant_id,
+        const std::string& key, Args... args);
 
     /**
      * @brief Switches the underlying RPC pool to the given submaster address.
