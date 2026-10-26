@@ -288,6 +288,16 @@ class ScopedSegmentAccess {
      */
     void UnmountLocalDiskSegment(const UUID& client_id);
 
+    /**
+     * @brief Look up a client's LocalDiskSegment bookkeeping entry.
+     * @return nullptr when the client has no local disk segment. The
+     * returned shared_ptr keeps the entry alive beyond this accessor's
+     * scope; field access on it still requires
+     * LocalDiskSegment::offloading_mutex_.
+     */
+    std::shared_ptr<LocalDiskSegment> GetClientLocalDiskSegment(
+        const UUID& client_id) const;
+
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;

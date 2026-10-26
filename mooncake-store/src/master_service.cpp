@@ -3366,18 +3366,17 @@ void MasterService::EvictStaleGenerationForHost(
             {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
-                auto& ld_segments =
-                    segment_access.getClientLocalDiskSegment();
                 for (const auto& cid : stale_ld_clients) {
                     // P2-8-2：name 级过滤。未登记（legacy / 仅
                     // LOCAL_DISK client）保持 host 级归并原行为。
-                    auto ld_it = ld_segments.find(cid);
-                    if (ld_it != ld_segments.end()) {
+                    const auto ld_segment =
+                        segment_access.GetClientLocalDiskSegment(cid);
+                    if (ld_segment) {
                         std::string registered_name;
                         {
                             MutexLocker locker(
-                                &ld_it->second->offloading_mutex_);
-                            registered_name = ld_it->second->segment_name;
+                                &ld_segment->offloading_mutex_);
+                            registered_name = ld_segment->segment_name;
                         }
                         if (!registered_name.empty() &&
                             registered_name != incoming.name) {
@@ -4282,12 +4281,12 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // client 无 name 上下文，保持空值（退化为 host 级归并）。
     {
         ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-        auto& ld_segments = segment_access.getClientLocalDiskSegment();
-        auto ld_it = ld_segments.find(client_id);
-        if (ld_it != ld_segments.end()) {
-            MutexLocker locker(&ld_it->second->offloading_mutex_);
-            if (ld_it->second->segment_name.empty()) {
-                ld_it->second->segment_name = segment.name;
+        const auto ld_segment =
+            segment_access.GetClientLocalDiskSegment(client_id);
+        if (ld_segment) {
+            MutexLocker locker(&ld_segment->offloading_mutex_);
+            if (ld_segment->segment_name.empty()) {
+                ld_segment->segment_name = segment.name;
             }
         }
     }

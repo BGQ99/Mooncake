@@ -234,6 +234,13 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
     return ErrorCode::OK;
 }
 
+std::shared_ptr<LocalDiskSegment>
+ScopedSegmentAccess::GetClientLocalDiskSegment(const UUID& client_id) const {
+    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
+    return it == segment_manager_->client_local_disk_segment_.end() ? nullptr
+                                                                   : it->second;
+}
+
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
