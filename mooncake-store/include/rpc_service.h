@@ -311,6 +311,13 @@ class WrappedMasterService {
     // OpLog 流自恢复。Internal（supervisor 调用），NOT an RPC endpoint.
     bool TrySelfRecoverFromOpLog();
 
+    // 环互备领养物化（互备 1.4）：supervisor RingStandbyRuntime 在
+    // ring-adopt staging 期间的编排入口，三态语义见
+    // MasterService::AdoptMaterializeFromDeadOwner。Internal（supervisor
+    // 调用），NOT an RPC endpoint.
+    ErrorCode AdoptMaterializeFromDeadOwner(const std::string& source_id,
+                                            bool& stream_present);
+
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).
     void SetCvmLeaseId(EtcdLeaseId lease_id);

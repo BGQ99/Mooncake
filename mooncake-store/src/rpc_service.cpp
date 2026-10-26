@@ -1947,6 +1947,12 @@ bool WrappedMasterService::TrySelfRecoverFromOpLog() {
     return master_service_.TrySelfRecoverFromOpLog();
 }
 
+ErrorCode WrappedMasterService::AdoptMaterializeFromDeadOwner(
+    const std::string& source_id, bool& stream_present) {
+    return master_service_.AdoptMaterializeFromDeadOwner(source_id,
+                                                         stream_present);
+}
+
 void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     master_service_.SetCvmLeaseId(lease_id);
 }

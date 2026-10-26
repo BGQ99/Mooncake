@@ -87,6 +87,10 @@ class SlotOwnerHeartbeat {
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
     std::thread thread_;
+    // 上一轮 reconcile 是否失败（仅 RunLoop 心跳线程访问，无需加锁）：
+    // 失败→成功的转变点打一条 INFO（reconcile incomplete 长期刷屏后恢复
+    // 的明确观测点），稳态成功静默。
+    bool last_publish_failed_ = false;
 };
 
 }  // namespace cvm

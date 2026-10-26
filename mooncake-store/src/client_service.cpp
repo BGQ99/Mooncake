@@ -3397,6 +3397,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     results.reserve(ops.size());
 
     int no_available_handle_count = 0;
+    size_t succeeded_count = 0;
+    size_t failed_count = 0;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
@@ -3408,11 +3410,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
+                ++succeeded_count;
                 continue;
             }
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
+                ++failed_count;
             } else {
+                ++failed_count;
                 LOG(ERROR) << "Operation for key " << op.key
                            << " failed: " << toString(op.result.error())
                            << (op.failure_context
@@ -3420,6 +3425,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                                    : "");
             }
         } else {
+            ++succeeded_count;
             VLOG(1) << "Operation for key " << op.key
                     << " completed successfully";
         }
@@ -3427,6 +3433,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPut failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+    }
+    // 批次级写入恢复转变（成员 last_batch_put_failed_ 注释）：含失败的批次
+    // 只置位；此前曾失败后首个全成功批打一条 INFO——与上方逐 key ERROR
+    // 构成「失败风暴 → 恢复」的明确收口观测，稳态成功批次静默。
+    if (failed_count > 0) {
+        last_batch_put_failed_.store(true, std::memory_order_relaxed);
+    } else if (succeeded_count > 0 &&
+               last_batch_put_failed_.exchange(false,
+                                               std::memory_order_relaxed)) {
+        LOG(INFO) << "Batch put recovered: " << succeeded_count
+                  << " keys succeeded after previous failures"
+                  << " (client writes are flowing again)";
     }
 
     return results;

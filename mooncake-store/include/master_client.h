@@ -1022,6 +1022,25 @@ class MasterClient {
         const std::string& key, Args... args);
 
     /**
+     * @brief Batch 路由自愈（与 InvokeRoutedWithSlotRetry 的单 key 版互补）。
+     * 首轮批量分组 RPC 收到 STALE_ROUTE / SLOT_NOT_OWNED / SLOT_MIGRATING
+     * / 无 owner 空分组（UNAVAILABLE_IN_CURRENT_STATUS）的 key 子集：
+     * 含 SLOT_MIGRATING 时先轻量退避一轮（60ms，等 slot import/replay
+     * 就绪），再 RefreshSubmasterRouting 刷新路由后仅对失败子集重新分组
+     * 重发一次（有界 1 次）；重发后仍失败的 key 保持终态错误，语义与首轮一致。
+     * @param tenant_id 失败子集重新分组用租户。
+     * @param results 原批结果（in/out）：send_group 写回，其余不动。
+     * @param send_group(submaster, group_keys, group_orig_indices) 负责单组
+     * 重发并把组内结果写回 results（group_orig_indices 为组内 key 在原批
+     * 中的下标）；返回组内是否全部成功（仅用于打点）。
+     */
+    template <typename ResultType, typename SendGroupFn>
+    void RetryBatchOnStaleRoute(
+        const std::string& tenant_id, const std::vector<std::string>& keys,
+        std::vector<tl::expected<ResultType, ErrorCode>>& results,
+        SendGroupFn send_group);
+
+    /**
      * @brief Switches the underlying RPC pool to the given submaster address.
      * @param address Submaster address (primary_master_id).
      */

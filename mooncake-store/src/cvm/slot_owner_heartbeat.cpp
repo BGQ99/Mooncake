@@ -79,6 +79,14 @@ ErrorCode SlotOwnerHeartbeat::PublishOnce() {
         LOG(WARNING) << "SlotOwnerHeartbeat reconcile incomplete: master_id="
                      << config_.master_id << " owned_slots=" << slots.size()
                      << " err=" << err;
+        last_publish_failed_ = true;
+    } else if (last_publish_failed_) {
+        // 失败→成功转变（vsegment 发布成功 / 门控解除后心跳恢复收口）：
+        // 明确观测点，与「All owned slots ready」衔接成「可写入」信号链。
+        last_publish_failed_ = false;
+        LOG(INFO) << "SlotOwnerHeartbeat reconcile recovered: master_id="
+                  << config_.master_id << " owned_slots=" << slots.size()
+                  << " (slot handoff healthy again)";
     }
     return err;
 }

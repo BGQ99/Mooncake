@@ -132,8 +132,58 @@ class CvmController {
 
     // standby 动态绑定：按「本 standby 负责的 slot 区间」，用本地一致性哈希
     // 环（与客户端/服务端一致）推导出拥有这些 slot 的 primary，作为回放源
-    // （而非回放全部 primary）。本机为 primary 或无法确定负责区间时返回空列表。
+    //（而非回放全部 primary）。本机为 primary 或无法确定负责区间时返回空列表。
     std::vector<MasterRegistration> GetBindingSources();
+
+    // 环互备职责源（互备 1.3.1，供 supervisor serve phase 双角色回放运行
+    // 时低频拉取，2-5s 周期；内部含 etcd 读，勿在请求热路径调用）：
+    // 本机 master_id 出现在其 standby_ids 中的每个 rank → 该 rank 的
+    // primary 即回放源（OpLog 流命名空间 = primary master_id）。
+    // 与 GetBindingSources 互补且职责集天然不相交：phase3 只配未归属
+    //（待命池）成员，JoinAsStandbyRing（互备 1.1）只配已归属成员。
+    // 本机角色不过滤（双角色语义：serving 成员亦可被指派为环 standby）；
+    // primary 已死的 rank 不产出源（流不再推进，晋升窗口由互备 1.4
+    // 处理）；caretaker 多 rank 场景可返回多源。
+    std::vector<MasterRegistration> GetRingStandbySources();
+
+    // MC_STANDBY_MUTUAL_PAIRING 环互备总开关（true|1|on）：进程级静态
+    // 缓存，互备 1.1 门控（TryAssignRankForSelf 已归属分支）与 1.3.2
+    // supervisor 双角色回放运行时（RingStandbyRuntime::Start）必须读同一
+    // 值——配对记录与回放运行时失配（记录在而回放未起 = 空 standby
+    // 晋升缺口；回放起而记录无 = 白耗跟随资源）。
+    static bool StandbyMutualPairingEnabled();
+
+    // ---- 环互备领养编排（互备 1.4，staging-first 协议）----
+    // serving 成员领养死 primary 的额外 rank 时角色不变（kPrimary→
+    // kPrimary），supervisor 升级序列不触发——直接 CAS kStable 发布即
+    // 空元数据 serve（§16 要修的缺陷）。协议改为三段：
+    //   ① TryPromoteDeadPrimaryRanks 对已归属 serving 领养者 CAS
+    //      kMigrating（migrating_to 留空 = ring-adopt 标记）：写屏障立即
+    //      生效（CheckSlotWritable：kMigrating 且 migrating_to != 本机
+    //      → SLOT_MIGRATING），MasterService::ImportSlotMetadata 同据
+    //      暂缓就绪（SLOT_MIGRATING pending，下轮心跳重试）；
+    //   ② supervisor RingStandbyRuntime 每 poll 调 FindStagedRing
+    //      Adoptions 检测 staging rank，经 WrappedMasterService::
+    //      AdoptMaterializeFromDeadOwner 重放死 primary 的 OpLog 流
+    //      （P4 owned-slot 过滤，幂等定局）；
+    //   ③ 物化成功后 FinalizeRingAdoption CAS kMigrating→kStable，
+    //      解除写屏障，领养 slot 随下轮心跳自然 ready。
+    struct StagedRingAdoption {
+        uint32_t rank{0};
+        uint64_t epoch{0};       // 检测时刻的 ring_slots epoch（收尾 CAS 用）
+        std::string dead_primary_id;  // 空 = 进程重启丢失源记录（见下）
+    };
+    // 枚举本机处于 ring-adopt staging 的 rank（primary=本机且 kMigrating
+    // 且 migrating_to 为空；reshard 阶段 1 的 migrating_to=目标不属此列）。
+    // dead_primary_id 来自 staging CAS 时刻的进程内记录；领养者进程在
+    // ①→③ 窗口内重启会丢失该记录（返回空 id），此时保持写屏障并节流
+    // 告警等人工处置（admin reshard 重建），绝不盲目收尾。
+    std::vector<StagedRingAdoption> FindStagedRingAdoptions();
+    // ③ 收尾 CAS：kMigrating→kStable（epoch CAS 单赢家；standby 列表
+    // 保留——P3 不做补位，§16.15.3）。成功即清除 staging 记录；STALE
+    // = 并发推进（他方已收尾 / 管理员操作），调用方静默接受。
+    ErrorCode FinalizeRingAdoption(uint32_t rank, uint64_t expected_epoch,
+                                   const std::string& dead_primary_id);
 
     // Admin Metrics 专用低频只读视图（§16.18.2 满配缺口的可观测化）：
     // 统计各 rank 的存活 standby 覆盖情况。live etcd 读，仅由 admin
@@ -148,6 +198,10 @@ class CvmController {
     // rank 越界）返回 false；G=0 表示尚未加载。
     bool GetCachedRingSlotAssign(uint32_t rank, RingSlotAssign& out);
     uint32_t GetCachedSlotGroupCount();
+    // 缓存对应的 etcd revision（0 = 尚未成功刷新）。route_epoch 语义与
+    // §15 masters revision 一致：归属 CAS 推进 → 递增 → 客户端 STALE_ROUTE
+    // 比对可感知归属变化。
+    int64_t GetCachedRingSlotsRevision();
     // ring_slots 模型是否启用（存在任一归属记录）。注意 group_count 不能
     // 作启用判定：旧集群（§15）的 cluster_meta 反序列化后 G 也落默认 1。
     bool HasCachedRingSlotAssigns();
@@ -207,6 +261,14 @@ class CvmController {
     std::mutex ring_slots_mutex_;
     uint32_t ring_slot_group_count_{0};
     std::map<uint32_t, RingSlotAssign> ring_slots_cache_;
+    // 最近一次缓存刷新读取 ring_slots 前缀时的 etcd revision（range read
+    // header ModRevision，随任何 etcd 写——含归属 CAS——单调递增）。供
+    // MasterService 在 ring 模式下维护 route_epoch 门控（cvm_ring_revision_，
+    // §15 回退分支用 masters revision 的 ring 对应物）：修复 ring 分支只更
+    // 新 owned 集合不更新 revision，导致 numeric partition 路由加载恒被
+    // 「revision<=0」门控拒绝的死锁。与缓存同临界区更新，保证 revision 与
+    // assigns 一致。
+    int64_t ring_slots_revision_{0};
     // 本进程曾观测到 ring_slots 记录（模型启用标记，只置位不回落）。
     // 幽灵写告警门控（见 HasSeenRingSlotsModel）。
     std::atomic<bool> ring_slots_model_seen_{false};
@@ -229,6 +291,13 @@ class CvmController {
     // 降级 fencing 承担。primary 恢复存活即清除。
     std::map<uint32_t, std::chrono::steady_clock::time_point>
         dead_primary_since_;
+    // 环互备 1.4：ring-adopt staging rank → 被领养 rank 的死 primary
+    // master_id（staging CAS 时刻记录，FindStagedRingAdoptions 消费、
+    // FinalizeRingAdoption 清除）。进程内记录，重启即失——窗口内重启的
+    // 领养者会得到空 dead_primary_id，由调用方保持屏障 + 节流告警。
+    // 挂 ring_slots_mutex_（写入方 ReconcileRole 线程，读取方
+    // RingStandbyRuntime 线程）。
+    std::map<uint32_t, std::string> staged_adoption_source_;
     std::atomic<bool> ring_slots_watch_armed_{false};
     std::unique_ptr<WatchState> ring_slots_watch_state_;
     std::thread ring_slots_watch_thread_;
@@ -238,11 +307,12 @@ class CvmController {
     // 一条 INFO（含跳过原因统计，见 LogStepOutcome），稳态（连续
     // no-candidate）静默；逐候选跳过原因在 VLOG(1)（-v=1 开启）。
     // 索引 0-3 = 补位四阶段，4 = 晋升路径（TryPromoteDeadPrimaryRanks），
-    // 5 = 兼管自愈（TryDesignatedTakeover）——见 cpp 匿名命名空间
-    // AssignPhase。原子不加锁：ReconcileRole 的 watch/membership 双触发
+    // 5 = 兼管自愈（TryDesignatedTakeover），6 = 已归属成员环互备配对
+    //（JoinAsStandbyRing）——见 cpp 匿名命名空间 AssignPhase。
+    // 原子不加锁：ReconcileRole 的 watch/membership 双触发
     // 并发下最多漏/重一条诊断行，无害。
-    std::atomic<int> last_phase_outcome_[6]{{-1}, {-1}, {-1}, {-1},
-                                           {-1}, {-1}};
+    std::atomic<int> last_phase_outcome_[7]{{-1}, {-1}, {-1}, {-1},
+                                           {-1}, {-1}, {-1}};
     std::atomic<bool> last_my_turn_{false};
 
     std::mutex membership_mutex_;
@@ -312,6 +382,18 @@ class CvmController {
     // 阶段 ③：以 standby 身份加入无存活 standby 的 rank（1:1 配对）。
     int JoinAsStandby(const RingSlotsView& view,
                       const std::vector<MasterRegistration>& members);
+    // 已归属成员环互备配对（§16.18.1 环拓扑扩展，互备 1.1）：目标 rank
+    // 的指派候选者 = 沿 rank 升序环下一个「有存活 primary 的 rank」的
+    // primary，同机则顺延（跨机约束）；指派确定性推导 → 全集群对同一
+    // rank 唯一写者，无 CAS 竞争，无需轮次门控。仅当「指派候选者 ==
+    // 本机」才 CAS 加入（1:1 整体替换，同阶段 ③ 语义）。已有存活
+    // standby 的 rank 不强制重拓扑（防成员变动期配对抖动）。挂在
+    // MC_STANDBY_MUTUAL_PAIRING 环境开关后面（互备回放运行时 1.3 部署
+    // 前必须保持 OFF，否则空 standby_ids 记录会被晋升路径优先采纳）。
+    // 单周期单动作，三态结果同阶段 ①-③。
+    int JoinAsStandbyRing(const RingSlotsView& view,
+                          const std::vector<MasterRegistration>& members,
+                          uint32_t group_count);
     // 补位阶段结果的变更触发日志（phase 索引 / outcome 三态见 cpp 匿名
     // 命名空间的 AssignPhase / StepOutcome；detail 为跳过统计或动作
     // 摘要）。结果与上次周期相同则静默（防刷屏，见 last_phase_outcome_

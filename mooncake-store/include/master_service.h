@@ -1078,6 +1078,21 @@ class MasterService {
     // 死 owner（或自身旧世代）冷接管重放：ImportSlotMetadata 判空分支
     // 前调用；每个 source 定局后仅尝试一次，瞬态失败可下轮重试。
     bool TryRecoverFromDeadOwnerOpLog(const std::string& source_id);
+
+    // 环互备领养物化（互备 1.4）：supervisor RingStandbyRuntime 在
+    // ring-adopt staging（kMigrating 写屏障）期间的编排入口。与
+    // TryRecoverFromDeadOwnerOpLog 同通道（重放 source_id 流 + P4
+    // owned-slot 过滤 + 定局登记 + RestoreFromStandbySnapshot 物化，
+    // 幂等：已定局短路返回 OK），但返回 ErrorCode 三态供编排方决策：
+    //   OK        —— 已物化或已定局，可 CAS kMigrating→kStable 收尾；
+    //   INCOMPLETE_OPLOG_CATCH_UP —— 30s 重放预算耗尽（etcd 抖动），
+    //                瞬态：不收尾，写屏障保持，下轮重试；
+    //   其余 FATAL —— 流不可恢复（越窗 / durable prefix 缺失等）或
+    //                OpLog 未启用（UNAVAILABLE_IN_CURRENT_STATUS）：
+    //                按既有冷接管回退语义（判空、客户端冷重建）可收尾，
+    //                调用方须告警。stream_present 仅诊断（false=流不存在）。
+    ErrorCode AdoptMaterializeFromDeadOwner(const std::string& source_id,
+                                            bool& stream_present);
     ///@}
 
     /**
@@ -2618,6 +2633,14 @@ class MasterService {
     std::vector<bool> expected_owned_;
     std::vector<bool> ready_owned_;
     bool owned_slots_ready_{false};
+    // ready/expected 计数（owned_slots_mutex_ 保护）：饱和（ready==expected
+    // 且 >0）转变时打一条「全部就绪可写入」INFO——vsegment 发布成功后写入
+    // 可行性的明确观测点（此前 MarkSlotsReady 完全静默，只能从 admin
+    // metrics 的 owned_slots 间接推断）。all_ready_logged_ 为饱和去重标记：
+    // 进入饱和打一条，离开饱和静默复位，稳态零输出。
+    uint32_t ready_slot_count_{0};
+    uint32_t expected_slot_count_{0};
+    bool all_ready_logged_{false};
     // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
     bool owned_slot_count_logged_{false};
     std::size_t last_logged_owned_count_{0};

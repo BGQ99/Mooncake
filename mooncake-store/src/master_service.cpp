@@ -1467,6 +1467,7 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
         "load_fail", "reconcile_fail", "stale_cas"};
     uint32_t vseg_stats[kVSegStatCount] = {0, 0, 0, 0, 0, 0, 0};
     std::string reconcile_fail_first;
+    std::string load_fail_first;
     bool complete = true;
     for (const auto& partition_id : partition_ids) {
         ++vseg_stats[0];
@@ -1482,6 +1483,12 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
             continue;
         }
         if (error != ErrorCode::OK) {
+            // 首失败样本（partition + 错误码），周期末一条 ERROR——与
+            // reconcile_fail_first 同模式；典型样本即 ring_revision 门控的
+            // INVALID_VERSION，能直接暴露本次这类死锁。
+            if (load_fail_first.empty()) {
+                load_fail_first = partition_id + ": " + toString(error);
+            }
             ++vseg_stats[4];
             complete = false;
             continue;
@@ -1539,6 +1546,13 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
     if (!reconcile_fail_first.empty()) {
         LOG(ERROR) << "vsegment reconcile failures: count="
                    << vseg_stats[5] << ", first=" << reconcile_fail_first;
+    }
+    // load_fail（路由加载失败，含 ring_revision 门控拒绝的 INVALID_VERSION）
+    // 同样收拢为每周期一条首样本——否则门控类全量失败 16384 条/周期只进
+    // stats 计数，排查时无错误码可看（本次死锁定位耗时长的直接缺口）。
+    if (!load_fail_first.empty()) {
+        LOG(ERROR) << "vsegment reconcile load failures: count="
+                   << vseg_stats[4] << ", first=" << load_fail_first;
     }
     if (complete && !recovered_owned_partitions.empty()) {
         std::unordered_map<std::string,
@@ -2260,6 +2274,28 @@ MasterService::InterMasterAckSlotRangeImported(
 }
 
 ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
+    // 环互备领养 staging 门控（互备 1.4 ①）：slot 所在 rank 处于
+    // ring-adopt staging（primary=本机且 kMigrating、migrating_to 为空）
+    // 期间暂缓导入与就绪——物化由 supervisor RingStandbyRuntime 编排
+    //（OpLog 流重放 + P4 过滤），kMigrating→kStable 收尾后本路径随
+    // 下轮心跳重试自然通过。staging 窗口内提前 RefreshVSegmentOwnership
+    // 有重建 allocator 覆盖存活 extent 的风险（4.2 fail-closed 语义），
+    // 提前 MarkSlotsReady 则半物化 serve；返回 SLOT_MIGRATING 挂起
+    // pending，SlotOwnerHeartbeat 下轮自动重试（on_slot_acquired 非 OK
+    // 语义）。缓存读取零 etcd 开销；签名（primary=本机 + migrating_to
+    // 空）与 reshard 阶段 1（primary=源、migrating_to=目标）不相交。
+    if (cvm_controller_ != nullptr) {
+        const uint32_t group_count = cvm_controller_->GetCachedSlotGroupCount();
+        cvm::RingSlotAssign assign;
+        if (group_count > 0 &&
+            cvm_controller_->GetCachedRingSlotAssign(
+                cvm::SlotToRank(slot, group_count), assign) &&
+            static_cast<cvm::SlotState>(assign.state) ==
+                cvm::SlotState::kMigrating &&
+            assign.primary_id == master_id_ && assign.migrating_to_id.empty()) {
+            return ErrorCode::SLOT_MIGRATING;
+        }
+    }
     // 推导迁移前一任 owner（旧环）。空环 / 无旧 owner（冷启动、旧 owner
     // 消亡）→ 无可拉取对象，直接视为就绪（元数据为空，客户端重建）。
     std::vector<std::string> prev_ids;
@@ -3543,6 +3579,17 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
         // 实现等价（rank 越界记录由 RankOwnedSlots 防御性返回空剔除，
         // 不影响本机 owned 集合）。
         const cvm::RingSlotsView view = cvm_controller_->BuildRingSlotsView();
+        // 缓存对应的 etcd revision（range read ModRevision，锁外取——与上方
+        // BuildRingSlotsView 同模式，避免 controller 锁内再套 resolver 锁）。
+        // ring 模式下作为 route_epoch 门控数据写入 cvm_ring_revision_：修复
+        // ring 分支只更新 owned 集合、revision 恒为 0，导致 numeric partition
+        // 的 LoadEffectivePartitionRoute 恒被「ring_revision<=0」拒绝（全量
+        // load_fail → PERSISTENT_FAIL → slot 永不 ready → 全部写入 SLOT_MIGRATING
+        // 的单主新集群死锁）。§15 回退分支用 masters revision，此处用 ring
+        // 前缀 revision，语义一致：归属 CAS 推进 → 递增 → 客户端 STALE_ROUTE
+        // 比对可感知归属变化。
+        const int64_t ring_revision =
+            cvm_controller_->GetCachedRingSlotsRevision();
         const uint32_t group_count = view.group_count();
         std::vector<cvm::RingSlotAssign> mine;
         for (const auto& a : view.assigns()) {
@@ -3558,6 +3605,7 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
                 owned.insert(owned.end(), segment.begin(), segment.end());
             }
             std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+            cvm_ring_revision_ = ring_revision;
             const std::size_t new_count = owned.size();
             if (!owned_slot_count_logged_ ||
                 new_count != last_logged_owned_count_) {
@@ -3579,6 +3627,9 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
         // primary N→0）打一次变更日志，稳态零输出。
         {
             std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+            // standby（非任何 rank 的 primary）同样维护 revision 门控：其对
+            // foreign partition 的路由缓存加载也走同一判定。
+            cvm_ring_revision_ = ring_revision;
             if (!owned_slot_count_logged_ || last_logged_owned_count_ != 0) {
                 LOG(INFO) << "ResolveOwnedSlotsForCvm: owned slot count "
                              "changed (ring_slots)"
@@ -3785,9 +3836,16 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     // Retained slots remain ready. Newly acquired slots are not serviceable
     // until both object metadata and their vsegment state have been installed.
     ready_owned_.resize(cvm::kSlotCount, false);
+    uint32_t ready_count = 0;
     for (size_t slot = 0; slot < ready_owned_.size(); ++slot) {
         ready_owned_[slot] = ready_owned_[slot] && expected_owned_[slot];
+        if (ready_owned_[slot]) {
+            ++ready_count;
+        }
     }
+    // ready/expected 计数同步（饱和日志观测点，见成员注释）。
+    expected_slot_count_ = static_cast<uint32_t>(slots.size());
+    ready_slot_count_ = ready_count;
     owned_slots_ready_ = true;
     // 一致性哈希环分配结果（3.1）：仅在数量变化（含首次解析）时打印，
     // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
@@ -3810,8 +3868,26 @@ void MasterService::MarkSlotsReady(const std::vector<uint16_t>& slots) {
     for (uint16_t slot : slots) {
         if (slot < ready_owned_.size() && slot < expected_owned_.size() &&
             expected_owned_[slot]) {
+            if (!ready_owned_[slot]) {
+                ++ready_slot_count_;
+            }
             ready_owned_[slot] = true;
         }
+    }
+    // 饱和转变日志（进入打一条，离开静默复位）：ready==expected 即「全部
+    // 已归属 slot 元数据就绪、写入可放行」的明确观测点——vsegment 发布
+    // 成功（reconcile recovered）之后、客户端恢复写入之前的最后一环。
+    if (expected_slot_count_ > 0 &&
+        ready_slot_count_ == expected_slot_count_) {
+        if (!all_ready_logged_) {
+            LOG(INFO) << "All owned slots ready: ready="
+                      << ready_slot_count_ << "/" << expected_slot_count_
+                      << ", master is ready to serve writes"
+                      << ", master_id=" << master_id_;
+            all_ready_logged_ = true;
+        }
+    } else if (all_ready_logged_) {
+        all_ready_logged_ = false;
     }
 }
 
@@ -6004,11 +6080,34 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
         return results;
     }
 
+    // Slot 归属门控：非本机 key 原路径会静默落入 tenant miss / not found
+    // 分支并误报 false，客户端会把「路由错」当「对象不存在」。对齐
+    // BatchGetReplicaList 读路径的三路拆分：OK→本地查询；SLOT_MIGRATING→
+    // 透传（客户端有界退避重试）；非本机→SLOT_NOT_OWNED。
+    // InterMasterRpc 无 BatchExistKey 转发方法：客户端 batch 路径已有
+    // RetryBatchOnStaleRoute 刷新路由重发闭环自愈，服务端转发仅省一跳
+    // RTT 收益有限，故直接拒绝保持语义正确（路由漂移窗口的可见性由
+    // 客户端 60s 节流 WARNING 提供，此处不逐 key 打日志防刷屏）。
+    std::vector<size_t> local_indices;
+    local_indices.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const uint16_t slot = cvm::KeySlot(normalized_tenant, keys[i]);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc == ErrorCode::OK) {
+            local_indices.push_back(i);
+        } else {
+            results[i] = tl::make_unexpected(svc);
+        }
+    }
+    if (local_indices.empty()) {
+        return results;
+    }
+
     std::vector<std::vector<size_t>> indices_by_shard(kNumShards);
     {
         std::shared_lock<std::shared_mutex> group_routing_lock(
             group_routing_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
+        for (const size_t i : local_indices) {
             auto route_it = object_group_ids_.find(
                 normalized_tenant.MakeScopedKey(keys[i]));
             const size_t shard_idx =
@@ -16409,6 +16508,59 @@ bool MasterService::TryRecoverFromDeadOwnerOpLog(const std::string& source_id) {
     RestoreFromStandbySnapshot(objects, /*initial_oplog_sequence_id=*/0,
                                 segments, vsegment_partitions);
     return true;
+}
+
+ErrorCode MasterService::AdoptMaterializeFromDeadOwner(
+    const std::string& source_id, bool& stream_present) {
+    // 互备 1.4 ②：与 TryRecoverFromDeadOwnerOpLog 同通道的物化原语，
+    // 供 supervisor RingStandbyRuntime 在 ring-adopt staging（kMigrating
+    // 写屏障）期间编排调用（契约满足 RecoverStateFromOpLogStream 第 1
+    // 条：领养 rank 处于写屏障，重放条目与在途写无覆盖竞态）。区别仅在
+    // 错误传达：bool（回退判空语义，心跳路径自闭环）升级为 ErrorCode
+    // 三态（OK=可收尾 / INCOMPLETE=瞬态重试 / FATAL=不可恢复可收尾），
+    // 收尾决策权移交编排方（见头文件注释）。锁与定局登记语义同
+    // TryRecoverFromDeadOwnerOpLog：oplog_replay_mutex_ 串行化重放，
+    // 成功才定局，瞬态失败不登记。
+    stream_present = false;
+    if (!enable_oplog_ || source_id.empty()) {
+        // OpLog 未启用：无可恢复数据（与既有晋升空态语义一致，调用方
+        // 告警后按空态收尾）。
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    std::lock_guard<std::mutex> lock(oplog_replay_mutex_);
+    if (oplog_replay_finalized_sources_.count(source_id)) {
+        // 已定局（心跳死 owner 分支 / 先前周期已物化）：幂等短路。
+        stream_present = true;
+        return ErrorCode::OK;
+    }
+    std::vector<StandbyObjectEntry> objects;
+    std::vector<StandbySegmentInfo> segments;
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
+    const ErrorCode err = RecoverStateFromOpLogStream(
+        source_id, stream_present, objects, segments, vsegment_partitions);
+    if (err != ErrorCode::OK) {
+        // INCOMPLETE_OPLOG_CATCH_UP（预算耗尽）/ FATAL（越窗、prefix
+        // 缺失）：均不定局，三态交编排方决策（重试或告警收尾）。
+        return err;
+    }
+    // 上限保护同 TrySelfRecoverFromOpLog（1<<20 清空，seq 幂等兜底）。
+    if (oplog_replay_finalized_sources_.size() >= (1 << 20)) {
+        oplog_replay_finalized_sources_.clear();
+    }
+    oplog_replay_finalized_sources_.insert(source_id);
+    if (stream_present &&
+        (!objects.empty() || !segments.empty() || !vsegment_partitions.empty())) {
+        LOG(INFO) << "ring adoption replay: materializing dead owner state,"
+                 << " source=" << source_id << ", objects=" << objects.size()
+                 << ", segments=" << segments.size()
+                 << ", vsegment_partitions=" << vsegment_partitions.size();
+        // P4 owned-slot 过滤同冷接管：只物化本机当前 owned slots（staging
+        // 期间领养 rank 的 slot 已计入 owned——ResolveOwnedSlotsForCvm 按
+        // primary_id 判定，不看 rank state）。
+        RestoreFromStandbySnapshot(objects, /*initial_oplog_sequence_id=*/0,
+                                   segments, vsegment_partitions);
+    }
+    return ErrorCode::OK;
 }
 
 tl::expected<uint64_t, ErrorCode>

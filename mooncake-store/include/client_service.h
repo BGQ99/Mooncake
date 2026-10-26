@@ -951,6 +951,12 @@ class Client {
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+    // 上一批次 Put 是否含失败 key（relaxed atomic：观测性辅助，非正确性；
+    // 并发批量下尽力转变检测）。失败→恢复的转变批次打一条 INFO——与
+    // CollectResults 的逐 key ERROR 对应，作为「客户端写入恢复」的明确
+    // 观测点（如 SLOT_MIGRATING 风暴后 master 就绪、写入重新流通），
+    // 稳态成功批次静默。
+    std::atomic<bool> last_batch_put_failed_{false};
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
         std::vector<PutOperation>& ops);
