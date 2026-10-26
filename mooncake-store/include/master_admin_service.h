@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,12 +40,21 @@ class MasterAdminServer {
 
     void SetServiceAvailable(bool available);
 
+    // HA standby 覆盖率低频可观测（§16.18.2 满配缺口）：由 supervisor 注入
+    // 拉取式 provider（读 CvmController 当前视图），admin metrics 线程按
+    // kMetricReportIntervalSeconds 周期调用并拼入 Master Admin Metrics
+    // 日志（置于 owned_slots 之前，行尾槽位约定不变）。provider 为空时
+    // 显示 n/a；调用方须保证 provider 闭包的捕获生命周期安全（supervisor
+    // 侧以 RAII guard 摘除，见 master_service_supervisor.cpp）。
+    void SetStandbyCoverageProvider(std::function<std::string()> provider);
+
    private:
     struct RuntimeSnapshot {
         ha::MasterRuntimeState state = ha::MasterRuntimeState::kStarting;
         std::optional<ha::MasterView> leader_view;
         std::shared_ptr<WrappedMasterService> service;
         bool service_available = false;
+        std::function<std::string()> standby_coverage_provider;
     };
 
     RuntimeSnapshot SnapshotState() const;
@@ -118,6 +128,7 @@ class MasterAdminServer {
     std::optional<ha::MasterView> leader_view_;
     std::shared_ptr<WrappedMasterService> service_;
     bool service_available_ = false;
+    std::function<std::string()> standby_coverage_provider_;
 };
 
 }  // namespace mooncake

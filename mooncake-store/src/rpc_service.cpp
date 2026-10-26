@@ -1943,6 +1943,10 @@ void WrappedMasterService::RestoreFromStandby(
         objects, initial_oplog_sequence_id, segments, vsegment_partitions);
 }
 
+bool WrappedMasterService::TrySelfRecoverFromOpLog() {
+    return master_service_.TrySelfRecoverFromOpLog();
+}
+
 void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     master_service_.SetCvmLeaseId(lease_id);
 }
@@ -1950,6 +1954,11 @@ void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
 void WrappedMasterService::SetCvmController(
     cvm::CvmController* controller) {
     master_service_.SetCvmController(controller);
+}
+
+void WrappedMasterService::SetVSegmentAutoPlanPolicy(
+    const vsegment::VSegmentUserPolicy& policy) {
+    master_service_.SetVSegmentAutoPlanPolicy(policy);
 }
 
 ErrorCode WrappedMasterService::StartSlotOwnerHeartbeat() {

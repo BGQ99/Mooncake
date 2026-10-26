@@ -375,6 +375,50 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
     }
 
+    // standby 覆盖率 provider 的共享生命周期状态：metric 线程（拷贝的
+    // provider 闭包）与退出路径（guard 析构）经互斥互达——provider 要么
+    // 先于 guard 完成 live etcd 调用，要么看到 alive=false 直接返回
+    // unavailable，消除 cvm_controller 悬垂窗口（admin_server 生命周期
+    // 长于本函数作用域，RunSupervisorLoop 不调用其 Stop）。
+    struct StandbyCoverageSharedState {
+        std::mutex mutex;
+        bool alive = false;
+        cvm::CvmController* controller = nullptr;
+    };
+    std::shared_ptr<StandbyCoverageSharedState> coverage_state;
+    if (cvm_controller) {
+        coverage_state = std::make_shared<StandbyCoverageSharedState>();
+        coverage_state->controller = cvm_controller.get();
+        coverage_state->alive = true;
+        const auto state_ptr = coverage_state;
+        // P2-7-C（§16.18.2 满配缺口可观测化）：admin metrics 线程按
+        // kMetricReportIntervalSeconds（10s）低频拉取，不走心跳路径。
+        admin_server.SetStandbyCoverageProvider([state_ptr]() -> std::string {
+            std::lock_guard<std::mutex> lock(state_ptr->mutex);
+            if (!state_ptr->alive || !state_ptr->controller) {
+                return "unavailable";
+            }
+            return state_ptr->controller->GetStandbyCoverageSummary();
+        });
+    }
+    // RAII guard 声明于 cvm_controller 与 coverage_state 之后 → 析构先于
+    // 二者：任意 return 路径都先摘 provider、置 alive=false，再销毁
+    // controller，杜绝 metric 线程在 controller 析构期间/之后解引用。
+    struct StandbyCoverageProviderGuard {
+        MasterAdminServer& admin;
+        std::shared_ptr<StandbyCoverageSharedState> state;
+        ~StandbyCoverageProviderGuard() {
+            if (state) {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->alive = false;
+                    state->controller = nullptr;
+                }
+                admin.SetStandbyCoverageProvider(nullptr);
+            }
+        }
+    } standby_coverage_guard{admin_server, coverage_state};
+
     EnterStandbyMode(admin_server, *standby_controller,
                      accept_standby_runtime_updates,
                      cvm_controller);
@@ -444,6 +488,22 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 wrapped_master_service->SetCvmController(cvm_controller.get());
             }
 
+            // vsegment auto-plan 发布侧重试策略（--vsegment_auto_plan flags
+            // 经 MasterServiceSupervisorConfig 传入）：serve phase 前注入一次，
+            // 供心跳/mount 触发点在配额快照缺失期间节流重试发布（修复
+            // submaster 先于 client 启动时一次性 bootstrap 永久失败的死锁）。
+            if (config.vsegment_auto_plan &&
+                config.vsegment_auto_plan_member_count != 0) {
+                vsegment::VSegmentUserPolicy policy;
+                policy.member_count = config.vsegment_auto_plan_member_count;
+                policy.stripe_size = config.vsegment_auto_plan_stripe_size;
+                policy.member_extent_size =
+                    config.vsegment_auto_plan_member_extent_size;
+                policy.reserved_ratio =
+                    config.vsegment_auto_plan_reserved_ratio;
+                wrapped_master_service->SetVSegmentAutoPlanPolicy(policy);
+            }
+
             // Restore from standby if we have context.
             if (promotion_ctx.applied_seq_id > 0 ||
                 !promotion_ctx.objects.empty() ||
@@ -453,6 +513,24 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     promotion_ctx.objects, promotion_ctx.applied_seq_id,
                     promotion_ctx.segments,
                     promotion_ctx.vsegment_partitions);
+            } else {
+                // 缺陷3修复（同身份重启失忆自愈）：无上游 PromotionContext
+                //（首启 primary 或重启后 rank 仍指向本机的快重启场景）时，
+                // 从本机 OpLog 流自恢复——否则空内存 serve 会导致该 master
+                // 全部 owned slots 的对象元数据静默丢失（etcd 视图正常、
+                // 路由无变化，客户端连 STALE_ROUTE 重试都不会触发）。
+                // 本 else 分支是 serve 前的一次性路径（RegisterRpcService
+                // 之前，每进程至多触发一次；进程内幂等由 callee 的
+                // oplog_replay_finalized_sources_ 定局登记兜底）。
+                // 返回 false 覆盖两种情形：真·新集群空流（正常空态）与
+                // 重放失败（瞬态已有界重试、耗尽后 ERROR 告警，均在 callee
+                // 内完成，此处无需重复打点）。
+                const bool self_recovered =
+                    wrapped_master_service->TrySelfRecoverFromOpLog();
+                if (self_recovered) {
+                    LOG(INFO) << "Supervisor: self OpLog recovery restored "
+                                 "state before serve";
+                }
             }
 
             mooncake::RegisterRpcService(server, *wrapped_master_service);

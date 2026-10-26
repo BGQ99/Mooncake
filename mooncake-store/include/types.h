@@ -313,6 +313,10 @@ enum class ErrorCode : int32_t {
         -104,  ///< Partition quota cannot satisfy the configured layout.
     VSEGMENT_CREATING =
         -105,  ///< A single-flight vsegment creation is in progress.
+    VSEGMENT_SERVICE_NOT_READY =
+        -106,  ///< VSegment service init in progress; retry later.
+    VSEGMENT_MOUNT_QUIET_PERIOD =
+        -107,  ///< Mount stream not settled; publish deferred, retry later.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =

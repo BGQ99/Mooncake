@@ -307,10 +307,17 @@ class WrappedMasterService {
                                 vsegment::PartitionVSegmentSnapshot>&
                                 vsegment_partitions = {});
 
+    // 同身份重启失忆自愈（缺陷3修复）：无 PromotionContext 时从本机
+    // OpLog 流自恢复。Internal（supervisor 调用），NOT an RPC endpoint.
+    bool TrySelfRecoverFromOpLog();
+
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).
     void SetCvmLeaseId(EtcdLeaseId lease_id);
     void SetCvmController(cvm::CvmController* controller);
+    // vsegment auto-plan 重试策略注入（--vsegment_auto_plan flags 解析），
+    // 转发给内部 MasterService（见 MasterService::SetVSegmentAutoPlanPolicy）。
+    void SetVSegmentAutoPlanPolicy(const vsegment::VSegmentUserPolicy& policy);
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 

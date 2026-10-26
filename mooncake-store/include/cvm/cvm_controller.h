@@ -135,6 +135,14 @@ class CvmController {
     // （而非回放全部 primary）。本机为 primary 或无法确定负责区间时返回空列表。
     std::vector<MasterRegistration> GetBindingSources();
 
+    // Admin Metrics 专用低频只读视图（§16.18.2 满配缺口的可观测化）：
+    // 统计各 rank 的存活 standby 覆盖情况。live etcd 读，仅由 admin
+    // metrics 线程周期调用（10s 量级），不走心跳路径。uncovered 即
+    // 「primary 存活但零存活 standby」的稳态缺口（N 满配部署的已知
+    // 架构缺口，见 JoinAsStandby 注释）；kMigrating 与 primary 死亡的
+    // rank 单列，不计入 uncovered。
+    std::string GetStandbyCoverageSummary();
+
     // ---- RingSlots 缓存读取（步骤 2-4 消费接口，§16.14.6）----
     // 拷贝语义：锁内复制后返回，调用方长期持有安全。未命中（缓存空 /
     // rank 越界）返回 false；G=0 表示尚未加载。

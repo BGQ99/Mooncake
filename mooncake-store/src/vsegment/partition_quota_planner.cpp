@@ -1,7 +1,9 @@
 #include "vsegment/partition_quota_planner.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
@@ -10,6 +12,7 @@
 
 #include "etcd_helper.h"
 #include "crc32c.h"
+#include "cvm/cvm_keys.h"
 #include "cvm/etcd_view_store.h"
 #include "cvm/slot_hash.h"
 
@@ -423,6 +426,46 @@ ErrorCode PlanAndPublishDiscoveredQuota(
     if (error != ErrorCode::OK) {
         if (detail) *detail = "CVM discovery failed: " + toString(error);
         return error;
+    }
+
+    // ---- 1b. W6 集群级 mount 静默期门控 ----
+    // quota 首写一次定型（first-writer-wins）：滚动部署中段（后续 worker 的
+    // 段尚未挂齐）发布会得到覆盖不完整拓扑的快照。mount/remount 处理器把
+    // 最近活动墙钟毫秒写入 etcd 共享 key（跨 submaster 生效——静默信号在
+    // 集群层面成立，与触发方所在进程无关）；未静默满门控窗口则本轮拒绝
+    // 发布，调用方按可重试处理。时钟为各 submaster 墙钟，秒级偏差对窗口
+    // 可忽略。
+    // 窗口默认 10s（小集群/bench 场景 30s 过长导致写请求在挂载完成后仍
+    // STALE_ROUTE 达 30~40s）；大规模滚动部署可经
+    // MOONCAKE_VSEGMENT_MOUNT_QUIET_MS 调高；<=0 关闭门控（仅供测试）。
+    {
+        static const int64_t kMountQuietPeriodMs = [] {
+            const char* env = std::getenv("MOONCAKE_VSEGMENT_MOUNT_QUIET_MS");
+            return env != nullptr ? std::atoll(env) : 10000;
+        }();
+        if (kMountQuietPeriodMs > 0) {
+            const auto activity_key =
+                cvm::VSegmentMountActivityKey(cluster_namespace);
+            std::string activity;
+            EtcdRevisionId revision = 0;
+            if (EtcdHelper::Get(activity_key.data(), activity_key.size(),
+                                activity,
+                                revision) == ErrorCode::OK &&
+                !activity.empty() &&
+                activity.find_first_not_of("0123456789") ==
+                    std::string::npos) {
+                const int64_t last_ms = std::stoll(activity);
+                const auto now_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now()
+                            .time_since_epoch())
+                        .count();
+                if (last_ms > 0 && now_ms - last_ms < kMountQuietPeriodMs) {
+                    if (detail) *detail = "mount stream not settled yet";
+                    return ErrorCode::VSEGMENT_MOUNT_QUIET_PERIOD;
+                }
+            }
+        }
     }
 
     // ---- 2. 构建规划请求 + 计算（三核心参数校验在 Build 内）----

@@ -764,6 +764,48 @@ MasterRole CvmController::ComputeDesiredRole() {
     return current_role_.load();
 }
 
+// Admin Metrics 拉取式低频只读视图：计数口径与 JoinAsStandby 一致
+//（standby_ids 中任一成员存活即视为已配对）。uncovered 只度量
+// 「primary 存活但零存活 standby」的稳态缺口；primary 死亡与迁移中
+// 的 rank 属瞬态，单列不计入。
+std::string CvmController::GetStandbyCoverageSummary() {
+    std::vector<MasterRegistration> members;
+    if (!LoadRankedMembers(members) || members.empty()) {
+        return "unavailable";
+    }
+    const RingSlotsView view = BuildRingSlotsView();
+    if (!view.active()) {
+        return "inactive";
+    }
+    int total = 0, covered = 0, primary_dead = 0, migrating = 0;
+    for (const auto& a : view.assigns()) {
+        ++total;
+        if (a.primary_id.empty() || !IsMemberAlive(members, a.primary_id)) {
+            ++primary_dead;
+            continue;
+        }
+        if (static_cast<SlotState>(a.state) == SlotState::kMigrating) {
+            ++migrating;
+            continue;
+        }
+        bool has_live_standby = false;
+        for (const auto& sid : a.standby_ids) {
+            if (IsMemberAlive(members, sid)) {
+                has_live_standby = true;
+                break;
+            }
+        }
+        if (has_live_standby) {
+            ++covered;
+        }
+    }
+    return "ranks=" + std::to_string(total) + ", covered=" +
+           std::to_string(covered) + ", uncovered=" +
+           std::to_string(total - covered - primary_dead - migrating) +
+           ", primary_dead=" + std::to_string(primary_dead) +
+           ", migrating=" + std::to_string(migrating);
+}
+
 std::string CvmController::GetPrimaryAddress() {
     std::vector<MasterRegistration> members;
     if (!LoadRankedMembers(members) || members.empty()) {
@@ -1428,13 +1470,27 @@ int CvmController::JoinAsStandby(
     const std::vector<MasterRegistration>& members) {
     // ③ primary 存活但无存活 standby 的 rank（§16.18.2 步 2，rank 升序）：
     // CAS 加入 standby_ids（1:1 整体替换，§16.18.1；顺带清死亡 standby）。
-    // kMigrating 的 rank 跳过（迁移瞬态，完成后下周期补）。
-    int dead_or_empty = 0, migrating = 0, already_paired = 0;
+    // kMigrating 的 rank 跳过（迁移瞬态，完成后下周期补——注意：该「下周期
+    // 补」仅对 N+ 部署（成员数 > submaster_count，待命池非空）的未归属
+    // 候选者可达；submaster_count=N 满配部署下迁移完成的新 owner 属「已
+    // 归属」成员，被 TryAssignRankForSelf 阶段 0 门控挡在 phase3 之外，
+    // 稳态每 rank 零 standby 是当前架构已知缺口（修复需 primary 互为
+    // standby 的并发跟随支持，见设计文档）。
+    int dead_or_empty = 0, migrating = 0, already_paired = 0, self_primary = 0;
     for (const auto& a : view.assigns()) {
         if (a.primary_id.empty() || !IsMemberAlive(members, a.primary_id)) {
             ++dead_or_empty;
             VLOG(1) << "assign phase3 skip rank=" << a.rank
                     << ": primary dead or empty";
+            continue;
+        }
+        // 防自配对：本机是该 rank 的 primary 时不能同时担任其 standby
+        //（当前门控下未归属候选者不会命中；为未来放开已归属成员互备
+        // 预置的防御）。
+        if (a.primary_id == config_.master_id) {
+            ++self_primary;
+            VLOG(1) << "assign phase3 skip rank=" << a.rank
+                    << ": self is primary";
             continue;
         }
         if (static_cast<SlotState>(a.state) == SlotState::kMigrating) {
@@ -1483,7 +1539,8 @@ int CvmController::JoinAsStandby(
                    "scanned=" + std::to_string(view.assigns().size()) +
                        ", dead_or_empty=" + std::to_string(dead_or_empty) +
                        ", migrating=" + std::to_string(migrating) +
-                       ", already_paired=" + std::to_string(already_paired));
+                       ", already_paired=" + std::to_string(already_paired) +
+                       ", self_primary=" + std::to_string(self_primary));
     return kStepNoCandidate;
 }
 

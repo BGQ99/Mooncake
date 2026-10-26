@@ -10,6 +10,7 @@
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <optional>  // For std::optional
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -1520,17 +1521,18 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 #ifdef STORE_USE_ETCD
-// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
-// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
-// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
-// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
-// planner CLI 或 master POST /vsegment_quota 端点手工发布。
-void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
-    if (!FLAGS_vsegment_auto_plan) return;
+// --vsegment_auto_plan 策略解析（flags → VSegmentUserPolicy，一次解析两处
+// 使用：启动 bootstrap + supervisor 注入 MasterService 重试组件）。返回空
+// 表示未启用 / 参数不完整 / 后端不符（各告警一次，不阻断启动——quota 可
+// 随后经 planner CLI 或 master POST /vsegment_quota 端点手工发布，参数
+// 补齐后随重启生效）。
+std::optional<mooncake::vsegment::VSegmentUserPolicy>
+BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
+    if (!FLAGS_vsegment_auto_plan) return std::nullopt;
     if (config.ha_backend_type != "etcd") {
         LOG(WARNING) << "--vsegment_auto_plan requires the etcd HA backend; "
                         "skipping";
-        return;
+        return std::nullopt;
     }
     if (FLAGS_vsegment_member_count == 0 || FLAGS_vsegment_stripe_size == 0 ||
         FLAGS_vsegment_member_extent_size == 0) {
@@ -1538,8 +1540,26 @@ void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
             << "--vsegment_auto_plan is enabled but requires "
                "--vsegment_member_count, --vsegment_stripe_size and "
                "--vsegment_member_extent_size; skipping";
-        return;
+        return std::nullopt;
     }
+    mooncake::vsegment::VSegmentUserPolicy policy;
+    policy.member_count = FLAGS_vsegment_member_count;
+    policy.stripe_size = FLAGS_vsegment_stripe_size;
+    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
+    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    return policy;
+}
+
+// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
+// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
+// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
+// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
+// planner CLI 或 master POST /vsegment_quota 端点手工发布，或由
+// MasterService::MaybeRetryVSegmentAutoPlan 在运行期节流重试自愈。
+void TryAutoPlanVSegmentQuota(
+    const mooncake::MasterConfig& config,
+    const std::optional<mooncake::vsegment::VSegmentUserPolicy>& policy_opt) {
+    if (!policy_opt) return;
     const std::string connstring = ResolveHABackendConnstring(config);
     if (connstring.empty()) {
         LOG(WARNING) << "vsegment auto-plan: no etcd endpoints configured; "
@@ -1560,11 +1580,7 @@ void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
                   << " already published; skipping";
         return;
     }
-    mooncake::vsegment::VSegmentUserPolicy policy;
-    policy.member_count = FLAGS_vsegment_member_count;
-    policy.stripe_size = FLAGS_vsegment_stripe_size;
-    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
-    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    const auto& policy = *policy_opt;
     std::string summary;
     err = mooncake::vsegment::PlanAndPublishDiscoveredQuota(
         config.cluster_id, policy,
@@ -1842,13 +1858,31 @@ int main(int argc, char* argv[]) {
     if (master_config.enable_ha) {
 #ifdef STORE_USE_ETCD
         // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
-        // 一次性 bootstrap，仅当快照不存在时执行（详见函数注释）。
-        TryAutoPlanVSegmentQuota(master_config);
+        // 一次性 bootstrap（仅当快照不存在时执行，详见函数注释）；同时把
+        // 策略注入 supervisor → MasterService，供心跳/mount 触发点在快照
+        // 缺失期间节流重试发布（发布侧自愈，
+        // 见 MasterService::MaybeRetryVSegmentAutoPlan）。
+        const auto auto_plan_policy =
+            BuildVSegmentAutoPlanPolicy(master_config);
+        TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
 #endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
+#ifdef STORE_USE_ETCD
+        if (auto_plan_policy) {
+            supervisor_config.vsegment_auto_plan = true;
+            supervisor_config.vsegment_auto_plan_member_count =
+                auto_plan_policy->member_count;
+            supervisor_config.vsegment_auto_plan_stripe_size =
+                auto_plan_policy->stripe_size;
+            supervisor_config.vsegment_auto_plan_member_extent_size =
+                auto_plan_policy->member_extent_size;
+            supervisor_config.vsegment_auto_plan_reserved_ratio =
+                auto_plan_policy->reserved_ratio;
+        }
+#endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         return supervisor.Start();
     } else {

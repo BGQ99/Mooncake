@@ -300,6 +300,14 @@ bool MasterAdminServer::Start() {
                         << ", view_version="
                         << snapshot.leader_view->view_version;
                 }
+                // standby 覆盖率（§16.18.2 满配缺口可观测化）：provider
+                // 拷贝于锁内、调用在锁外（live etcd 读不持 state_mutex_）；
+                // 行尾 owned_slots 槽位约定不变。
+                log_stream << ", standby_coverage={"
+                           << (snapshot.standby_coverage_provider
+                                   ? snapshot.standby_coverage_provider()
+                                   : std::string("n/a"))
+                           << "}";
                 log_stream << ", owned_slots="
                            << (snapshot.service
                                    ? snapshot.service->GetOwnedSlotCount()
@@ -353,6 +361,12 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
     service_available_ = available && service_ != nullptr;
 }
 
+void MasterAdminServer::SetStandbyCoverageProvider(
+    std::function<std::string()> provider) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    standby_coverage_provider_ = std::move(provider);
+}
+
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return RuntimeSnapshot{
@@ -360,6 +374,7 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
         .leader_view = leader_view_,
         .service = service_,
         .service_available = service_available_,
+        .standby_coverage_provider = standby_coverage_provider_,
     };
 }
 

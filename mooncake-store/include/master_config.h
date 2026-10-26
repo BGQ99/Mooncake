@@ -257,6 +257,17 @@ class MasterServiceSupervisorConfig {
     // 使用）：见 MasterServiceConfig 同名字段说明。
     std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
     bool cvm_segments_vsegment_exclusive = false;
+    // vsegment auto-plan 重试策略：master.cpp 从 --vsegment_auto_plan /
+    // --vsegment_member_count / --vsegment_stripe_size /
+    // --vsegment_member_extent_size / --vsegment_reserved_ratio flags 解析
+    // 填充（flags 是唯一事实源，不进 JSON schema），supervisor 在 serve
+    // phase 前经 SetVSegmentAutoPlanPolicy 注入 MasterService。
+    // vsegment_auto_plan=false（或 member_count==0）表示未启用。
+    bool vsegment_auto_plan = false;
+    uint32_t vsegment_auto_plan_member_count = 0;
+    uint64_t vsegment_auto_plan_stripe_size = 0;
+    uint64_t vsegment_auto_plan_member_extent_size = 0;
+    double vsegment_auto_plan_reserved_ratio = 0.0;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =

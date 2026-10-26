@@ -69,6 +69,14 @@ inline std::string VSegmentPartitionQuotaSnapshotKey(
     return SnapshotPrefix(cluster_namespace) + "vsegment_partition_quota";
 }
 
+// 集群级 mount 活动时间戳（墙钟毫秒，十进制串）：任意 submaster 的
+// mount/remount 处理器刷新；PlanAndPublishDiscoveredQuota 发布前读取并
+// 等待静默（W6：防滚动部署中段发布覆盖不完整拓扑的一次性快照）。
+inline std::string VSegmentMountActivityKey(
+    const std::string& cluster_namespace) {
+    return SnapshotPrefix(cluster_namespace) + "vsegment_mount_activity";
+}
+
 // ---- Segment neutral entity + per-master mount keys (§3 view layout) ----
 
 // "/cvm/<namespace>/segments/"

@@ -90,6 +90,13 @@ inline std::ostream& operator<<(
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    // P2-8-2：该 client 内存段挂载的 segment_name（MountSegment 尾部
+    // 补登），代际驱逐 LOCAL_DISK 对称清理的 name 级 co-tenant 过滤
+    // 依据：非空且与新代段 name 不同 → 同 host 多 name 部署的旁路
+    // client，跳过卸载。空 = 尚未见过内存段挂载（legacy / 仅
+    // LOCAL_DISK client），退化为 host 级归并（原行为）。读写均持
+    // offloading_mutex_；offloading/promotion 业务路径不触碰本字段。
+    std::string segment_name;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(

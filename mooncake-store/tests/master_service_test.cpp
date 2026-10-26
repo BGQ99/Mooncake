@@ -4294,6 +4294,76 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
               segment2.name);
 }
 
+// 修改二回归（冗余 segment 清理）：client 被 kill 后快速重注册（快于
+// TTL reaper 的 client_live_ttl 窗口）时，同 name + 同 host_id + 同
+// te_endpoint（非 P2PHANDSHAKE 固定端点场景）但不同 owner client 的
+// 旧代 segment 应在新代挂载时被立即驱逐，而非残留等待 TTL 过期。
+TEST_F(MasterServiceTest, StaleGenerationEvictedOnFastClientRemount) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    // 旧代：client1 挂载（host_id 非空才进入 stale generation 清理路径）。
+    auto old_segment = MakeSegment("hostA", buffer1, size, "hostA");
+    UUID client1 = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(old_segment, client1).has_value());
+
+    // 旧代段上写入一个对象。
+    std::string key1 =
+        GenerateKeyForSegment(client1, service_, old_segment.name);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service_
+                    ->PutStart(client1, key1, TenantId::Default(), 1024,
+                               config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client1, key1, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_EQ(1, service_->GetKeyCount());
+
+    // 新代：模拟 client 重启后重注册——同 name / host_id / te_endpoint，
+    // 不同 segment.id 与 owner client。驱逐已异步化（MountSegment 仅入队，
+    // stale_evict_thread_ 延迟执行），冲刷队列后再断言。
+    auto new_segment = MakeSegment("hostA", buffer2, size, "hostA");
+    UUID client2 = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(new_segment, client2).has_value());
+    service_->FlushStaleEvictQueueForTesting();
+
+    // 旧代段已被驱逐：旧对象随段卸载清理而消失（不等 TTL）。
+    auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
+    ASSERT_FALSE(get_result1.has_value());
+    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    // 新代段可用：client2 可正常写入并读取。
+    std::string key2 =
+        GenerateKeyForSegment(client2, service_, new_segment.name);
+    auto put_start2 = service_->PutStart(
+        client2, key2, TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start2.has_value());
+    ASSERT_TRUE(service_->PutEnd(client2, key2, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                    .has_value());
+    auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
+    ASSERT_TRUE(get_result2.has_value());
+    ASSERT_EQ(get_result2.value()[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              new_segment.name);
+    ASSERT_EQ(1, service_->GetKeyCount());
+
+    // 幂等重挂（同 owner + 同端点）不触发驱逐：新代重复挂载应保留对象。
+    // 重挂同样入队（参考 client=client2 仍持有该 name 段，drain 重新检测
+    // 无旧代 → no-op），冲刷后再断言。
+    ASSERT_TRUE(service_->MountSegment(new_segment, client2).has_value());
+    service_->FlushStaleEvictQueueForTesting();
+    auto get_result3 = service_->GetReplicaList(key2, TenantId::Default());
+    ASSERT_TRUE(get_result3.has_value());
+    ASSERT_EQ(1, service_->GetKeyCount());
+}
+
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     std::unique_ptr<MasterService> service_(new MasterService());
 

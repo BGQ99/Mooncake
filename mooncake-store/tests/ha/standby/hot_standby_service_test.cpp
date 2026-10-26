@@ -1008,6 +1008,53 @@ TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
+// 修改三回归（重放幂等）：严格更旧的 seq 不得覆盖已存储的更新条目——
+// MasterService 的 OpLog 自恢复 / 冷接管死 owner 重放路径复用
+// StandbyMetadataStore 物化元数据，定局集合是内存态、跨重启丢失后
+// 二次重放由此防护兜底。seq 相等保持旧覆盖语义。
+TEST(StandbyMetadataStoreSeqGuardTest, PutMetadataRejectsStaleSequence) {
+    HotStandbyService::StandbyMetadataStore store;
+    const std::string tenant = "t1";
+    const std::string key = "k1";
+
+    StandbyObjectMetadata v10;
+    v10.size = 100;
+    v10.last_sequence_id = 10;
+    ASSERT_TRUE(store.PutMetadata(tenant, key, v10));
+
+    StandbyObjectMetadata v20;
+    v20.size = 200;
+    v20.last_sequence_id = 20;
+    ASSERT_TRUE(store.PutMetadata(tenant, key, v20));
+
+    // 更旧条目被拒绝：不得覆盖 seq=20 的条目。
+    StandbyObjectMetadata stale;
+    stale.size = 300;
+    stale.last_sequence_id = 5;
+    ASSERT_TRUE(store.PutMetadata(tenant, key, stale));
+    const auto after_stale = store.GetMetadata(tenant, key);
+    ASSERT_TRUE(after_stale.has_value());
+    EXPECT_EQ(200, after_stale->size);
+    EXPECT_EQ(20, after_stale->last_sequence_id);
+
+    // 更新条目正常覆盖；相等 seq 保持旧语义（覆盖）。
+    StandbyObjectMetadata v20_dup;
+    v20_dup.size = 250;
+    v20_dup.last_sequence_id = 20;
+    ASSERT_TRUE(store.PutMetadata(tenant, key, v20_dup));
+    auto after_equal = store.GetMetadata(tenant, key);
+    ASSERT_TRUE(after_equal.has_value());
+    EXPECT_EQ(250, after_equal->size);
+
+    StandbyObjectMetadata v30;
+    v30.size = 400;
+    v30.last_sequence_id = 30;
+    ASSERT_TRUE(store.PutMetadata(tenant, key, v30));
+    const auto after_newer = store.GetMetadata(tenant, key);
+    ASSERT_TRUE(after_newer.has_value());
+    EXPECT_EQ(400, after_newer->size);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
