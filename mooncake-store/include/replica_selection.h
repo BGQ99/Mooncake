@@ -116,14 +116,18 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 }
 
 // Select the best replica from a list: prefer local MEMORY, then any MEMORY,
-// then LOCAL_DISK, then DISK. Master may return replicas in any order, so we
-// always scan. When scoring is enabled and there are multiple remote MEMORY
-// replicas, the best-scoring one is chosen instead of the first encountered.
+// then NOF_SSD, then VSEGMENT, then LOCAL_DISK, then DISK. Master may return
+// replicas in any order, so we always scan. When scoring is enabled and there
+// are multiple remote MEMORY replicas, the best-scoring one is chosen instead
+// of the first encountered. VSEGMENT replicas are memory-class active data
+// striped across multiple member endpoints, so there is no "local" notion
+// for them; they rank above offloaded disk replicas.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
+    const Replica::Descriptor *first_vsegment = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -140,6 +144,8 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local NOF_SSD — also good
             }
             if (!first_nof) first_nof = &r;
+        } else if (r.is_vsegment_replica()) {
+            if (!first_vsegment) first_vsegment = &r;
         }
     }
     // No local replica. Among remote MEMORY replicas, optionally pick the
@@ -152,6 +158,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     }
     if (first_memory) return first_memory;
     if (first_nof) return first_nof;
+    if (first_vsegment) return first_vsegment;
 
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {

@@ -3112,6 +3112,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         bool is_local_holder = (ld_desc.client_id == client_->getClientId());
         replica_type =
             is_local_holder ? "local_disk_local" : "local_disk_remote";
+    } else if (replica.is_vsegment_replica()) {
+        // VSEGMENT: data is striped across multiple member endpoints; the
+        // read is planned by VSegmentTransferPlanner inside Client::Get.
+        replica_type = "vsegment";
     } else {
         replica_type = "disk";
     }
