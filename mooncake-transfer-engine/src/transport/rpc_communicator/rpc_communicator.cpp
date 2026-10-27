@@ -59,6 +59,29 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     // Initialize client pools with proper configuration
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char* value = std::getenv("MC_RPC_PROTOCOL");
+    const bool use_urma = value && std::string_view(value) == "urma";
+
+#ifdef YLT_ENABLE_URMA
+    coro_io::urma_socket_t::config_t urma_config{};
+    if (use_urma) {
+        auto probed_config = coro_io::try_make_urma_rpc_config();
+        if (!probed_config) {
+            LOG(ERROR) << "URMA RPC requested, but URMA configuration "
+                          "probe failed; check URMA_RPC_ENABLE=1 and "
+                          "URMA_RPC_DEVICE";
+            return false;
+        }
+        urma_config = *probed_config;
+        pool_conf.client_config.socket_config = urma_config;
+    }
+#else
+    if (use_urma) {
+        LOG(ERROR) << "URMA RPC requested, but YLT URMA support is "
+                      "disabled at compile time";
+        return false;
+    }
+#endif
+
 #ifdef YLT_ENABLE_IBV
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
@@ -108,6 +131,12 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
             }
         }
 #endif
+#ifdef YLT_ENABLE_URMA
+        if (use_urma) {
+            server_->init_urma(urma_config);
+            LOG(INFO) << "URMA RPC configured on server";
+        }
+#endif
 
         server_->register_handler<&RpcCommunicator::handleDataTransfer,
                                   &RpcCommunicator::handleTensorTransfer>(this);
@@ -121,7 +150,13 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
         LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP "
                         "transport for RPC communication";
 #endif
-    } else {
+    }
+#ifdef YLT_ENABLE_URMA
+    else if (use_urma) {
+        LOG(INFO) << "Using URMA transport for RPC communication";
+    }
+#endif
+    else {
         LOG(INFO) << "Using TCP transport for RPC communication";
     }
 

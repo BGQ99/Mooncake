@@ -498,8 +498,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void cancelStatusDeadline() {
         status_deadline_disarmed_ = true;
         if (status_timer_) {
-            asio::error_code ec;
-            status_timer_->cancel(ec);
+            try {
+                status_timer_->cancel();
+            } catch (const asio::system_error&) {
+                // Preserve best-effort cancellation behavior.
+            }
         }
     }
 
@@ -575,8 +578,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         ++progress_epoch_;
         if (progress_epoch_ == 0) ++progress_epoch_;
         if (progress_timer_) {
-            asio::error_code ec;
-            progress_timer_->cancel(ec);
+            try {
+                progress_timer_->cancel();
+            } catch (const asio::system_error&) {
+                // Preserve best-effort cancellation behavior.
+            }
         }
     }
 
