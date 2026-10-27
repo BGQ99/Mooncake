@@ -4,5 +4,5 @@
 	branch = stable
 [submodule "extern/yalantinglibs"]
 	path = extern/yalantinglibs
-	url = https://github.com/alibaba/yalantinglibs.git
-	branch = v0.5.7
+	url = git@github.com:BGQ99/yalantinglibs.git
+	branch = fix/qualify-coro-io-calls
