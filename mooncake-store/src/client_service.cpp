@@ -198,6 +198,16 @@ struct ReplicaTransferSummary {
     }
 };
 
+// vsegment 翻译层分段计时的 thread_local 累加器：Plan() 同步执行于调用
+// 线程，调用方在 Plan 前清零、Plan 后读取（见 TransferData vsegment 分支）。
+struct VSegPlanTiming {
+    int view_loads = 0;
+    uint64_t view_load_ns = 0;
+    int endpoint_rpcs = 0;
+    uint64_t endpoint_resolve_ns = 0;
+};
+thread_local VSegPlanTiming tl_vseg_plan_timing{};
+
 class MasterClientVSegmentViewProvider final
     : public vsegment::VSegmentViewProvider {
    public:
@@ -209,8 +219,18 @@ class MasterClientVSegmentViewProvider final
                        vsegment::VSegmentView* view,
                        std::string* detail) override {
         if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
+        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_VIEW_LOAD,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
+        const auto t0 = std::chrono::steady_clock::now();
         auto result =
             master_client_->GetVSegmentView(partition_id, vsegment_id);
+        tl_vseg_plan_timing.view_load_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        ++tl_vseg_plan_timing.view_loads;
+        pt.End(result ? 0 : -1);
         if (!result) {
             if (detail) *detail = "failed to load vsegment view from owner";
             return result.error();
@@ -233,7 +253,17 @@ class MasterClientSegmentEndpointResolver final
         const std::string& segment_id,
         vsegment::PSegmentLocation* location) override {
         if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
+        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_ENDPOINT_RESOLVE,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
+        const auto t0 = std::chrono::steady_clock::now();
         auto result = master_client_->GetPSegmentEndpoint(segment_id);
+        tl_vseg_plan_timing.endpoint_resolve_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        ++tl_vseg_plan_timing.endpoint_rpcs;
+        pt.End(result ? 0 : -1);
         if (!result) return result.error();
         *location = std::move(result.value());
         return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
@@ -5047,8 +5077,29 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
             client_slices.push_back(
                 {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
         }
+        // 翻译层分解计时：provider/resolver 在本线程内的 RPC 次数与耗时由
+        // thread_local 累加器收集（Plan 前清零、Plan 后读取，见 provider/
+        // resolver 定义处），配 SpDiag 直方图与采样 breakdown 日志。
+        tl_vseg_plan_timing = {};
+        SpDiag::PerfPoint pt_plan(PerfKey::VSEGMENT_READ_PLAN,
+                                  SpDiag::PerfLevel::MODULE);
+        if (is_read) pt_plan.Start();
         auto plan = vsegment_transfer_planner_->Plan(
             replica_descriptor.get_vsegment_descriptor(), client_slices);
+        if (is_read) {
+            pt_plan.End(plan ? 0 : -1);
+            if (mooncake::logging::ShouldSampleHiFreqLog()) {
+                MC_LOG(INFO)
+                    << "vsegment_read_breakdown view_loads="
+                    << tl_vseg_plan_timing.view_loads << " view_load_us="
+                    << tl_vseg_plan_timing.view_load_ns / 1000
+                    << " endpoint_rpcs=" << tl_vseg_plan_timing.endpoint_rpcs
+                    << " endpoint_resolve_us="
+                    << tl_vseg_plan_timing.endpoint_resolve_ns / 1000
+                    << " subrequests="
+                    << (plan ? plan.requests.size() : 0);
+            }
+        }
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
             if (is_read) pt_full.End(-1);

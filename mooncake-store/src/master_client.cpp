@@ -500,6 +500,12 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             }
         }());
     if (breakdown_log) {
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+        // client_overhead_us: local code time excluding the RPC wire call
+        // (pool lookup + future get + result parse + call-site glue).
         MC_LOG(INFO) << "master_rpc_client_breakdown method="
                      << RpcNameTraits<ServiceMethod>::value
                      << " pool_lookup_us="
@@ -509,10 +515,8 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                      << " rpc_call_us=" << rpc_call_us
                      << " result_get_us=" << result_get_us
                      << " result_parse_us=" << result_parse_us
-                     << " total_us="
-                     << std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - total_start)
-                            .count()
+                     << " client_overhead_us=" << (total_us - rpc_call_us)
+                     << " total_us=" << total_us
                      << " status=" << (rpc_result ? "ok" : "rpc_fail");
     }
     return rpc_result;
