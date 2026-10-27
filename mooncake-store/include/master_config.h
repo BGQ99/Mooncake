@@ -31,6 +31,10 @@ inline std::string ResolveConfiguredHABackendConnstring(
 // The configuration for the master server
 struct MasterConfig {
     bool enable_metric_reporting;
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     uint32_t metrics_port;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;

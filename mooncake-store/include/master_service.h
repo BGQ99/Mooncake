@@ -186,6 +186,11 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+
+    // vsegment/psegment 术语的单行状态摘要（enabled/generation/profiles/
+    // installed partitions/vsegment count/池组成），供 admin 周期日志线程
+    // 输出独立的 "VSegment Status" 行。
+    std::string GetVSegmentStatusLogLine() const;
     void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
         vsegment_service_ = std::move(service);
     }

@@ -67,6 +67,7 @@
 #include "io_pattern/cfm_service.h"
 #include "vsegment/partition_quota_planner.h"
 #include "vsegment/vsegment_ha.h"
+#include "vsegment/vsegment_metrics.h"
 
 namespace mooncake {
 
@@ -1360,6 +1361,7 @@ bool MasterService::MaybeRetryVSegmentAutoPlan(const char* trigger) {
                               : std::string(
                                     ": another instance published "
                                     "concurrently"));
+            vsegment::LogVSegmentPoolFormed(cluster_id_);
             break;
         case ErrorCode::INVALID_PARAMS: {
             // 策略非法（非资源不足），重试无意义：终态锁存 + 单次 WARNING。
@@ -1867,6 +1869,43 @@ uint32_t MasterService::GetOwnedSlotCount() const {
     }
     return static_cast<uint32_t>(
         std::count(ready_owned_.begin(), ready_owned_.end(), true));
+}
+
+std::string MasterService::GetVSegmentStatusLogLine() const {
+    std::ostringstream os;
+    os << "VSegment Status: enabled=" << (vsegment_service_ ? 1 : 0);
+    if (vsegment_service_) {
+        const auto& snapshot = vsegment_service_->quota_snapshot();
+        const auto& metrics = vsegment::VSegmentMetrics::Instance();
+        os << ", generation=" << snapshot.config_generation
+           << ", profiles=" << snapshot.profile_specs.size()
+           << ", partitions_installed="
+           // PartitionCount/VSegmentCount 内部持 manager 锁，快照引用与
+           // metrics 读取均为锁外安全视图。
+           << vsegment_service_->PartitionCount()
+           << ", vsegments=" << vsegment_service_->VSegmentCount()
+           << ", logical_capacity=" << metrics.logical_capacity_bytes()
+           << ", logical_free=" << metrics.logical_free_bytes()
+           << " | pools=";
+        bool first_pool = true;
+        for (const auto& profile : snapshot.profile_specs) {
+            if (!first_pool) os << "; ";
+            first_pool = false;
+            // 成员数取 partition "0" 在该 profile 下的配额 extent 数
+            //（所有 partition 的成员集合相同）。
+            size_t member_count = 0;
+            for (const auto& quota : snapshot.quotas) {
+                if (quota.partition_id == "0" &&
+                    quota.profile_name == profile.name) {
+                    member_count = quota.extents.size();
+                    break;
+                }
+            }
+            os << profile.name << ":members=" << member_count
+               << ",medium=" << profile.required_medium;
+        }
+    }
+    return os.str();
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -3344,6 +3383,38 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
         segment.host_id.empty() ? desc.segment_id : segment.host_id;
     desc.used_bytes = used_bytes;
     desc.vsegment_exclusive = cvm_segments_vsegment_exclusive_;
+    // vsegment/psegment 术语的注册可见性日志（存量日志不动，仅此新增行）。
+    // numa_node 从 medium "cpu:N" 解析（N 为 NUMA 节点号，非核号）；
+    // 非 cpu: 前缀（cuda:/ssd:/集群默认值）打印 n/a。
+    {
+        const std::string kNumaPrefix = "cpu:";
+        std::string numa_node = "n/a";
+        if (desc.medium.rfind(kNumaPrefix, 0) == 0 &&
+            desc.medium.size() > kNumaPrefix.size()) {
+            try {
+                numa_node =
+                    "numa" + std::to_string(std::stoi(
+                                 desc.medium.substr(kNumaPrefix.size())));
+            } catch (const std::exception&) {
+            }
+        }
+        LOG(INFO) << "PSegment registered: id=" << desc.segment_id
+                  << ", store=" << desc.te_endpoint
+                  << ", host=" << desc.host_id
+                  << ", numa_node=" << numa_node
+                  << ", medium=" << desc.medium
+                  << ", capacity=" << desc.capacity
+                  << ", used=" << desc.used_bytes << ", available="
+                  << (desc.capacity > desc.used_bytes
+                          ? desc.capacity - desc.used_bytes
+                          : 0)
+                  << ", protocol=" << desc.protocol
+                  << ", io_alignment=" << desc.io_alignment
+                  << ", unaligned_io="
+                  << (desc.supports_unaligned_io ? "supported" : "unsupported")
+                  << ", failure_domain=" << desc.failure_domain
+                  << ", mounted_on=" << master_id_;
+    }
     ErrorCode err =
         cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
     if (err != ErrorCode::OK) {

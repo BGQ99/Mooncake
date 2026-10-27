@@ -1987,6 +1987,10 @@ uint32_t WrappedMasterService::GetOwnedSlotCount() const {
     return master_service_.GetOwnedSlotCount();
 }
 
+std::string WrappedMasterService::GetVSegmentStatusLogLine() const {
+    return master_service_.GetVSegmentStatusLogLine();
+}
+
 tl::expected<InterMasterHandshakeResponse, ErrorCode>
 WrappedMasterService::InterMasterHandshake() {
     return execute_rpc(
