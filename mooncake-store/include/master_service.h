@@ -301,6 +301,15 @@ class MasterService {
     InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
                                const std::string& requester_master_id);
 
+    // 心跳交接专用的批量导出变体（slot 就绪加速）：与 InterMasterExportSlotBatch
+    // 的差异在未 staged 的 slot——不做无门控即时构建，仅当本机已观察到失去该
+    // slot 归属（require_not_owned 门控）时才即时构建；仍持有归属的 slot 不出现
+    // 在响应中（调用方对其走单 slot 路径重试）。心跳交接路径没有 kMigrating
+    // 冻结写，快照稳定性完全依赖「源已观察到 lost 并停服」。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatchGated(uint16_t first_slot, uint16_t last_slot,
+                                    const std::string& requester_master_id);
+
     // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
     //（DropSlotMetadataRange）。源未观察到归属已切走时返回
     // SLOT_MIGRATING（目标稍后重试，重发无损）。
@@ -2514,6 +2523,11 @@ class MasterService {
     // etcd publication). Only started in HA mode when a stable master_id is
     // configured.
     std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
+    // slot_owner_heartbeat_ 生命周期写（Start/Stop 路径）与跨线程 Kick 读的
+    // 互斥：Kick 触发点在心跳线程之外（后台首建线程、mount RPC 线程），
+    // 防止对 unique_ptr 的并发读写。锁内绝不 join（Stop 在锁外执行）。
+    std::mutex slot_heartbeat_kick_mutex_;
+    void KickSlotHeartbeat();  // 事件驱动触发下一轮立即 reconcile（见 SlotOwnerHeartbeat::Kick）
     // Inter-master RPC client (CVM multi-submaster coordination): etcd-driven
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
@@ -2544,7 +2558,9 @@ class MasterService {
     std::atomic<bool> vsegment_runtime_gate_active_{false};
     void MaybeSpawnVSegmentInit();   // kIdle → 拉起后台首建线程（幂等）
     void VSegmentInitThreadFunc();   // 后台：Load→首建→发布→首次全量 sweep
-    ErrorCode RunVSegmentOwnershipReconcile(const std::string& acquiring);
+    ErrorCode RunVSegmentOwnershipReconcile(
+        const std::string& acquiring,
+        vsegment::VSegmentCommitBatch* batch = nullptr);
     // 构造 + provider 注入 + 原子发布（先配置后发布）。前提：持有
     // vsegment_service_init_mutex_ 且复检 vsegment_service_ 为空。
     void ConstructVSegmentService(vsegment::PartitionPhysicalQuotaSnapshot quota);
@@ -2722,7 +2738,12 @@ class MasterService {
     //      经 InterMasterRpc 直传拉取 export 并物化到本地，成功后回 ack。
     // 数据字节始终留在 segment，不搬移。二者均运行在心跳线程。
     ErrorCode ExportSlotMetadata(uint16_t slot);
-    ErrorCode ImportSlotMetadata(uint16_t slot);
+    // Installation only; the range caller owns the durable barrier and ACK.
+    ErrorCode ImportSlotMetadata(
+        uint16_t slot, const SlotMetadataExport* prefetched_export,
+        vsegment::VSegmentCommitBatch* batch);
+    ErrorCode OnSlotRangeAcquired(uint16_t first_slot, uint16_t last_slot,
+                                  std::vector<ErrorCode>& results);
 
     // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
     // require_not_owned（默认 true，§15 单 slot 交接语义）：要求本机已失去
@@ -2730,7 +2751,10 @@ class MasterService {
     //（kMigrating 冻结写保证快照稳定；切 owner 后源仍持有未 ack 数据，
     // 重拉幂等）。
     tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
-        uint16_t slot, bool require_not_owned = true) const;
+        uint16_t slot, bool require_not_owned = true);
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    BuildSlotMetadataExportBatch(uint16_t first_slot, uint16_t last_slot,
+                                  bool require_not_owned);
     // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
     ErrorCode DropSlotMetadataLocal(uint16_t slot);
     // 段级批量版 DropSlotMetadataLocal（§16.16.5，P4 reshard ack 后的源侧
@@ -2769,9 +2793,13 @@ class MasterService {
     // 显式路由，owner 必须是本机）。安装后调用 RefreshVSegmentOwnership 激活。
     ErrorCode InstallSlotMetadataExport(
         const SlotMetadataExport& export_payload,
-        const partition::PartitionRoute& effective_route);
+        const partition::PartitionRoute& effective_route,
+        vsegment::VSegmentCommitBatch* batch = nullptr);
     std::thread reshard_driver_thread_;
     std::atomic<bool> reshard_driver_running_{false};
+    std::mutex reshard_wake_mutex_;
+    std::condition_variable reshard_wake_cv_;
+    bool reshard_wake_pending_{false};
     // 防同 rank 并发驱动：进行中的 (rank -> 目标 epoch)。
     std::mutex reshard_inflight_mutex_;
     std::map<uint32_t, uint64_t> reshard_inflight_;
@@ -3012,7 +3040,9 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
-    ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
+    ErrorCode RefreshVSegmentOwnership(
+        const std::string& acquiring = {},
+        vsegment::VSegmentCommitBatch* batch = nullptr);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

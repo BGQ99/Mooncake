@@ -1,7 +1,6 @@
 #include "vsegment/vsegment_ha.h"
 
 #include <algorithm>
-#include <condition_variable>
 #include <mutex>
 #include <unordered_set>
 
@@ -12,11 +11,12 @@ namespace {
 
 bool SameState(const VSegmentStateSnapshot& left,
                const VSegmentStateSnapshot& right) {
-    std::string left_json;
-    std::string right_json;
-    struct_json::to_json(left, left_json);
-    struct_json::to_json(right, right_json);
-    return left_json == right_json;
+    // 写路径加速：结构化字段比较（各 struct 已提供 operator==），替代原先
+    // 的 JSON 双序列化比较——每次 delta 构建为每个未变更 vsegment 省两次
+    // 序列化。语义与逐字段 JSON 对比一致（字段全覆盖，含顺序敏感的 vector）。
+    return left.profile_name == right.profile_name &&
+           left.lifecycle == right.lifecycle && left.view == right.view &&
+           left.logical_allocation == right.logical_allocation;
 }
 
 VSegmentStateDelta BuildDelta(const PartitionVSegmentSnapshot& before,
@@ -92,12 +92,31 @@ ErrorCode ApplyDelta(const VSegmentOpLogRecord& record,
 ErrorCode OrderedOpLogVSegmentCommitter::Commit(
     const PartitionVSegmentSnapshot& state, const std::string& mutation,
     std::string* detail) {
+    std::shared_ptr<VSegmentDeferredCommitHandle> handle;
+    const auto error = CommitDeferred(state, mutation, &handle, detail);
+    return error == ErrorCode::OK ? WaitDurable(handle, detail) : error;
+}
+
+namespace {
+// P3b：延迟 durable 句柄的具体载体（对外只暴露基类指针）。
+struct DeferredDurableWait : public VSegmentDeferredCommitHandle {
+    uint64_t sequence_id{0};
+};
+}  // namespace
+
+ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
+    const PartitionVSegmentSnapshot& state, const std::string& mutation,
+    std::shared_ptr<VSegmentDeferredCommitHandle>* handle, std::string* detail) {
     if (!writer_ || mutation.empty() || state.partition_id.empty() ||
-        state.metadata_revision == 0) {
-        if (detail) *detail = "invalid vsegment OpLog commit";
+        state.metadata_revision == 0 || handle == nullptr) {
+        if (detail) *detail = "invalid deferred vsegment OpLog commit";
         return ErrorCode::INVALID_PARAMS;
     }
     std::unique_lock<std::mutex> commit_lock(mutex_);
+    // entry 构建逻辑与 Commit 一致（full_state/delta 判定 + 序列化 +
+    // 校验）。last_states_ 在提交时即前移：后续 entry 的 delta 基于提交
+    // 顺序，ordered writer 的全局 seq 保证重放序，崩溃时截断在任意 entry
+    // 边界均得到一致状态。
     VSegmentOpLogRecord record;
     record.partition_id = state.partition_id;
     record.route_epoch = state.route_epoch;
@@ -124,53 +143,33 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
         if (detail) *detail = std::move(validation_detail);
         return ErrorCode::INVALID_PARAMS;
     }
-
     auto reservation = writer_->Reserve();
     if (!reservation) {
         if (detail) *detail = "OpLog writer is not accepting vsegment state";
         return reservation.error();
     }
-    struct DurableWait {
-        std::mutex mutex;
-        std::condition_variable ready;
-        bool durable{false};
-    };
-    auto wait = std::make_shared<DurableWait>();
-    auto pending = writer_->Commit(
-        std::move(*reservation), std::move(entry), [wait](const OpLogEntry&) {
-            std::lock_guard<std::mutex> lock(wait->mutex);
-            wait->durable = true;
-            wait->ready.notify_one();
-        });
+    auto wait = std::make_shared<DeferredDurableWait>();
+    auto pending = writer_->Commit(std::move(*reservation), std::move(entry), {});
     if (!pending) {
         if (detail) *detail = "failed to enqueue vsegment OpLog entry";
         return pending.error();
     }
-    // REMOVE/PUT_END durable callbacks may release vsegment allocations. A
-    // synchronous wait from the writer's callback thread would wait for a
-    // callback queued behind itself. The object-metadata record is already
-    // durable in this context and is authoritative during recovery, so the
-    // accepted vsegment delta may complete asynchronously without weakening
-    // crash consistency.
-    if (writer_->IsCallbackThread()) {
-        last_states_[state.partition_id] = state;
-        return ErrorCode::OK;
-    }
-    std::unique_lock<std::mutex> lock(wait->mutex);
-    // Once Commit accepts an entry it cannot be cancelled: the ordered writer
-    // may persist it after any local timeout. Returning failure here would make
-    // VSegmentManager roll back memory while recovery later replays the entry.
-    // Preserve the write-ahead invariant by waiting for the durable callback;
-    // the interval is only used to surface a prolonged backend outage.
-    while (!wait->ready.wait_for(lock, durable_wait_warning_interval_,
-                                 [&] { return wait->durable; })) {
-        MC_LOG(WARNING)
-            << "Still waiting for durable vsegment OpLog, sequence_id="
-            << pending->sequence_id()
-            << ", writer_error=" << writer_->LastError();
-    }
+    wait->sequence_id = pending->sequence_id();
     last_states_[state.partition_id] = state;
+    *handle = std::move(wait);
     return ErrorCode::OK;
+}
+
+ErrorCode OrderedOpLogVSegmentCommitter::WaitDurable(
+    const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
+    std::string* detail) {
+    if (!handle) {
+        if (detail) *detail = "null deferred vsegment OpLog handle";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto* wait = static_cast<DeferredDurableWait*>(handle.get());
+    return writer_->WaitDurable(wait->sequence_id,
+                                durable_wait_warning_interval_);
 }
 
 ErrorCode ReplayVSegmentState(
@@ -207,7 +206,8 @@ ErrorCode ReplayVSegmentState(
             if (detail) *detail = "stale vsegment route epoch";
             return ErrorCode::STALE_ROUTE;
         }
-        if (record.metadata_revision != revision + 1) {
+        const bool initial_checkpoint = revision == 0 && record.full_state;
+        if (!initial_checkpoint && record.metadata_revision != revision + 1) {
             if (detail) *detail = "vsegment OpLog revision gap";
             return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
         }
@@ -225,6 +225,27 @@ ErrorCode ReplayVSegmentState(
         revision = record.metadata_revision;
     }
     return ErrorCode::OK;
+}
+
+ErrorCode ApplyVSegmentStateEntry(
+    const OpLogEntry& entry,
+    std::unordered_map<std::string, PartitionVSegmentSnapshot>& states,
+    std::string* detail) {
+    VSegmentOpLogRecord record;
+    try {
+        struct_json::from_json(record, entry.payload);
+    } catch (const std::exception& error) {
+        if (detail) *detail = error.what();
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (record.partition_id.empty()) return ErrorCode::INVALID_PARAMS;
+    auto found = states.find(record.partition_id);
+    PartitionVSegmentSnapshot base, recovered;
+    if (found != states.end()) base = found->second;
+    else base.partition_id = record.partition_id;
+    const auto error = ReplayVSegmentState(base, {entry}, &recovered, detail);
+    if (error == ErrorCode::OK) states[record.partition_id] = std::move(recovered);
+    return error;
 }
 
 }  // namespace mooncake::vsegment

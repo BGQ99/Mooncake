@@ -293,6 +293,20 @@ InterMasterRpcClient::ExportSlotBatch(const std::string& master_id,
         *address, first_slot, last_slot, requester_master_id);
 }
 
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+InterMasterRpcClient::ExportSlotBatchGated(const std::string& master_id,
+                                            uint16_t first_slot,
+                                            uint16_t last_slot,
+                                            const std::string& requester_master_id) {
+    auto address = ResolveAddress(master_id);
+    if (!address) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return invoke_rpc<&WrappedMasterService::InterMasterExportSlotBatchGated,
+                      std::vector<SlotMetadataExport>>(
+        *address, first_slot, last_slot, requester_master_id);
+}
+
 tl::expected<bool, ErrorCode> InterMasterRpcClient::AckSlotRangeImported(
     const std::string& master_id, uint16_t first_slot, uint16_t last_slot,
     const std::string& importer_master_id) {

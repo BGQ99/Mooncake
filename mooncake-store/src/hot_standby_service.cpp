@@ -833,36 +833,12 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 }
 
 bool HotStandbyService::ApplyVSegmentState(const OpLogEntry& entry) {
-    vsegment::VSegmentOpLogRecord record;
-    try {
-        struct_json::from_json(record, entry.payload);
-    } catch (const std::exception& error) {
-        LOG(ERROR) << "Failed to decode vsegment state: " << error.what();
-        return false;
-    }
-    if (record.partition_id.empty() ||
-        record.state.partition_id != record.partition_id ||
-        record.state.route_epoch != record.route_epoch ||
-        record.state.metadata_revision != record.metadata_revision) {
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(vsegment_mutex_);
-    auto found = vsegment_partitions_.find(record.partition_id);
-    if (found != vsegment_partitions_.end()) {
-        const auto& current = found->second;
-        if (record.metadata_revision <= current.metadata_revision) return true;
-        if (record.metadata_revision != current.metadata_revision + 1 ||
-            record.route_epoch < current.route_epoch) {
-            return false;
-        }
-        found->second = std::move(record.state);
-    } else {
-        if (record.metadata_revision != 1) return false;
-        vsegment_partitions_.emplace(record.partition_id,
-                                     std::move(record.state));
-    }
-    return true;
+    std::string detail;
+    const auto error = vsegment::ApplyVSegmentStateEntry(entry, vsegment_partitions_, &detail);
+    if (error != ErrorCode::OK)
+        LOG(ERROR) << "Failed to replay vsegment state: " << detail;
+    return error == ErrorCode::OK;
 }
 
 void HotStandbyService::CollectVSegmentPartitions(

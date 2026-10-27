@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -122,6 +123,8 @@ class CvmController {
     CvmController& operator=(const CvmController&) = delete;
 
     void SetDelegate(CvmServiceDelegate* delegate);
+    // Called outside cache locks; clearing waits for an in-flight callback.
+    void SetSlotsChangedCallback(std::function<void()> callback);
 
     // 当前角色（随名额协调动态变化）。
     MasterRole GetCurrentRole() const { return current_role_.load(); }
@@ -234,6 +237,9 @@ class CvmController {
     };
 
     Config config_;
+    void NotifySlotsChanged();
+    std::mutex slots_changed_mutex_;
+    std::function<void()> slots_changed_callback_;
     CvmServiceDelegate* delegate_ = nullptr;
 
     EtcdLeaseId lease_id_{0};

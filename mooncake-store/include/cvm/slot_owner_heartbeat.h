@@ -60,6 +60,12 @@ class SlotOwnerHeartbeat {
         // derive-only behavior.
         std::function<ErrorCode(uint16_t)> on_slot_acquired;
         std::function<void(uint16_t)> on_slot_released;
+
+        // 段级批量 acquire（slot 就绪加速）：gained 聚成连续区间后整段回调，
+        // results 为逐 slot 结果（语义同 on_slot_acquired）。留空则全部走逐
+        // slot 路径。实现内部对不可批量化的 slot 回退单 slot 路径。
+        SlotMigrator::RangeAcquireCallback on_slot_range_acquired;
+        SlotMigrator::RangeReleaseCallback on_slot_range_released;
     };
 
     explicit SlotOwnerHeartbeat(Config config);
@@ -75,6 +81,12 @@ class SlotOwnerHeartbeat {
     // once. Idempotent; safe to call from the heartbeat thread or externally.
     ErrorCode PublishOnce();
 
+    // 立即触发下一轮 PublishOnce（短路 heartbeat_interval 等待）。线程安全：
+    // 仅置位标志并 notify；RunLoop 单线程消费，重入语义退化为「当前周期结束
+    // 后立刻再跑一轮」。用于事件驱动的重试加速（vsegment 后台首建完成 /
+    // auto-plan 发布成功等），替代固定 5s 周期粒度的干等。
+    void Kick();
+
    private:
     void RunLoop();
 
@@ -86,6 +98,8 @@ class SlotOwnerHeartbeat {
     std::atomic<bool> running_{false};
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
+    // Kick 置位标志（与 stop_cv_ 共用 stop_mutex_，notify/kick 双方都覆盖）。
+    bool kick_pending_ = false;
     std::thread thread_;
     // 上一轮 reconcile 是否失败（仅 RunLoop 心跳线程访问，无需加锁）：
     // 失败→成功的转变点打一条 INFO（reconcile incomplete 长期刷屏后恢复

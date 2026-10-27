@@ -38,6 +38,8 @@ SlotOwnerHeartbeat::SlotOwnerHeartbeat(Config config)
                                      config_.lease_id}) {
     migrator_.SetOnAcquire(config_.on_slot_acquired);
     migrator_.SetOnRelease(config_.on_slot_released);
+    migrator_.SetOnReleaseRange(config_.on_slot_range_released);
+    migrator_.SetOnAcquireRange(config_.on_slot_range_acquired);
 }
 
 SlotOwnerHeartbeat::~SlotOwnerHeartbeat() { Stop(); }
@@ -54,6 +56,13 @@ ErrorCode SlotOwnerHeartbeat::Start() {
 void SlotOwnerHeartbeat::Stop() {
     if (!running_.exchange(false)) {
         return;
+    }
+    {
+        // 空临界区仅作 happens-before 屏障：若 RunLoop 正处于「谓词检查完、
+        // 尚未阻塞」的窗口（该窗口内持有 stop_mutex_），Stop 等它阻塞后再
+        // notify，保证通知不落空——否则 notify 可能在等待线程睡下前发出，
+        // join 最多空等一个 heartbeat_interval（5s）才等到超时唤醒。
+        std::lock_guard<std::mutex> lock(stop_mutex_);
     }
     stop_cv_.notify_all();
     if (thread_.joinable()) {
@@ -91,12 +100,29 @@ ErrorCode SlotOwnerHeartbeat::PublishOnce() {
     return err;
 }
 
+void SlotOwnerHeartbeat::Kick() {
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        kick_pending_ = true;
+    }
+    stop_cv_.notify_all();
+}
+
 void SlotOwnerHeartbeat::RunLoop() {
+    const auto minimum_retry = std::min(config_.heartbeat_interval,
+                                         std::chrono::milliseconds(100));
+    auto retry_delay = minimum_retry;
     while (running_.load()) {
-        (void)PublishOnce();
+        const auto error = PublishOnce();
         std::unique_lock<std::mutex> lock(stop_mutex_);
-        stop_cv_.wait_for(lock, config_.heartbeat_interval,
-                          [this] { return !running_.load(); });
+        const auto delay = error == ErrorCode::OK
+                               ? config_.heartbeat_interval : retry_delay;
+        stop_cv_.wait_for(lock, delay,
+                          [this] { return !running_.load() || kick_pending_; });
+        retry_delay = error == ErrorCode::OK || kick_pending_
+                          ? minimum_retry
+                          : std::min(retry_delay * 2, config_.heartbeat_interval);
+        kick_pending_ = false;
     }
 }
 

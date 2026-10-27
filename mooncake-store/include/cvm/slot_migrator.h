@@ -41,6 +41,14 @@ class SlotMigrator {
     // retried next cycle. on_release is best-effort (no result needed).
     using AcquireCallback = std::function<ErrorCode(uint16_t)>;
     using ReleaseCallback = std::function<void(uint16_t)>;
+    using RangeReleaseCallback = std::function<void(uint16_t, uint16_t)>;
+    // 段级批量 acquire（slot 就绪加速）：gained slot 聚成连续区间后整段回调，
+    // results[i] 为 slot (first + i) 的逐 slot 结果，语义与 on_acquire 完全
+    // 一致（OK=就绪，其它=下轮重试）。实现内部对不可批量化的 slot（owner
+    // 不连续 / 门控拦截 / RPC 失败）应回退单 slot 路径并填好 results。整段
+    // 返回值非 OK 时 migrator 退回逐 slot 兜底，语义不丢失。
+    using RangeAcquireCallback = std::function<ErrorCode(
+        uint16_t first, uint16_t last, std::vector<ErrorCode>& results)>;
 
     explicit SlotMigrator(Config config);
     ~SlotMigrator() = default;
@@ -53,6 +61,14 @@ class SlotMigrator {
     // on_release stages the export for the new owner to pull.
     void SetOnAcquire(AcquireCallback cb) { on_acquire_ = std::move(cb); }
     void SetOnRelease(ReleaseCallback cb) { on_release_ = std::move(cb); }
+    void SetOnReleaseRange(RangeReleaseCallback cb) {
+        on_release_range_ = std::move(cb);
+    }
+    // 段级批量 acquire 钩子：设置后 gained 的连续区间（长度 ≥ 阈值）走整段
+    // 回调，短区间与失败兜底仍走逐 slot on_acquire。
+    void SetOnAcquireRange(RangeAcquireCallback cb) {
+        on_acquire_range_ = std::move(cb);
+    }
 
     // Computes the gained/released slot diff for `owned_slots` and drives the
     // hooks. Idempotent; safe to call from the heartbeat thread. Returns the
@@ -63,6 +79,8 @@ class SlotMigrator {
     Config config_;
     AcquireCallback on_acquire_;
     ReleaseCallback on_release_;
+    RangeReleaseCallback on_release_range_;
+    RangeAcquireCallback on_acquire_range_;
     std::vector<uint16_t> last_owned_slots_;
 };
 

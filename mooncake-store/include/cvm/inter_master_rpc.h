@@ -171,6 +171,16 @@ class InterMasterRpcClient {
         const std::string& master_id, uint16_t first_slot, uint16_t last_slot,
         const std::string& requester_master_id);
 
+    // 心跳交接专用批量拉取（slot 就绪加速）：与 ExportSlotBatch 的差异是
+    // 源侧对未 staged 的 slot 施加「必须已失去归属」门控（心跳路径无
+    // kMigrating 冻结写，仍持有归属时的即时构建会读到活快照）；仍持有归属
+    // 的 slot 缺席于响应，调用方回退单 slot 路径。新方法独立于既有签名——
+    // 滚动升级期间旧 peer 无此方法，返回 RPC 错误由调用方兜底。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    ExportSlotBatchGated(const std::string& master_id, uint16_t first_slot,
+                         uint16_t last_slot,
+                         const std::string& requester_master_id);
+
     // 段级 ack：目标安装完成后通知源删除 [first_slot, last_slot] 内全部
     // 本地元数据（DropSlotMetadataRange）。失败由目标侧重试（源不清数据，
     // 重发无损）。

@@ -73,16 +73,42 @@ VSegmentManager::VSegmentManager(
         profiles_.emplace(profile.name, profile);
 }
 
+VSegmentManager::VSegmentManager(
+    std::vector<PartitionVSegmentConfig> configs,
+    const std::vector<VSegmentProfile>& profiles, std::string default_profile,
+    std::shared_ptr<VSegmentStateCommitter> committer,
+    size_t max_operation_tombstones)
+    : partition_id_(configs.empty() ? std::string{} : configs.front().partition_id),
+      config_generation_(configs.empty() ? 0 : configs.front().config_generation),
+      default_profile_(std::move(default_profile)),
+      quota_configs_(std::move(configs)),
+      physical_allocator_(quota_configs_),
+      committer_(std::move(committer)),
+      max_operation_tombstones_(std::max<size_t>(1, max_operation_tombstones)) {
+    for (const auto& profile : profiles) profiles_.emplace(profile.name, profile);
+}
+
 VSegmentAllocationResult VSegmentManager::Create(
     const std::string& profile_name) {
     const auto creation_key = partition_id_ + "/" + profile_name;
     auto result = profile_creation_coordinator_.GetOrCreate(
         creation_key,
         [&] { return CreateSingleFlight(profile_name, 0); });
-    if (result)
-        VSegmentMetrics::Instance().IncCreateSuccess();
-    else
-        VSegmentMetrics::Instance().IncCreateFailure();
+    return FinishCreate(std::move(result));
+}
+
+VSegmentAllocationResult VSegmentManager::FinishCreate(VSegmentAllocationResult result) {
+    if (result) {
+        std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fence = latest_persist_;
+        }
+        // A concurrent initialization batch may have won the single flight.
+        result.error = WaitForDurable(fence, &result.detail);
+    }
+    if (result) VSegmentMetrics::Instance().IncCreateSuccess();
+    else VSegmentMetrics::Instance().IncCreateFailure();
     return result;
 }
 
@@ -118,13 +144,7 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
                                             return CreateSingleFlight(
                                                 profile_name, creation_epoch);
                                         });
-                                if (result)
-                                    VSegmentMetrics::Instance()
-                                        .IncCreateSuccess();
-                                else
-                                    VSegmentMetrics::Instance()
-                                        .IncCreateFailure();
-                                return result;
+                                return FinishCreate(std::move(result));
                             })
                      .share());
     }
@@ -136,7 +156,8 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
 VSegmentPutStartResult VSegmentManager::StartPut(
     const std::string& operation_id, uint64_t length,
     const std::string& requested_profile, uint64_t expected_route_epoch,
-    const std::vector<std::string>& excluded_vsegments) {
+    const std::vector<std::string>& excluded_vsegments,
+    VSegmentCommitBatch* batch) {
     const auto& profile_name =
         requested_profile.empty() ? default_profile_ : requested_profile;
     if (operation_id.empty() || length == 0 || !profiles_.count(profile_name))
@@ -144,13 +165,18 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 "invalid PutStart operation, length, or profile"};
 
     for (int pass = 0; pass < 2; ++pass) {
+        std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+        bool allocated = false;
+        VSegmentPutStartResult allocated_result;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+            if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
                 return {ErrorCode::STALE_ROUTE, operation_id, {},
                         "PutStart route epoch is stale"};
             auto existing_operation = operation_vsegments_.find(operation_id);
             if (existing_operation != operation_vsegments_.end()) {
+                // Reuse the reservation, but still wait for its submission.
                 auto managed = vsegments_.find(existing_operation->second);
                 if (managed == vsegments_.end())
                     return {ErrorCode::INTERNAL_ERROR, operation_id, {},
@@ -161,14 +187,15 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 if (!reservation)
                     return {reservation.error, operation_id, {},
                             std::move(reservation.detail)};
-                return {ErrorCode::OK,
-                        operation_id,
-                        {partition_id_, existing_operation->second,
-                         reservation.range.offset, reservation.range.length,
-                         operation_id},
-                        {}};
+                allocated_result = {ErrorCode::OK, operation_id,
+                                    {partition_id_, existing_operation->second,
+                                     reservation.range.offset,
+                                     reservation.range.length, operation_id}, {}};
+                fence = latest_persist_;
+                allocated = true;
             }
             for (auto& [id, managed] : vsegments_) {
+                if (allocated) break;
                 if (std::find(excluded_vsegments.begin(),
                               excluded_vsegments.end(), id) !=
                     excluded_vsegments.end())
@@ -187,18 +214,36 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 }
                 std::string detail;
                 operation_vsegments_.emplace(operation_id, id);
-                auto persisted = PersistLocked("logical_reserve", &detail);
+                // 锁收窄：提交（delta 构建 + seq 分配）在锁内完成，durable
+                // 等待移到锁外 fence 收口——partition mutex 不再横跨 etcd
+                // 往返。失败回滚语义不变：提交失败发生在锁内，照旧回滚。
+                auto persisted = PersistDeferredLocked("logical_reserve",
+                                                       &detail, &fence);
                 if (persisted != ErrorCode::OK) {
                     operation_vsegments_.erase(operation_id);
                     managed.logical_allocator->Restore(before);
                     return {persisted, operation_id, {}, std::move(detail)};
                 }
-                return {ErrorCode::OK,
-                        operation_id,
-                        {partition_id_, id, reservation.range.offset,
-                         reservation.range.length, operation_id},
-                        {}};
+                allocated_result = {ErrorCode::OK,
+                                    operation_id,
+                                    {partition_id_, id,
+                                     reservation.range.offset,
+                                     reservation.range.length, operation_id},
+                                    {}};
+                allocated = true;
+                break;
             }
+        }
+        if (allocated) {
+            if (batch) {
+                batch->Add(committer_, fence);
+                return allocated_result;
+            }
+            // durable fence：entry 已被 ordered writer 接受不可取消，等待
+            // 语义与原同步持久化一致（etcd 故障时无限告警等待直至 durable）。
+            const auto error = WaitForDurable(fence, &allocated_result.detail);
+            if (error != ErrorCode::OK) allocated_result.error = error;
+            return allocated_result;
         }
         auto creation = RequestCreate(profile_name);
         if (!creation) {
@@ -211,74 +256,99 @@ VSegmentPutStartResult VSegmentManager::StartPut(
 }
 
 VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
-    const std::string& profile_name, uint64_t expected_route_epoch) {
+    const std::string& profile_name, uint64_t expected_route_epoch,
+    bool single_phase_persist, VSegmentCommitBatch* batch) {
     auto profile = profiles_.find(profile_name);
     if (profile == profiles_.end()) {
         return ManagerError(ErrorCode::INVALID_PARAMS,
                             "unknown vsegment profile: " + profile_name);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (expected_route_epoch != 0 && route_epoch_ != expected_route_epoch) {
-        VSegmentMetrics::Instance().IncStaleRoute();
-        return ManagerError(ErrorCode::STALE_ROUTE,
-                            "vsegment creation route epoch is stale");
-    }
-    for (auto& [id, pending] : vsegments_) {
-        if (pending.profile_name != profile_name ||
-            pending.lifecycle != Lifecycle::PREPARING)
-            continue;
-        pending.lifecycle = Lifecycle::ACTIVE;
-        std::string detail;
-        auto persisted = PersistLocked("vsegment_create_commit", &detail);
-        if (persisted != ErrorCode::OK) {
-            pending.lifecycle = Lifecycle::PREPARING;
-            return ManagerError(persisted, std::move(detail));
+    // Preserve submission order under mutex_; wait outside the critical section.
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    VSegmentAllocationResult result;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (expected_route_epoch != 0 && route_epoch_ != expected_route_epoch)) {
+            VSegmentMetrics::Instance().IncStaleRoute();
+            return ManagerError(ErrorCode::STALE_ROUTE,
+                                "vsegment creation route epoch is stale");
         }
-        return {ErrorCode::OK, pending.view, {}};
+        bool adopted = false;
+        for (auto& [id, pending] : vsegments_) {
+            if (pending.profile_name != profile_name ||
+                pending.lifecycle != Lifecycle::PREPARING)
+                continue;
+            pending.lifecycle = Lifecycle::ACTIVE;
+            std::string detail;
+            auto persisted = PersistDeferredLocked("vsegment_create_commit",
+                                                    &detail, &fence);
+            if (persisted != ErrorCode::OK) {
+                pending.lifecycle = Lifecycle::PREPARING;
+                return ManagerError(persisted, std::move(detail));
+            }
+            result = {ErrorCode::OK, pending.view, {}};
+            adopted = true;
+            break;
+        }
+        if (!adopted) {
+            const std::string vsegment_id = UuidToString(generate_uuid());
+            auto logical = std::make_unique<LogicalRangeAllocator>(
+                profile->second.member_extent_size * profile->second.member_count);
+            // 运行时坏端点排除集快照：把新 vsegment 的条带成员避开已判死的物理段
+            // （provider 为空时不过滤，行为与旧版本一致）。
+            std::set<std::string> excluded_segments;
+            const std::set<std::string>* excluded_segments_ptr = nullptr;
+            if (excluded_segments_provider_) {
+                excluded_segments = excluded_segments_provider_();
+                excluded_segments_ptr = &excluded_segments;
+            }
+            auto allocation = physical_allocator_.Allocate(
+                vsegment_id, profile->second, excluded_segments_ptr);
+            if (!allocation) return allocation;
+            try {
+                vsegments_.emplace(
+                    vsegment_id,
+                    ManagedVSegment{profile_name,
+                        single_phase_persist ? Lifecycle::ACTIVE : Lifecycle::PREPARING,
+                        allocation.view, std::move(logical)});
+            } catch (...) {
+                physical_allocator_.Release(allocation.view);
+                throw;
+            }
+            std::string detail;
+            auto persisted = PersistDeferredLocked(
+                single_phase_persist ? "vsegment_create" : "vsegment_create_begin",
+                &detail, &fence);
+            if (persisted != ErrorCode::OK) {
+                vsegments_.erase(vsegment_id);
+                physical_allocator_.Release(allocation.view);
+                return ManagerError(persisted, std::move(detail));
+            }
+            if (!single_phase_persist) {
+                vsegments_.at(vsegment_id).lifecycle = Lifecycle::ACTIVE;
+                persisted = PersistDeferredLocked("vsegment_create_commit", &detail,
+                                                   &fence);
+                if (persisted != ErrorCode::OK) {
+                    vsegments_.at(vsegment_id).lifecycle = Lifecycle::PREPARING;
+                    return ManagerError(persisted, std::move(detail));
+                }
+            }
+            result = allocation;
+        }
     }
-    const std::string vsegment_id = UuidToString(generate_uuid());
-    auto logical = std::make_unique<LogicalRangeAllocator>(
-        profile->second.member_extent_size * profile->second.member_count);
-    // 运行时坏端点排除集快照：把新 vsegment 的条带成员避开已判死的物理段
-    // （provider 为空时不过滤，行为与旧版本一致）。
-    std::set<std::string> excluded_segments;
-    const std::set<std::string>* excluded_segments_ptr = nullptr;
-    if (excluded_segments_provider_) {
-        excluded_segments = excluded_segments_provider_();
-        excluded_segments_ptr = &excluded_segments;
+    if (batch) {
+        batch->Add(committer_, fence);
+    } else {
+        const auto error = WaitForDurable(fence, &result.detail);
+        if (error != ErrorCode::OK) result.error = error;
     }
-    auto allocation = physical_allocator_.Allocate(vsegment_id, profile->second,
-                                                   excluded_segments_ptr);
-    if (!allocation) return allocation;
-    try {
-        vsegments_.emplace(
-            vsegment_id,
-            ManagedVSegment{profile_name, Lifecycle::PREPARING,
-                            allocation.view, std::move(logical)});
-    } catch (...) {
-        vsegments_.erase(vsegment_id);
-        physical_allocator_.Release(allocation.view);
-        throw;
-    }
-    std::string detail;
-    auto persisted = PersistLocked("vsegment_create_begin", &detail);
-    if (persisted != ErrorCode::OK) {
-        vsegments_.erase(vsegment_id);
-        physical_allocator_.Release(allocation.view);
-        return ManagerError(persisted, std::move(detail));
-    }
-    vsegments_.at(vsegment_id).lifecycle = Lifecycle::ACTIVE;
-    persisted = PersistLocked("vsegment_create_commit", &detail);
-    if (persisted != ErrorCode::OK) {
-        vsegments_.at(vsegment_id).lifecycle = Lifecycle::PREPARING;
-        return ManagerError(persisted, std::move(detail));
-    }
-    return allocation;
+    return result;
 }
 
 ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch == 0 || route_epoch < route_epoch_) {
+    if (!owned_ || route_epoch == 0 || route_epoch < route_epoch_) {
         VSegmentMetrics::Instance().IncStaleRoute();
         return ErrorCode::STALE_ROUTE;
     }
@@ -286,7 +356,23 @@ ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
     return ErrorCode::OK;
 }
 
-ErrorCode VSegmentManager::EnsureInitialVSegments(std::string* detail) {
+uint64_t VSegmentManager::RouteEpoch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return route_epoch_;
+}
+
+ErrorCode VSegmentManager::Deactivate(uint64_t route_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch == 0 || route_epoch < route_epoch_)
+        return ErrorCode::STALE_ROUTE;
+    route_epoch_ = route_epoch;
+    owned_ = false;
+    return ErrorCode::OK;
+}
+
+ErrorCode VSegmentManager::EnsureInitialVSegments(std::string* detail,
+                                                 VSegmentCommitBatch* batch) {
+    std::lock_guard<std::mutex> creation_lock(initial_creation_mutex_);
     std::vector<std::pair<std::string, uint32_t>> targets;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -313,47 +399,74 @@ ErrorCode VSegmentManager::EnsureInitialVSegments(std::string* detail) {
     }
     for (const auto& [profile_name, count] : targets) {
         for (uint32_t index = 0; index < count; ++index) {
-            auto result = Create(profile_name);
+            // P2：首建走单阶段持久化（一笔 ACTIVE entry，无 begin/commit
+            // 两阶段），配合 P3 的批量 durable barrier 削减冷启动 etcd 事务。
+            const auto creation_key = partition_id_ + "/" + profile_name;
+            auto result = profile_creation_coordinator_.GetOrCreate(
+                creation_key, [&] {
+                    return CreateSingleFlight(profile_name, 0, true, batch);
+                });
+            if (result) VSegmentMetrics::Instance().IncCreateSuccess();
+            else VSegmentMetrics::Instance().IncCreateFailure();
             if (!result) {
                 if (detail) *detail = std::move(result.detail);
                 return result.error;
             }
         }
     }
-    return ErrorCode::OK;
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fence = latest_persist_;
+    }
+    if (batch) {
+        batch->Add(committer_, fence);
+        return ErrorCode::OK;
+    }
+    return WaitForDurable(fence, detail);
 }
 
 ReservationResult VSegmentManager::ReservePut(
     const std::string& vsegment_id, const std::string& operation_id,
     uint64_t length, uint64_t expected_route_epoch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
-        return ReservationError(ErrorCode::STALE_ROUTE,
-                                "PutStart route epoch is stale");
-    auto managed = vsegments_.find(vsegment_id);
-    if (managed == vsegments_.end() ||
-        managed->second.lifecycle != Lifecycle::ACTIVE)
-        return ReservationError(ErrorCode::SEGMENT_NOT_FOUND,
-                                "vsegment not found or not active");
-    auto existing = operation_vsegments_.find(operation_id);
-    if (existing != operation_vsegments_.end() &&
-        existing->second != vsegment_id)
-        return ReservationError(ErrorCode::INVALID_WRITE,
-                                "operation is reserved in another vsegment");
-    const auto before = managed->second.logical_allocator->Snapshot();
-    auto result = managed->second.logical_allocator->Reserve(operation_id,
-                                                              length);
-    if (!result) return result;
-    std::string detail;
-    const bool inserted =
-        operation_vsegments_.emplace(operation_id, vsegment_id).second;
-    const auto persisted = PersistLocked("logical_reserve", &detail);
-    if (persisted != ErrorCode::OK) {
-        if (inserted) operation_vsegments_.erase(operation_id);
-        managed->second.logical_allocator->Restore(before);
-        return ReservationError(persisted, std::move(detail));
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    ReservationResult reserved;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ReservationError(ErrorCode::STALE_ROUTE,
+                                    "PutStart route epoch is stale");
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end() ||
+            managed->second.lifecycle != Lifecycle::ACTIVE)
+            return ReservationError(ErrorCode::SEGMENT_NOT_FOUND,
+                                    "vsegment not found or not active");
+        auto existing = operation_vsegments_.find(operation_id);
+        if (existing != operation_vsegments_.end() &&
+            existing->second != vsegment_id)
+            return ReservationError(ErrorCode::INVALID_WRITE,
+                                    "operation is reserved in another vsegment");
+        const auto before = managed->second.logical_allocator->Snapshot();
+        auto result = managed->second.logical_allocator->Reserve(operation_id,
+                                                                  length);
+        if (!result) return result;
+        std::string detail;
+        const bool inserted =
+            operation_vsegments_.emplace(operation_id, vsegment_id).second;
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        const auto persisted = PersistDeferredLocked("logical_reserve", &detail,
+                                                     &fence);
+        if (persisted != ErrorCode::OK) {
+            if (inserted) operation_vsegments_.erase(operation_id);
+            managed->second.logical_allocator->Restore(before);
+            return ReservationError(persisted, std::move(detail));
+        }
+        reserved = std::move(result);
     }
-    return result;
+    const auto error = WaitForDurable(fence);
+    return error == ErrorCode::OK ? reserved : ReservationError(error, {});
 }
 
 ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
@@ -361,86 +474,117 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
                                      const std::string& allocation_id,
                                      LogicalRange* range,
                                      uint64_t expected_route_epoch,
-                                     const LogicalRange* expected_range) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
-        return ErrorCode::STALE_ROUTE;
-    auto managed = vsegments_.find(vsegment_id);
-    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    const auto before = managed->second.logical_allocator->Snapshot();
-    if (expected_range) {
-        auto reservation = std::find_if(
-            before.reservations.begin(), before.reservations.end(),
-            [&](const auto& candidate) {
-                return candidate.operation_id == operation_id;
-            });
-        auto completed = std::find_if(
-            before.completed_operations.begin(),
-            before.completed_operations.end(), [&](const auto& candidate) {
-                return candidate.operation_id == operation_id &&
-                       candidate.outcome == OperationOutcome::COMMITTED;
-            });
-        const LogicalRange* actual =
-            reservation != before.reservations.end()
-                ? &reservation->range
-                : (completed != before.completed_operations.end()
-                       ? &completed->range
-                       : nullptr);
-        if (!actual || actual->offset != expected_range->offset ||
-            actual->length != expected_range->length)
-            return ErrorCode::INVALID_VERSION;
+                                     const LogicalRange* expected_range,
+                                     VSegmentCommitBatch* batch) {
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ErrorCode::STALE_ROUTE;
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        if (expected_range) {
+            auto reservation = std::find_if(
+                before.reservations.begin(), before.reservations.end(),
+                [&](const auto& candidate) {
+                    return candidate.operation_id == operation_id;
+                });
+            auto completed = std::find_if(
+                before.completed_operations.begin(),
+                before.completed_operations.end(), [&](const auto& candidate) {
+                    return candidate.operation_id == operation_id &&
+                           candidate.outcome == OperationOutcome::COMMITTED;
+                });
+            const LogicalRange* actual =
+                reservation != before.reservations.end()
+                    ? &reservation->range
+                    : (completed != before.completed_operations.end()
+                           ? &completed->range
+                           : nullptr);
+            if (!actual || actual->offset != expected_range->offset ||
+                actual->length != expected_range->length)
+                return ErrorCode::INVALID_VERSION;
+        }
+        const auto result = managed->second.logical_allocator->Commit(
+            operation_id, allocation_id, range);
+        if (result != ErrorCode::OK) return result;
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        const auto persisted = PersistDeferredLocked("logical_commit", nullptr,
+                                                     &fence);
+        if (persisted != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            return persisted;
+        }
     }
-    const auto result = managed->second.logical_allocator->Commit(
-        operation_id, allocation_id, range);
-    if (result != ErrorCode::OK) return result;
-    const auto persisted = PersistLocked("logical_commit");
-    if (persisted != ErrorCode::OK)
-        managed->second.logical_allocator->Restore(before);
-    return persisted;
+    if (batch) {
+        batch->Add(committer_, fence);
+        return ErrorCode::OK;
+    }
+    return WaitForDurable(fence);
 }
 
 ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
                                     const std::string& operation_id,
                                     uint64_t expected_route_epoch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
-        return ErrorCode::STALE_ROUTE;
-    auto managed = vsegments_.find(vsegment_id);
-    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    const auto before = managed->second.logical_allocator->Snapshot();
-    const auto result = managed->second.logical_allocator->Abort(operation_id);
-    if (result != ErrorCode::OK) return result;
-    const auto operations_before = operation_vsegments_;
-    TrimOperationTombstonesLocked(managed->second,
-                                  max_operation_tombstones_);
-    const auto persisted = PersistLocked("logical_abort");
-    if (persisted != ErrorCode::OK) {
-        managed->second.logical_allocator->Restore(before);
-        operation_vsegments_ = operations_before;
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ErrorCode::STALE_ROUTE;
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        const auto result =
+            managed->second.logical_allocator->Abort(operation_id);
+        if (result != ErrorCode::OK) return result;
+        const auto operations_before = operation_vsegments_;
+        TrimOperationTombstonesLocked(managed->second,
+                                      max_operation_tombstones_);
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        const auto persisted = PersistDeferredLocked("logical_abort", nullptr,
+                                                     &fence);
+        if (persisted != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            operation_vsegments_ = operations_before;
+            return persisted;
+        }
     }
-    return persisted;
+    return WaitForDurable(fence);
 }
 
 ErrorCode VSegmentManager::RollbackPutReservation(
     const std::string& vsegment_id, const std::string& operation_id,
     uint64_t expected_route_epoch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
-        return ErrorCode::STALE_ROUTE;
-    auto managed = vsegments_.find(vsegment_id);
-    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    const auto before = managed->second.logical_allocator->Snapshot();
-    const auto operations_before = operation_vsegments_;
-    const auto result =
-        managed->second.logical_allocator->CancelReservation(operation_id);
-    if (result != ErrorCode::OK) return result;
-    operation_vsegments_.erase(operation_id);
-    const auto persisted = PersistLocked("logical_abort");
-    if (persisted != ErrorCode::OK) {
-        managed->second.logical_allocator->Restore(before);
-        operation_vsegments_ = operations_before;
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ErrorCode::STALE_ROUTE;
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        const auto operations_before = operation_vsegments_;
+        const auto result =
+            managed->second.logical_allocator->CancelReservation(operation_id);
+        if (result != ErrorCode::OK) return result;
+        operation_vsegments_.erase(operation_id);
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        const auto persisted = PersistDeferredLocked("logical_abort", nullptr,
+                                                     &fence);
+        if (persisted != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            operation_vsegments_ = operations_before;
+            return persisted;
+        }
     }
-    return persisted;
+    return WaitForDurable(fence);
 }
 
 void VSegmentManager::TrimOperationTombstonesLocked(
@@ -464,66 +608,82 @@ ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
                                          const std::string& allocation_id,
                                          LogicalRange range,
                                          uint64_t expected_route_epoch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
-        return ErrorCode::STALE_ROUTE;
-    auto managed = vsegments_.find(vsegment_id);
-    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    const auto before = managed->second.logical_allocator->Snapshot();
-    const auto result = managed->second.logical_allocator->Release(
-        allocation_id, range);
-    if (result != ErrorCode::OK) return result;
-    std::vector<std::pair<std::string, std::string>> forgotten_operations;
-    for (const auto& completed : before.completed_operations) {
-        if (completed.allocation_id != allocation_id) continue;
-        auto operation = operation_vsegments_.find(completed.operation_id);
-        if (operation != operation_vsegments_.end()) {
-            forgotten_operations.push_back(*operation);
-            operation_vsegments_.erase(operation);
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ErrorCode::STALE_ROUTE;
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        const auto result = managed->second.logical_allocator->Release(
+            allocation_id, range);
+        if (result != ErrorCode::OK) return result;
+        std::vector<std::pair<std::string, std::string>> forgotten_operations;
+        for (const auto& completed : before.completed_operations) {
+            if (completed.allocation_id != allocation_id) continue;
+            auto operation = operation_vsegments_.find(completed.operation_id);
+            if (operation != operation_vsegments_.end()) {
+                forgotten_operations.push_back(*operation);
+                operation_vsegments_.erase(operation);
+            }
+            const auto forgotten =
+                managed->second.logical_allocator->ForgetCompleted(
+                    completed.operation_id);
+            if (forgotten != ErrorCode::OK) {
+                managed->second.logical_allocator->Restore(before);
+                operation_vsegments_.insert(forgotten_operations.begin(),
+                                            forgotten_operations.end());
+                return forgotten;
+            }
         }
-        const auto forgotten =
-            managed->second.logical_allocator->ForgetCompleted(
-                completed.operation_id);
-        if (forgotten != ErrorCode::OK) {
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        const auto persisted = PersistDeferredLocked("logical_release",
+                                                      nullptr, &fence);
+        if (persisted != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
             operation_vsegments_.insert(forgotten_operations.begin(),
                                         forgotten_operations.end());
-            return forgotten;
+            return persisted;
         }
     }
-    const auto persisted = PersistLocked("logical_release");
-    if (persisted != ErrorCode::OK) {
-        managed->second.logical_allocator->Restore(before);
-        operation_vsegments_.insert(forgotten_operations.begin(),
-                                    forgotten_operations.end());
-    }
-    return persisted;
+    return WaitForDurable(fence);
 }
 
 ErrorCode VSegmentManager::ForgetOperation(const std::string& operation_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto operation = operation_vsegments_.find(operation_id);
-    if (operation == operation_vsegments_.end())
-        return ErrorCode::OBJECT_NOT_FOUND;
-    auto managed = vsegments_.find(operation->second);
-    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    const auto before = managed->second.logical_allocator->Snapshot();
-    auto result =
-        managed->second.logical_allocator->ForgetCompleted(operation_id);
-    if (result != ErrorCode::OK) return result;
-    const auto vsegment_id = operation->second;
-    operation_vsegments_.erase(operation);
-    result = PersistLocked("operation_gc");
-    if (result != ErrorCode::OK) {
-        managed->second.logical_allocator->Restore(before);
-        operation_vsegments_.emplace(operation_id, vsegment_id);
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+    if (!owned_) return ErrorCode::STALE_ROUTE;
+        auto operation = operation_vsegments_.find(operation_id);
+        if (operation == operation_vsegments_.end())
+            return ErrorCode::OBJECT_NOT_FOUND;
+        auto managed = vsegments_.find(operation->second);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        auto result =
+            managed->second.logical_allocator->ForgetCompleted(operation_id);
+        if (result != ErrorCode::OK) return result;
+        const auto vsegment_id = operation->second;
+        operation_vsegments_.erase(operation);
+        // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
+        // 同原同步持久化；失败回滚不变）。
+        result = PersistDeferredLocked("operation_gc", nullptr, &fence);
+        if (result != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            operation_vsegments_.emplace(operation_id, vsegment_id);
+            return result;
+        }
     }
-    return result;
+    return WaitForDurable(fence);
 }
 
 ErrorCode VSegmentManager::TransitionLifecycle(
     const std::string& vsegment_id, Lifecycle target) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!owned_) return ErrorCode::STALE_ROUTE;
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
     const auto current = managed->second.lifecycle;
@@ -615,6 +775,36 @@ ErrorCode VSegmentManager::PersistLocked(const std::string& mutation,
     return result;
 }
 
+ErrorCode VSegmentManager::PersistDeferredLocked(
+    const std::string& mutation, std::string* detail,
+    std::shared_ptr<VSegmentDeferredCommitHandle>* fence_out) {
+    if (!committer_) {
+        if (detail) *detail = "vsegment state committer is not configured";
+        return ErrorCode::PERSISTENT_FAIL;
+    }
+    ++metadata_revision_;
+    std::shared_ptr<VSegmentDeferredCommitHandle> handle;
+    // committer 不支持延迟（默认回退同步 Commit）时 handle 为空且 entry
+    // 已 durable，语义与 PersistLocked 等价。
+    auto result = committer_->CommitDeferred(SnapshotLocked(), mutation,
+                                              &handle, detail);
+    if (result != ErrorCode::OK) {
+        --metadata_revision_;
+        VSegmentMetrics::Instance().IncPersistenceFailure();
+        return result;
+    }
+    latest_persist_ = handle;
+    if (fence_out) *fence_out = std::move(handle);
+    return ErrorCode::OK;
+}
+
+ErrorCode VSegmentManager::WaitForDurable(
+    const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
+    std::string* detail) {
+    if (!handle) return ErrorCode::OK;
+    return committer_->WaitDurable(handle, detail);
+}
+
 ErrorCode VSegmentManager::Restore(
     const PartitionVSegmentSnapshot& snapshot, std::string* detail) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -699,6 +889,7 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
     const std::vector<VSegmentObjectReference>& references,
     std::string* detail) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!owned_) return ErrorCode::STALE_ROUTE;
     std::unordered_map<std::string, std::vector<VSegmentObjectReference>>
         by_vsegment;
     for (const auto& reference : references) {
@@ -800,7 +991,7 @@ bool VSegmentManager::FindView(const std::string& vsegment_id,
                                VSegmentView* view) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto vsegment = vsegments_.find(vsegment_id);
-    if (vsegment == vsegments_.end()) return false;
+    if (!owned_ || vsegment == vsegments_.end()) return false;
     if (vsegment->second.lifecycle != Lifecycle::ACTIVE &&
         vsegment->second.lifecycle != Lifecycle::DRAINING)
         return false;

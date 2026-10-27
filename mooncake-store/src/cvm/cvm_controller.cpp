@@ -179,6 +179,16 @@ CvmController::CvmController(Config config) : config_(std::move(config)) {
 
 CvmController::~CvmController() { Stop(); }
 
+void CvmController::SetSlotsChangedCallback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(slots_changed_mutex_);
+    slots_changed_callback_ = std::move(callback);
+}
+
+void CvmController::NotifySlotsChanged() {
+    std::lock_guard<std::mutex> lock(slots_changed_mutex_);
+    if (slots_changed_callback_) slots_changed_callback_();
+}
+
 void CvmController::SetDelegate(CvmServiceDelegate* delegate) {
     delegate_ = delegate;
 }
@@ -426,6 +436,7 @@ void CvmController::MastersWatchLoop() {
             if (delegate_) {
                 delegate_->OnMembershipChanged();
             }
+            NotifySlotsChanged();
 
             if (broken) {
                 // watch 已断开（goroutine 已自清理并退出），退出内层循环
@@ -487,6 +498,7 @@ void CvmController::RingSlotsWatchLoop() {
             // 幽灵写防护（§16.14.6）：本 refresh 让本机「不再是 owner」的
             // 判定即时生效。
             RefreshRingSlotsCache();
+            NotifySlotsChanged();
 
             if (broken) {
                 break;

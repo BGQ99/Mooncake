@@ -108,6 +108,17 @@ struct VSegmentView {
 YLT_REFL(VSegmentView, vsegment_id, partition_id, mapping_algorithm,
          stripe_size, logical_capacity, members, checksum);
 
+// 写路径加速：结构化相等比较（供 vsegment HA delta 构建使用，替代 JSON
+// 双序列化比较；语义与逐字段 JSON 对比一致）。
+inline bool operator==(const VSegmentView& left, const VSegmentView& right) {
+    return left.vsegment_id == right.vsegment_id &&
+           left.partition_id == right.partition_id &&
+           left.mapping_algorithm == right.mapping_algorithm &&
+           left.stripe_size == right.stripe_size &&
+           left.logical_capacity == right.logical_capacity &&
+           left.members == right.members && left.checksum == right.checksum;
+}
+
 struct VSegmentAllocationResult {
     ErrorCode error{ErrorCode::OK};
     VSegmentView view;

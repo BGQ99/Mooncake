@@ -406,6 +406,15 @@ class WrappedMasterService {
     InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
                                const std::string& requester_master_id);
 
+    // 心跳交接专用的批量导出变体（slot 就绪加速）：未 staged 的 slot 仅在
+    // 源已观察到失去归属时即时构建（require_not_owned 门控），仍持有归属的
+    // slot 缺席于响应（调用方对其走单 slot 路径重试）。新方法独立注册而非
+    // 改既有签名——滚动升级期间旧 peer 无此方法，调用方收到 RPC 错误后
+    // 回退单 slot 路径，兼容语义由调用方保证。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatchGated(uint16_t first_slot, uint16_t last_slot,
+                                    const std::string& requester_master_id);
+
     // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
     //（DropSlotMetadataRange）。源未观察到归属已切走时返回
     // SLOT_MIGRATING（目标稍后重试，重发无损）。

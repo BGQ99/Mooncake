@@ -2132,6 +2132,23 @@ WrappedMasterService::InterMasterExportSlotBatch(
         [] {}, [] {});
 }
 
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+WrappedMasterService::InterMasterExportSlotBatchGated(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& requester_master_id) {
+    return execute_rpc(
+        "InterMasterExportSlotBatchGated",
+        [&] {
+            return master_service_.InterMasterExportSlotBatchGated(
+                first_slot, last_slot, requester_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("range=[", first_slot, ",", last_slot,
+                             "], requester=", requester_master_id);
+        },
+        [] {}, [] {});
+}
+
 tl::expected<bool, ErrorCode>
 WrappedMasterService::InterMasterAckSlotRangeImported(
     uint16_t first_slot, uint16_t last_slot,
@@ -2186,6 +2203,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterExportSlotBatch>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterExportSlotBatchGated>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterAckSlotRangeImported>(

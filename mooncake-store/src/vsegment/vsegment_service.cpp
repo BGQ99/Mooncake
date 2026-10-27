@@ -13,6 +13,29 @@ int64_t SteadyClockNowNs() {
 
 }  // namespace
 
+VSegmentService::VSegmentService(
+    PartitionPhysicalQuotaSnapshot quota_snapshot,
+    std::chrono::milliseconds metrics_refresh_interval)
+    : quota_snapshot_(std::move(quota_snapshot)),
+      metrics_refresh_interval_(metrics_refresh_interval) {
+    for (const auto& quota : quota_snapshot_.quotas) {
+        auto [it, inserted] = partition_configs_.try_emplace(quota.partition_id);
+        if (inserted) partition_ids_.push_back(quota.partition_id);
+        PartitionVSegmentConfig config;
+        config.partition_id = quota.partition_id;
+        config.profile_name = quota.profile_name;
+        config.config_generation = quota_snapshot_.config_generation;
+        for (const auto& profile : quota_snapshot_.profile_specs) {
+            if (profile.name == quota.profile_name)
+                config.initial_vsegment_count = profile.initial_vsegment_count;
+        }
+        for (const auto& extent : quota.extents)
+            config.quotas.push_back(
+                {extent.segment_id, extent.base_offset, extent.length});
+        it->second.push_back(std::move(config));
+    }
+}
+
 void VSegmentService::RefreshMetrics(bool force) {
     const auto interval_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -95,16 +118,21 @@ void VSegmentService::SetExcludedSegmentsProvider(
 ErrorCode VSegmentService::AddPartition(
     const std::string& partition_id, uint64_t route_epoch,
     std::shared_ptr<VSegmentStateCommitter> committer,
-    const PartitionVSegmentSnapshot* recovered, std::string* detail) {
+    const PartitionVSegmentSnapshot* recovered, std::string* detail,
+    VSegmentCommitBatch* batch) {
     if (partition_id.empty() || route_epoch == 0 || !committer)
         return ErrorCode::INVALID_PARAMS;
-    PartitionVSegmentConfig default_config;
-    auto result = BuildPartitionConfig(quota_snapshot_, partition_id,
-                                       quota_snapshot_.default_profile,
-                                       &default_config, detail);
-    if (result != ErrorCode::OK) return result;
+    auto configs = partition_configs_.find(partition_id);
+    if (configs == partition_configs_.end())
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    bool has_default = false;
+    for (const auto& config : configs->second)
+        has_default |= config.profile_name == quota_snapshot_.default_profile;
+    if (!has_default) return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
     auto manager = std::make_shared<VSegmentManager>(
-        quota_snapshot_, partition_id, std::move(committer));
+        configs->second, quota_snapshot_.profile_specs,
+        quota_snapshot_.default_profile, std::move(committer));
+    ErrorCode result;
     {
         // 透传排除集提供者（若在 service 构造后注入）。持 service mutex_ 读
         // provider 指针，与 SetExcludedSegmentsProvider 的写入互斥。
@@ -133,26 +161,26 @@ ErrorCode VSegmentService::AddPartition(
     // Keep the manager installed if precreation persistence fails. Its
     // already-durable views must remain reserved, and the next ownership
     // reconciliation can safely retry only the missing count.
-    result = manager->EnsureInitialVSegments(detail);
-    RefreshMetrics(true);
+    result = manager->EnsureInitialVSegments(detail, batch);
+    if (!batch) RefreshMetrics(true);
     return result;
 }
 
 ErrorCode VSegmentService::RemovePartition(const std::string& partition_id,
-                                           uint64_t route_epoch) {
+                                           uint64_t route_epoch, bool refresh_metrics) {
     std::shared_ptr<VSegmentManager> removed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto found = partitions_.find(partition_id);
         if (found == partitions_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-        if (found->second->SetRouteEpoch(route_epoch) != ErrorCode::OK)
+        if (found->second->Deactivate(route_epoch) != ErrorCode::OK)
             return ErrorCode::STALE_ROUTE;
         removed = std::move(found->second);
         partitions_.erase(found);
     }
     // Destruction outside the registry lock waits for any asynchronous
     // creation without blocking unrelated Partitions.
-    RefreshMetrics(true);
+    if (refresh_metrics) RefreshMetrics(true);
     return ErrorCode::OK;
 }
 
@@ -169,7 +197,8 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     const partition::PartitionRoute& route,
     const std::string& local_submaster_id,
     std::shared_ptr<VSegmentStateCommitter> committer,
-    const PartitionVSegmentSnapshot* recovered, std::string* detail) {
+    const PartitionVSegmentSnapshot* recovered, std::string* detail,
+    VSegmentCommitBatch* batch) {
     const auto& partition_id = route.partition_id.partition_id;
     if (partition_id.empty() || local_submaster_id.empty() ||
         route.route_epoch == 0) {
@@ -192,17 +221,14 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
 
     // During MIGRATING the old owner remains the sole writer. The target does
     // not install a live manager until the route atomically switches owner.
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = partitions_.find(partition_id);
-        if (found != partitions_.end()) {
-            auto result = found->second->SetRouteEpoch(route.route_epoch);
-            if (result != ErrorCode::OK) return result;
-            return found->second->EnsureInitialVSegments(detail);
-        }
+    auto manager = FindPartition(partition_id);
+    if (manager) {
+        auto result = manager->SetRouteEpoch(route.route_epoch);
+        if (result != ErrorCode::OK) return result;
+        return manager->EnsureInitialVSegments(detail, batch);
     }
     return AddPartition(partition_id, route.route_epoch,
-                        std::move(committer), recovered, detail);
+                        std::move(committer), recovered, detail, batch);
 }
 
 std::vector<PartitionVSegmentSnapshot>
@@ -260,7 +286,7 @@ VSegmentPutStartResult VSegmentService::StartPutOwned(
         return {ErrorCode::STALE_ROUTE, operation_id, {},
                 "Partition is not owned by this SubMaster"};
     auto result = manager->StartPut(operation_id, length, profile_name,
-                                    manager->Snapshot().route_epoch);
+                                    manager->RouteEpoch());
     RefreshMetrics();
     return result;
 }
@@ -272,14 +298,21 @@ VSegmentService::StartPutReplicasOwned(
     const std::string& profile_name) {
     auto manager = FindPartition(partition_id);
     if (!manager) return tl::make_unexpected(ErrorCode::STALE_ROUTE);
-    const auto epoch = manager->Snapshot().route_epoch;
+    const auto epoch = manager->RouteEpoch();
+    VSegmentCommitBatch batch;
     std::vector<VSegmentPutStartResult> results;
     std::vector<std::string> selected;
     results.reserve(operation_ids.size());
     for (const auto& operation_id : operation_ids) {
         auto result = manager->StartPut(operation_id, length, profile_name,
-                                        epoch, selected);
+                                        epoch, selected, &batch);
+        if (result.error == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+            batch.Flush() == ErrorCode::OK)
+            result = manager->StartPut(operation_id, length, profile_name,
+                                       epoch, selected, &batch);
         if (!result) {
+            const auto durable = batch.Flush();
+            if (durable != ErrorCode::OK) return tl::make_unexpected(durable);
             // The group was not returned to the caller. Roll its earlier
             // reservations back without creating terminal abort tombstones,
             // allowing the same operation ids to retry after async creation.
@@ -294,6 +327,8 @@ VSegmentService::StartPutReplicasOwned(
         selected.push_back(result.replica.vsegment_id);
         results.push_back(std::move(result));
     }
+    const auto durable = batch.Flush();
+    if (durable != ErrorCode::OK) return tl::make_unexpected(durable);
     RefreshMetrics();
     return results;
 }
@@ -301,14 +336,15 @@ VSegmentService::StartPutReplicasOwned(
 ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
                                      uint64_t route_epoch,
                                      const std::string& operation_id,
-                                     const std::string& object_id) {
+                                     const std::string& object_id,
+                                     VSegmentCommitBatch* batch) {
     auto manager = FindPartition(replica.partition_id);
     if (!manager) return ErrorCode::STALE_ROUTE;
     LogicalRange committed;
     const LogicalRange expected{replica.logical_offset, replica.length};
     auto result = manager->CommitPut(replica.vsegment_id, operation_id,
                                      object_id, &committed, route_epoch,
-                                     &expected);
+                                     &expected, batch);
     if (result != ErrorCode::OK) return result;
     RefreshMetrics();
     return ErrorCode::OK;
@@ -316,10 +352,10 @@ ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
 
 ErrorCode VSegmentService::CommitPutOwned(
     const VSegmentDescriptor& replica, const std::string& operation_id,
-    const std::string& object_id) {
+    const std::string& object_id, VSegmentCommitBatch* batch) {
     auto manager = FindPartition(replica.partition_id);
-    return manager ? CommitPut(replica, manager->Snapshot().route_epoch,
-                               operation_id, object_id)
+    return manager ? CommitPut(replica, manager->RouteEpoch(),
+                               operation_id, object_id, batch)
                    : ErrorCode::STALE_ROUTE;
 }
 
@@ -340,7 +376,7 @@ ErrorCode VSegmentService::AbortPutOwned(
     const std::string& operation_id) {
     auto manager = FindPartition(partition_id);
     return manager ? AbortPut(partition_id, vsegment_id,
-                              manager->Snapshot().route_epoch, operation_id)
+                              manager->RouteEpoch(), operation_id)
                    : ErrorCode::STALE_ROUTE;
 }
 
@@ -350,17 +386,13 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
         replica.vsegment_id.empty() || replica.length == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
-    // Keep the registry lock through release so a concurrent route reconcile
-    // cannot detach or advance this manager between ownership validation and
-    // the persistent logical-range update.
-    std::unique_lock<std::mutex> lock(mutex_);
-    auto found = partitions_.find(replica.partition_id);
-    if (found == partitions_.end()) return ErrorCode::STALE_ROUTE;
-    const auto epoch = found->second->Snapshot().route_epoch;
-    const auto result = found->second->ReleaseObject(
+    auto manager = FindPartition(replica.partition_id);
+    if (!manager) return ErrorCode::STALE_ROUTE;
+    // Deactivate fences detached managers under their own mutex. No registry
+    // lock is held across storage I/O for an unrelated partition.
+    const auto result = manager->ReleaseObject(
         replica.vsegment_id, object_id,
-        {replica.logical_offset, replica.length}, epoch);
-    lock.unlock();
+        {replica.logical_offset, replica.length}, manager->RouteEpoch());
     if (result == ErrorCode::OK || result == ErrorCode::OBJECT_NOT_FOUND)
         VSegmentMetrics::Instance().IncReleaseSuccess();
     else

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <future>
 #include <limits>
 #include <thread>
 
@@ -1023,10 +1024,10 @@ TEST(VSegmentManagerTest, ExposesLifecycleStatsAndGcsOperationTombstone) {
 
 TEST(VSegmentManagerTest, RetriesIncompleteInitialPrecreation) {
     auto committer = Committer();
-    committer->fail_mutation = "vsegment_create_commit";
+    committer->fail_mutation = "vsegment_create";
     VSegmentManager manager(Config(), {Profile()}, committer);
     EXPECT_EQ(manager.EnsureInitialVSegments(), ErrorCode::PERSISTENT_FAIL);
-    EXPECT_EQ(manager.Stats().preparing, 1u);
+    EXPECT_EQ(manager.Stats().preparing, 0u);
 
     EXPECT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
     EXPECT_EQ(manager.Stats().preparing, 0u);
@@ -1279,12 +1280,14 @@ TEST(VSegmentHaTest, DurableMetadataCallbackCanPersistReleaseWithoutDeadlock) {
                                   return ErrorCode::OK;
                               });
     writer.Start();
-    OrderedOpLogVSegmentCommitter committer(&writer);
-    PartitionVSegmentSnapshot state;
-    state.partition_id = "partition-1";
-    state.config_generation = 1;
-    state.route_epoch = 1;
-    state.metadata_revision = 1;
+    auto committer = std::make_shared<OrderedOpLogVSegmentCommitter>(&writer);
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
+    LogicalRange range;
+    ASSERT_EQ(manager.CommitPut(allocation.view.vsegment_id, "put-1", "object-1", &range),
+              ErrorCode::OK);
     std::promise<ErrorCode> completed;
     auto completion = completed.get_future();
 
@@ -1299,13 +1302,165 @@ TEST(VSegmentHaTest, DurableMetadataCallbackCanPersistReleaseWithoutDeadlock) {
         std::move(*reservation), std::move(metadata_remove),
         [&](const OpLogEntry&) {
             completed.set_value(
-                committer.Commit(state, "logical_release", nullptr));
+                manager.ReleaseObject(allocation.view.vsegment_id, "object-1", range));
         });
     ASSERT_TRUE(pending.has_value());
     ASSERT_EQ(completion.wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
     EXPECT_EQ(completion.get(), ErrorCode::OK);
     writer.Stop();
+}
+
+TEST(VSegmentHaTest, InitialCheckpointAndDeltaUseTheSameReplayPath) {
+    VSegmentOpLogRecord record;
+    record.partition_id = "partition-1";
+    record.route_epoch = 3;
+    record.metadata_revision = 42;
+    record.state.partition_id = record.partition_id;
+    record.state.route_epoch = 3;
+    record.state.metadata_revision = 42;
+    record.full_state = true;
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_STATE;
+    entry.object_key = record.partition_id;
+    struct_json::to_json(record, entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    std::unordered_map<std::string, PartitionVSegmentSnapshot> states;
+    ASSERT_EQ(ApplyVSegmentStateEntry(entry, states), ErrorCode::OK);
+    EXPECT_EQ(states.at("partition-1").metadata_revision, 42u);
+    record.full_state = false;
+    record.state = {};
+    record.route_epoch = 4;
+    record.metadata_revision = 43;
+    entry.payload.clear();
+    struct_json::to_json(record, entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    ASSERT_EQ(ApplyVSegmentStateEntry(entry, states), ErrorCode::OK);
+    EXPECT_EQ(states.at("partition-1").metadata_revision, 43u);
+    EXPECT_EQ(states.at("partition-1").route_epoch, 4u);
+}
+
+// These regressions use an in-process storage callback, not an etcd server.
+TEST(VSegmentHaTest, DurableWaitDoesNotDependOnCallbackProgress) {
+    OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
+        [](const OpLogBatchRecord&, const DurablePrefix&) { return ErrorCode::OK; });
+    writer.Start();
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto release_future = release.get_future().share();
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation);
+    OpLogEntry entry;
+    entry.op_type = OpType::REMOVE;
+    entry.object_key = "callback-blocker";
+    auto pending = writer.Commit(std::move(*reservation), std::move(entry),
+        [&](const OpLogEntry&) { entered.set_value(); release_future.wait(); });
+    ASSERT_TRUE(pending);
+    entered_future.wait();
+    OrderedOpLogVSegmentCommitter committer(&writer);
+    PartitionVSegmentSnapshot state;
+    state.partition_id = "partition-1";
+    state.route_epoch = 1;
+    state.metadata_revision = 1;
+    auto result = std::async(std::launch::async, [&] {
+        return committer.Commit(state, "checkpoint", nullptr);
+    });
+    const auto status = result.wait_for(std::chrono::seconds(2));
+    release.set_value();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_EQ(result.get(), ErrorCode::OK);
+    writer.Stop();
+}
+
+TEST(VSegmentManagerTest, InitialBatchDefersOnlyTheDurabilityBarrier) {
+    std::atomic<bool> allow_write{false};
+    OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
+        [&](const OpLogBatchRecord&, const DurablePrefix&) {
+            while (!allow_write.load()) std::this_thread::yield();
+            return ErrorCode::OK;
+        });
+    writer.Start();
+    auto committer = std::make_shared<OrderedOpLogVSegmentCommitter>(&writer);
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    VSegmentCommitBatch batch;
+    auto initialized = std::async(std::launch::async, [&] {
+        return manager.EnsureInitialVSegments(nullptr, &batch);
+    });
+    const auto init_status = initialized.wait_for(std::chrono::seconds(2));
+    if (init_status != std::future_status::ready) allow_write = true;
+    EXPECT_EQ(init_status, std::future_status::ready);
+    EXPECT_EQ(initialized.get(), ErrorCode::OK);
+    if (init_status != std::future_status::ready) {
+        writer.Stop();
+        return;
+    }
+    EXPECT_EQ(manager.Stats().active, 1u);
+    auto result = std::async(std::launch::async, [&] { return batch.Flush(); });
+    const auto status = result.wait_for(std::chrono::milliseconds(20));
+    allow_write = true;
+    EXPECT_EQ(status, std::future_status::timeout);
+    EXPECT_EQ(result.get(), ErrorCode::OK);
+    writer.Stop();
+}
+
+TEST(VSegmentManagerTest, IdempotentStartWaitsForOriginalSubmission) {
+    std::atomic<bool> allow_write{true};
+    OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
+        [&](const OpLogBatchRecord&, const DurablePrefix&) {
+            while (!allow_write.load()) std::this_thread::yield();
+            return ErrorCode::OK;
+        });
+    writer.Start();
+    auto committer = std::make_shared<OrderedOpLogVSegmentCommitter>(&writer);
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    allow_write = false;
+    auto first = std::async(std::launch::async, [&] {
+        return manager.StartPut("same-operation", 64);
+    });
+    // Observe submission without waiting for storage durability.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!manager.Snapshot().operation_vsegments.count("same-operation") &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    auto retry = std::async(std::launch::async, [&] {
+        return manager.StartPut("same-operation", 64);
+    });
+    const auto status = retry.wait_for(std::chrono::milliseconds(20));
+    allow_write = true;
+    EXPECT_EQ(status, std::future_status::timeout);
+    auto original = first.get();
+    auto repeated = retry.get();
+    ASSERT_TRUE(original);
+    ASSERT_TRUE(repeated);
+    EXPECT_EQ(original.replica.logical_offset, repeated.replica.logical_offset);
+    writer.Stop();
+}
+
+TEST(VSegmentManagerTest, DetachedManagerRejectsWritesAtTheSameEpoch) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    ASSERT_EQ(manager.SetRouteEpoch(7), ErrorCode::OK);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    ASSERT_EQ(manager.Deactivate(7), ErrorCode::OK);
+    EXPECT_EQ(manager.StartPut("late-put", 64, "default", 7).error,
+              ErrorCode::STALE_ROUTE);
+    EXPECT_EQ(manager.SetRouteEpoch(7), ErrorCode::STALE_ROUTE);
+}
+
+TEST(VSegmentServiceTest, PartitionIndexDeduplicatesProfiles) {
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.default_profile = "default";
+    auto alternate = Profile();
+    alternate.name = "alternate";
+    quota.profile_specs = {Profile(), alternate};
+    quota.quotas = {
+        {"partition-1", "default", "DRAM", {{"segment-a", 0, 512}}},
+        {"partition-1", "alternate", "DRAM", {{"segment-b", 0, 512}}}};
+    VSegmentService service(quota);
+    ASSERT_EQ(service.PartitionIds().size(), 1u);
+    EXPECT_TRUE(service.HasPartitionQuota("partition-1"));
+    EXPECT_FALSE(service.HasPartitionQuota("missing"));
 }
 
 TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
