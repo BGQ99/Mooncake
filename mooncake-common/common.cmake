@@ -548,14 +548,20 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
-# URMA RPC transport for coro_rpc (MC_RPC_PROTOCOL=urma). Requires
-# yalantinglibs to be built AND installed with -DYLT_ENABLE_URMA=ON; keep
-# both switches in sync, otherwise the guarded API calls fail to link.
-option(MOONCAKE_ENABLE_URMA_RPC
-       "Enable URMA RPC transport in coro_rpc (requires yalantinglibs built with -DYLT_ENABLE_URMA=ON)"
-       OFF)
-if(MOONCAKE_ENABLE_URMA_RPC)
-    add_compile_definitions(YLT_ENABLE_URMA)
+# yalantinglibs: consume the in-tree extern/ submodule directly — no system
+# install and no separate build step (header-only INTERFACE target). The
+# submodule's CMakeLists has a dedicated add_subdirectory() branch that only
+# loads config (no tests/examples). -DYLT_ENABLE_URMA=ON passed on the
+# Mooncake command line drives the submodule's option() directly and
+# propagates back through the INTERFACE target as compile definitions,
+# UMDK include paths (URMA_ROOT honored) and the -lurma link dependency.
+if(NOT TARGET yalantinglibs::yalantinglibs)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/yalantinglibs/CMakeLists.txt")
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/yalantinglibs
+                         ${CMAKE_CURRENT_BINARY_DIR}/extern/ylt)
+    else()
+        # Fallback for legacy trees without the submodule initialized.
+        find_package(yalantinglibs CONFIG REQUIRED)
+    endif()
 endif()
+add_compile_definitions(YLT_ENABLE_IBV)

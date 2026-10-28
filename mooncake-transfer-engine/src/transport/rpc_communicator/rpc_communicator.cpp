@@ -80,8 +80,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     if (use_urma) {
         LOG(ERROR) << "URMA RPC requested, but YLT URMA support is "
                       "disabled at compile time "
-                      "(build with -DMOONCAKE_ENABLE_URMA_RPC=ON and "
-                      "-DYLT_ENABLE_URMA=ON)";
+                      "(build with -DYLT_ENABLE_URMA=ON)";
         return false;
     }
 #endif
