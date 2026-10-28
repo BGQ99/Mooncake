@@ -550,3 +550,12 @@ if(NOT TARGET gflags::gflags)
 endif()
 find_package(yalantinglibs CONFIG REQUIRED)
 add_compile_definitions(YLT_ENABLE_IBV)
+# URMA RPC transport for coro_rpc (MC_RPC_PROTOCOL=urma). Requires
+# yalantinglibs to be built AND installed with -DYLT_ENABLE_URMA=ON; keep
+# both switches in sync, otherwise the guarded API calls fail to link.
+option(MOONCAKE_ENABLE_URMA_RPC
+       "Enable URMA RPC transport in coro_rpc (requires yalantinglibs built with -DYLT_ENABLE_URMA=ON)"
+       OFF)
+if(MOONCAKE_ENABLE_URMA_RPC)
+    add_compile_definitions(YLT_ENABLE_URMA)
+endif()
