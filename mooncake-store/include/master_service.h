@@ -2553,7 +2553,13 @@ class MasterService {
     // 心跳周期 reconcile 跳过本周期。冷启动（StartSlotOwnerHeartbeat
     // 初始调用，gate 置 true 之前）仍走同步路径，错误硬失败启动，与历史
     // 行为一致。
-    enum class VSegmentInitState { kIdle, kInProgress, kReady };
+    // kNoQuota: the quota snapshot is absent (vsegment disabled or not yet
+    // published). Slot readiness does NOT depend on vsegment in this state —
+    // the runtime gate must let slot imports proceed (mirrors the cold-start
+    // semantics of RefreshVSegmentOwnership for ETCD_KEY_NOT_EXIST). The
+    // background init thread keeps re-probing each heartbeat so a runtime
+    // quota publish (auto-plan / POST) transitions to kReady.
+    enum class VSegmentInitState { kIdle, kInProgress, kReady, kNoQuota };
     std::atomic<VSegmentInitState> vsegment_init_state_{
         VSegmentInitState::kIdle};
     std::thread vsegment_init_thread_;

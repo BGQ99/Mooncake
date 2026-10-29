@@ -1412,10 +1412,18 @@ bool MasterService::MaybeRetryVSegmentAutoPlan(const char* trigger) {
 ErrorCode MasterService::RefreshVSegmentOwnership(
     const std::string& acquiring, vsegment::VSegmentCommitBatch* batch) {
     if (!ordered_oplog_writer_) return ErrorCode::OK;
-    if (vsegment_runtime_gate_active_.load(std::memory_order_acquire) &&
-        vsegment_init_state_.load(std::memory_order_acquire) != VSegmentInitState::kReady) {
-        MaybeSpawnVSegmentInit();
-        return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
+    if (vsegment_runtime_gate_active_.load(std::memory_order_acquire)) {
+        const auto gate_state =
+            vsegment_init_state_.load(std::memory_order_acquire);
+        if (gate_state == VSegmentInitState::kIdle ||
+            gate_state == VSegmentInitState::kInProgress) {
+            MaybeSpawnVSegmentInit();
+            return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
+        }
+        // kNoQuota：quota 快照不存在（vsegment 关闭或尚未发布）。slot 就绪
+        // 不依赖 vsegment——放行到 null-service 分支按冷启动同款语义处理，
+        // 绝不能被永不完成的初始化门控阻塞（否则 vsegment-off 部署下所有
+        // slot 永久 NOT_READY → put 永久 SLOT_MIGRATING）。
     }
     if (!vsegment_service_) {
         if (!vsegment_runtime_gate_active_.load(std::memory_order_acquire)) {
@@ -1455,6 +1463,16 @@ ErrorCode MasterService::RefreshVSegmentOwnership(
             // 示已在进行。NOT_READY 对全部运行期调用方均为可重试语义：
             // slot_migrator 的 on_acquire pending 路径、P4 reshard 下一轮
             // 重拉、心跳周期 reconcile 跳过本周期。
+            const auto gate_state =
+                vsegment_init_state_.load(std::memory_order_acquire);
+            if (gate_state == VSegmentInitState::kNoQuota) {
+                // quota 缺席的稳态：与冷启动 KEY_NOT_EXIST 路径语义对齐
+                //（slot 就绪不依赖 vsegment）。仍保持每心跳一次的后台重
+                // 探，使运行期发布（auto-plan / 手工 POST）能转换到
+                // kReady。绝不 fallthrough 到 reconcile：service 为空。
+                MaybeSpawnVSegmentInit();
+                return ErrorCode::OK;
+            }
             MaybeSpawnVSegmentInit();
             return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
         }
@@ -1734,10 +1752,11 @@ void MasterService::VSegmentInitThreadFunc() {
             error = store.Load(&quota, &detail);
         }
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
-            // 快照仍未发布（重试受节流/静默期门控属正常稳态）：复位 kIdle，
-            // 后续心跳周期重触发（每周期一次线程拉起 + 一次 etcd Get，开销
-            // 可忽略）。
-            vsegment_init_state_.store(VSegmentInitState::kIdle,
+            // 快照仍未发布（重试受节流/静默期门控属正常稳态）：置 kNoQuota
+            // 终态语义——quota 缺席不阻塞 slot 就绪（门控放行），但仍允许
+            // 每心跳一次的重探（本函数经 MaybeSpawnVSegmentInit 的
+            // kNoQuota 分支重拉），使运行期发布后自动转换到 kReady。
+            vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                        std::memory_order_release);
             return;
         }
@@ -1786,7 +1805,10 @@ void MasterService::MaybeSpawnVSegmentInit() {
             state, VSegmentInitState::kIdle);
         state = VSegmentInitState::kIdle;
     }
-    if (state != VSegmentInitState::kIdle) return;  // kInProgress：已在跑
+    if (state != VSegmentInitState::kIdle &&
+        state != VSegmentInitState::kNoQuota) {
+        return;  // kInProgress：已在跑（kReady 已在上方处理）
+    }
     if (!vsegment_init_state_.compare_exchange_strong(
             state, VSegmentInitState::kInProgress)) {
         return;  // 另一线程刚赢得拉起权
