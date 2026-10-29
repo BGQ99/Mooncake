@@ -2562,6 +2562,13 @@ class MasterService {
     enum class VSegmentInitState { kIdle, kInProgress, kReady, kNoQuota };
     std::atomic<VSegmentInitState> vsegment_init_state_{
         VSegmentInitState::kIdle};
+    // Independent re-probe in-flight flag for the background init thread.
+    // Never encoded into vsegment_init_state_: encoding it (the kNoQuota ->
+    // kInProgress CAS) turned every slot-admission release into a full
+    // kInProgress window (init thread's etcd Get), throttling slot readiness
+    // to ~1 slot per heartbeat. With this flag the spawn path is invisible
+    // to the gate: kNoQuota stays kNoQuota while probing.
+    std::atomic<bool> vsegment_init_probe_in_flight_{false};
     std::thread vsegment_init_thread_;
     std::mutex vsegment_init_spawn_mutex_;  // 保护线程 spawn/join 生命周期
     // StartSlotOwnerHeartbeat 初始同步调用完成后置 true：此前的调用走同步
