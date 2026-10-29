@@ -4,5 +4,5 @@
 	branch = stable
 [submodule "extern/yalantinglibs"]
 	path = extern/yalantinglibs
-	url = git@github.com:HaoyuWang2001/yalantinglibs.git
+	url = https://github.com/HaoyuWang2001/yalantinglibs.git
 	branch = fix/mc-ylt-urma-env-prefix
