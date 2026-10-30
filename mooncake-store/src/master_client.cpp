@@ -30,6 +30,8 @@
 
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
+
+#include <optional>
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {
@@ -626,9 +628,21 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     RoutedCallTiming* timing, const std::string& tenant_id,
-    const std::string& key, Args... args) {
+    const std::string& key, uint32_t rpc_stat_key, Args... args) {
     const auto t_routed_start = std::chrono::steady_clock::now();
+    // 可选的 SpDiag 统计（首段 RPC = 发起 ylt 请求到拿到结果的时延，与
+    // timing->rpc_first_us 同区间）：仅显式传入 PerfKey 的调用方记录
+    // （Query 传 QUERY_RPC_CALL），默认 0 不记录——本模板被 7 个 routed
+    // RPC 共享，不得污染彼此统计。PerfPoint 驻留协程帧按墙钟计量。
+    std::optional<SpDiag::PerfPoint> pt_rpc;
+    if (rpc_stat_key != 0) {
+        pt_rpc.emplace(rpc_stat_key, SpDiag::PerfLevel::MODULE);
+        pt_rpc->Start();
+    }
     auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+    if (pt_rpc) {
+        pt_rpc->End(result ? 0 : -1);
+    }
     if (timing) {
         timing->rpc_first_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t_routed_start)
@@ -1109,8 +1123,8 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::ExistKey,
                                             bool>(
-        /*timing=*/nullptr, tenant_id_.value(), object_key, object_key,
-        tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), object_key,
+        /*rpc_stat_key=*/0, object_key, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1331,20 +1345,32 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     // 与 routed（RPC 含重试/退避）分段。与 invoke_rpc 内层的
     // master_rpc_client_breakdown（pool_lookup/rpc_call/result_get）互补。
     const auto t0 = std::chrono::steady_clock::now();
+    // SpDiag 统计：Query 三段下钻（与 query_rpc_breakdown trace 字段同区
+    // 间）——RouteSwitch（路由解析/切换）、RpcCall（InvokeRoutedWithSlotRetry
+    // 内首段 RPC，见其 rpc_stat_key 参数）、RpcTotal（路由+RPC 全程）。统
+    // 计值与 trace 的 switch_us/rpc_first_us/total_us 可直接交叉对账。
+    SpDiag::PerfPoint pt_total(PerfKey::QUERY_RPC_TOTAL,
+                               SpDiag::PerfLevel::MODULE);
+    pt_total.Start();
     int64_t switch_us = 0;
     RoutedCallTiming timing;
 
     ErrorCode switch_err;
     {
+        SpDiag::PerfPoint pt_switch(PerfKey::QUERY_ROUTE_SWITCH,
+                                    SpDiag::PerfLevel::MODULE);
+        pt_switch.Start();
         const auto t_switch = std::chrono::steady_clock::now();
         switch_err = SwitchToSubmaster(tenant_id, object_key);
         switch_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_switch)
                 .count();
+        pt_switch.End(switch_err == ErrorCode::OK ? 0 : -1);
     }
     if (switch_err != ErrorCode::OK) {
         timer.LogResponse("error_code=", switch_err);
+        pt_total.End(-1);
         MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key
                      << "] switch_us[" << switch_us << "] rpc_first_us[0]"
                      << "] total_us["
@@ -1359,8 +1385,8 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
-        &timing, tenant_id, object_key, object_key, tenant_id, trace_id,
-        client_id_);
+        &timing, tenant_id, object_key, /*rpc_stat_key=*/PerfKey::QUERY_RPC_CALL,
+        object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
 
     const char* status = "ok";
@@ -1385,6 +1411,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
                  << "] retry_count[" << timing.retry_count
                  << "] backoff_count[" << timing.backoff_count << "] status["
                  << status << "]";
+    pt_total.End(result ? 0 : -1);
     return result;
 }
 
@@ -1492,8 +1519,9 @@ MasterClient::PutStart(const std::string& key,
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::PutStart, PutStartResult>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        total_slice_length, config, tenant_id_.value(), trace_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, total_slice_length, config, tenant_id_.value(),
+        trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1614,8 +1642,9 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutEnd,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
-        object_meta, replica_type, tenant_id_.value(), trace_id, operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key,
+        /*rpc_stat_key=*/0, client_id_, object_meta, replica_type,
+        tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1719,8 +1748,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutRevoke,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1817,8 +1846,8 @@ MasterClient::UpsertStart(const std::string& key,
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertStart, PutStartResult>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        total_slice_length, config, tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, total_slice_length, config, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1934,8 +1963,9 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
-        object_meta, replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key,
+        /*rpc_stat_key=*/0, client_id_, object_meta, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2037,8 +2067,8 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertRevoke, void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2125,8 +2155,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     }
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::Remove, void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, key, force,
-        tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0, key,
+        force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }

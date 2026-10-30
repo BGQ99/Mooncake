@@ -294,3 +294,7 @@ PERF_KEY_DEF(MASTER_RPC_GET_PSEGMENT_ENDPOINT, "rpc_service.cpp::GetPSegmentEndp
 PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
 PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
 PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")
+// === Query 路径下钻（GET 路径核心通信段统计） ===
+PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
+PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")
+PERF_KEY_DEF(QUERY_RPC_TOTAL,     "master_client.cpp::Query",  "QueryRpcTotal")
