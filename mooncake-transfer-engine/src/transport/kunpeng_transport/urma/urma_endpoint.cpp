@@ -144,41 +144,45 @@ int UrmaContext::construct(GlobalConfig& config) {
         return ERR_CONTEXT;
     }
 
-    const auto support = urmaCtpPrioritySupport(dev_attr_, jfs_priority_);
-    const bool capability_reported = support != UrmaPrioritySupport::Unknown;
-    const bool ctp_supported = support == UrmaPrioritySupport::Supported;
+    const auto capability =
+        urmaCtpPriorityCapability(dev_attr_, jfs_priority_, trans_mode_);
+    const bool capability_reported =
+        capability.priority_support != UrmaPrioritySupport::Unknown;
+    const bool priority_ctp_supported =
+        capability.priority_support == UrmaPrioritySupport::Supported;
     const auto& priority_info = dev_attr_.dev_cap.priority_info[jfs_priority_];
-    const auto& cap = dev_attr_.dev_cap;
-    const bool mode_ctp_supported =
-        trans_mode_ == URMA_TM_RC ? cap.rc_tp_cap.bs.ctp != 0 :
-        trans_mode_ == URMA_TM_RM ? cap.rm_tp_cap.bs.ctp != 0 :
-                                   cap.um_tp_cap.bs.ctp != 0;
-    if (!capability_reported || !ctp_supported || !mode_ctp_supported) {
+    std::ostringstream priority_details;
+    priority_details << "requested_priority="
+                     << static_cast<unsigned>(jfs_priority_)
+                     << ", effective_priority="
+                     << static_cast<unsigned>(jfs_priority_)
+                     << ", tp_type=CTP, trans_mode="
+                     << transModeToString(trans_mode_)
+                     << ", device_name=" << device_name_ << ", fallback=false"
+                     << ", capability_reported=" << capability_reported
+                     << ", priority_ctp_supported=" << priority_ctp_supported
+                     << ", device_ctp_enabled=" << capability.device_ctp_enabled
+                     << ", mode_ctp_supported=" << capability.mode_ctp_supported
+                     << ", capability_inconsistent="
+                     << capability.capability_inconsistent
+                     << ", SL=" << priority_info.SL;
+    if (!capability.can_attempt_creation) {
         if (config.urma_te_priority_explicit) {
-            LOG(ERROR) << "TE priority rejected: requested_priority="
-                       << static_cast<unsigned>(jfs_priority_)
-                       << ", effective_priority=none, tp_type=CTP, trans_mode="
-                       << transModeToString(trans_mode_)
-                       << ", device_name=" << device_name_
-                       << ", capability_reported=" << capability_reported
-                       << ", ctp_supported=" << ctp_supported
-                       << ", mode_ctp_supported=" << mode_ctp_supported;
+            LOG(ERROR) << "TE priority rejected before resource creation: "
+                       << priority_details.str();
             return ERR_CONTEXT;
         }
         LOG(WARNING) << "TE default priority is unverified or unsupported: "
-                     << "requested_priority=15, device_name=" << device_name_
-                     << "; retaining legacy behavior";
+                     << priority_details.str() << "; retaining legacy behavior";
     }
-    // The table reports TP-type support, not RC-specific scheduling guarantees.
-    LOG(INFO) << "TE priority configuration: requested_priority="
-              << static_cast<unsigned>(jfs_priority_)
-              << ", effective_priority=" << static_cast<unsigned>(jfs_priority_)
-              << ", tp_type=CTP, trans_mode=" << transModeToString(trans_mode_)
-              << ", device_name=" << device_name_ << ", fallback=false"
-              << ", capability_reported=" << capability_reported
-              << ", ctp_supported=" << ctp_supported
-              << ", mode_ctp_supported=" << mode_ctp_supported
-              << ", SL=" << priority_info.SL;
+    if (capability.capability_inconsistent) {
+        LOG(WARNING) << "RM CTP is not reported by rm_tp_cap, but device CTP "
+                        "feature and selected priority CTP are reported as "
+                        "supported; proceeding with resource creation. "
+                     << priority_details.str();
+    }
+    // Admission does not establish resource creation or communication success.
+    LOG(INFO) << "TE priority configuration: " << priority_details.str();
 
     num_JFCE_ = num_jfces;
     jfce_ = new urma_jfce_t*[num_JFCE_];
@@ -864,7 +868,8 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         LOG(INFO) << "TE Jetty created: requested_priority="
                   << static_cast<unsigned>(context_->jfs_priority_)
                   << ", effective_priority="
-                  << static_cast<unsigned>(attr.jfs_cfg.priority)
+                  << static_cast<unsigned>(
+                         jetty_list_[i]->jetty_cfg.jfs_cfg.priority)
                   << ", trans_mode=" << transModeToString(context_->transMode())
                   << ", tp_type=CTP, device_name=" << context_->deviceName()
                   << ", fallback=false, jetty_id=" << jetty_list_[i]->jetty_id.id;
