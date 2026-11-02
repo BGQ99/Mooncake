@@ -135,6 +135,9 @@ struct GlobalConfig {
     // urma transport mode: "RM" (default), "RC", "UM"; override via
     // MC_URMA_TRANS_MODE
     std::string urma_trans_mode = "RM";
+    // MC_URMA_TE_PRIORITY; -1 records an invalid explicit environment value.
+    int urma_te_priority = 15;
+    bool urma_te_priority_explicit = false;
     // urma active port: -1 (default) for auto-selection by scanning port
     // attributes, >=0 for user-specified port index; override via
     // MC_URMA_ACTIVE_PORT

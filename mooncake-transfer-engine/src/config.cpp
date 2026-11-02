@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "config.h"
+#include "urma_priority.h"
 
 #include <charconv>
 #include <cstring>
@@ -659,6 +660,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.urma_bonding_balance = true;
     }
 
+    if (const char* value = std::getenv("MC_URMA_TE_PRIORITY")) {
+        config.urma_te_priority_explicit = true;
+        auto priority = parseUrmaPriority(value);
+        if (!priority) {
+            LOG(ERROR) << "Invalid MC_URMA_TE_PRIORITY='" << value
+                       << "'; expected integer in [0, 15]; URMA init rejected";
+            config.urma_te_priority = -1;
+        } else {
+            config.urma_te_priority = *priority;
+        }
+    }
+
     const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
     if (urma_trans_mode_env && *urma_trans_mode_env) {
         std::string val(urma_trans_mode_env);
@@ -810,6 +823,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
     LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
+    LOG(INFO) << "urma_te_priority = " << config.urma_te_priority;
     LOG(INFO) << "urma_bonding_balance = "
               << (config.urma_bonding_balance ? "true" : "false");
 }

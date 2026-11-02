@@ -128,6 +128,7 @@ class UrmaContext : public UbContext {
     urma_mtu active_mtu_;
     urma_eid_t eid_{};
     urma_device_attr_t dev_attr_{};
+    uint8_t jfs_priority_ = 15;
 
     int eid_index_ = -1;
     int active_speed_ = -1;

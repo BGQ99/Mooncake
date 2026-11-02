@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include "config.h"
+#include "urma_priority.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
@@ -112,6 +113,11 @@ int UrmaContext::submitPostSend(
 
 int UrmaContext::construct(GlobalConfig& config) {
     trans_mode_ = parseTransMode(config.urma_trans_mode);
+    if (config.urma_te_priority < 0 || config.urma_te_priority > 15) {
+        LOG(ERROR) << "Invalid MC_URMA_TE_PRIORITY; URMA context rejected";
+        return ERR_CONTEXT;
+    }
+    jfs_priority_ = static_cast<uint8_t>(config.urma_te_priority);
     size_t num_jfc_list = config.num_jfc_per_ctx;
     size_t num_jfces = config.num_jfce_per_ctx;
     int eid_index = config.eid_index;
@@ -137,6 +143,42 @@ int UrmaContext::construct(GlobalConfig& config) {
                    << " with EID index : " << eid_index;
         return ERR_CONTEXT;
     }
+
+    const auto support = urmaCtpPrioritySupport(dev_attr_, jfs_priority_);
+    const bool capability_reported = support != UrmaPrioritySupport::Unknown;
+    const bool ctp_supported = support == UrmaPrioritySupport::Supported;
+    const auto& priority_info = dev_attr_.dev_cap.priority_info[jfs_priority_];
+    const auto& cap = dev_attr_.dev_cap;
+    const bool mode_ctp_supported =
+        trans_mode_ == URMA_TM_RC ? cap.rc_tp_cap.bs.ctp != 0 :
+        trans_mode_ == URMA_TM_RM ? cap.rm_tp_cap.bs.ctp != 0 :
+                                   cap.um_tp_cap.bs.ctp != 0;
+    if (!capability_reported || !ctp_supported || !mode_ctp_supported) {
+        if (config.urma_te_priority_explicit) {
+            LOG(ERROR) << "TE priority rejected: requested_priority="
+                       << static_cast<unsigned>(jfs_priority_)
+                       << ", effective_priority=none, tp_type=CTP, trans_mode="
+                       << transModeToString(trans_mode_)
+                       << ", device_name=" << device_name_
+                       << ", capability_reported=" << capability_reported
+                       << ", ctp_supported=" << ctp_supported
+                       << ", mode_ctp_supported=" << mode_ctp_supported;
+            return ERR_CONTEXT;
+        }
+        LOG(WARNING) << "TE default priority is unverified or unsupported: "
+                     << "requested_priority=15, device_name=" << device_name_
+                     << "; retaining legacy behavior";
+    }
+    // The table reports TP-type support, not RC-specific scheduling guarantees.
+    LOG(INFO) << "TE priority configuration: requested_priority="
+              << static_cast<unsigned>(jfs_priority_)
+              << ", effective_priority=" << static_cast<unsigned>(jfs_priority_)
+              << ", tp_type=CTP, trans_mode=" << transModeToString(trans_mode_)
+              << ", device_name=" << device_name_ << ", fallback=false"
+              << ", capability_reported=" << capability_reported
+              << ", ctp_supported=" << ctp_supported
+              << ", mode_ctp_supported=" << mode_ctp_supported
+              << ", SL=" << priority_info.SL;
 
     num_JFCE_ = num_jfces;
     jfce_ = new urma_jfce_t*[num_JFCE_];
@@ -785,7 +827,7 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         .depth = 2048,  // DEFAULT_DEPTH (512)
         .trans_mode =
             context_->transMode(), /* override via MC_URMA_TRANS_MODE */
-        .priority = 15,            // URMA_MAX_PRIORITY 15
+        .priority = context_->jfs_priority_,
         .max_sge = 5,              // SGE_NUM_MAX 5
         .rnr_retry = 7,            // URMA_TYPICAL_RNR_RETRY    7
         .err_timeout = 17,         // URMA_TYPICAL_ERR_TIMEOUT   17
@@ -819,6 +861,13 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
             pt_construct.End(-1);
             return ERR_ENDPOINT;
         }
+        LOG(INFO) << "TE Jetty created: requested_priority="
+                  << static_cast<unsigned>(context_->jfs_priority_)
+                  << ", effective_priority="
+                  << static_cast<unsigned>(attr.jfs_cfg.priority)
+                  << ", trans_mode=" << transModeToString(context_->transMode())
+                  << ", tp_type=CTP, device_name=" << context_->deviceName()
+                  << ", fallback=false, jetty_id=" << jetty_list_[i]->jetty_id.id;
         LOG(INFO) << "Create jetty success, jetty id = "
                   << jetty_list_[i]->jetty_id.id << " ,jetty jfc id = "
                   << jetty_list_[i]->jetty_cfg.jfs_cfg.jfc->jfc_id.id << " : "

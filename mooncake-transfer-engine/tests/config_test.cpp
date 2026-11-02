@@ -24,12 +24,39 @@ namespace {
 class PkeyIndexEnvTest : public ::testing::Test {
    protected:
     void TearDown() override {
+        ::unsetenv("MC_URMA_TE_PRIORITY");
         ::unsetenv("MC_PKEY_INDEX");
         ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
         ::unsetenv("MC_IB_SL");
         ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
     }
 };
+
+TEST_F(PkeyIndexEnvTest, UrmaPriorityDefaultAndOverrides) {
+    ::unsetenv("MC_URMA_TE_PRIORITY");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_EQ(defaults.urma_te_priority, 15);
+    EXPECT_FALSE(defaults.urma_te_priority_explicit);
+    for (const char* value : {"0", "6", "7", "15"}) {
+        ::setenv("MC_URMA_TE_PRIORITY", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.urma_te_priority, std::atoi(value));
+        EXPECT_TRUE(config.urma_te_priority_explicit);
+    }
+}
+
+TEST_F(PkeyIndexEnvTest, UrmaPriorityRejectsInvalidValues) {
+    for (const char* value : {"", "-1", "16", "256", "99999999999999999999",
+                              "7x", " 7", "7 ", "+7"}) {
+        ::setenv("MC_URMA_TE_PRIORITY", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.urma_te_priority, -1) << value;
+        EXPECT_TRUE(config.urma_te_priority_explicit);
+    }
+}
 
 TEST_F(PkeyIndexEnvTest, DefaultIsZeroWhenUnset) {
     ::unsetenv("MC_PKEY_INDEX");
