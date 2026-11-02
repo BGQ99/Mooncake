@@ -110,13 +110,11 @@ struct PutStartResult {
 };
 YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
 
-// NOTE: a batch-level envelope struct (results + compatible table) is NOT wire
-// compatible with the legacy bare vector. struct_pack validates the 4-byte type
-// code on deserialize (ylt/struct_pack/unpacker.hpp deserialize_metainfo), and
-// `compatible` fields do not participate in that code, so a different top-level
-// type is rejected in both directions. The deduplicated batch table therefore
+// BatchGetReplicaList keeps its legacy vector wire type. Its deduplicated table
 // rides on the first successful per-key GetReplicaListResponse, whose
-// compatible field keeps the old wire type intact.
+// compatible field keeps that RPC wire-compatible. BatchPutStart intentionally
+// returns per-key PutStartResult values instead; that direct RPC type change
+// requires clients and masters to be upgraded together.
 
 // Attaches the deduplicated batch table to the first successful per-key
 // response. No-op when there is no table or no successful key.

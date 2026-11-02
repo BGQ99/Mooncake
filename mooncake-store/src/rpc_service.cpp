@@ -646,7 +646,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& slice_lengths,
@@ -666,11 +666,31 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results;
     results.reserve(keys.size());
     auto resolved_tenant_id = ResolveTenantIdForWrite(
         tenant_id, master_service_.IsTenantQuotaEnabled());
+
+    auto start_one = [&](size_t index, const ReplicateConfig& key_config)
+        -> tl::expected<PutStartResult, ErrorCode> {
+        auto vsegment = master_service_.TryVSegmentPutStart(
+            client_id, keys[index], resolved_tenant_id.value(),
+            slice_lengths[index], key_config);
+        if (!vsegment) {
+            return tl::make_unexpected(vsegment.error());
+        }
+        if (vsegment->has_value()) {
+            return std::move(**vsegment);
+        }
+
+        auto descriptors = master_service_.PutStart(
+            client_id, keys[index], resolved_tenant_id.value(),
+            slice_lengths[index], key_config);
+        if (!descriptors) {
+            return tl::make_unexpected(descriptors.error());
+        }
+        return PutStartResult{{}, std::move(descriptors.value())};
+    };
 
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
@@ -691,13 +711,10 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = new_config.ForSingleKey(i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
-            results.emplace_back(result);
+            auto result = start_one(i, key_config);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
-                for (const auto& replica : result.value()) {
+                for (const auto& replica : result->replicas) {
                     if (replica.is_memory_replica()) {
                         auto handles =
                             replica.get_memory_descriptor().buffer_descriptor;
@@ -710,13 +727,12 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                     new_config.preferred_segment = preferred_segment;
                 }
             }
+            results.emplace_back(std::move(result));
         }
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
+            results.emplace_back(start_one(i, key_config));
         }
     }
 

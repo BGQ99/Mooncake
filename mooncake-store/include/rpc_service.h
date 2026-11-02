@@ -114,7 +114,7 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,

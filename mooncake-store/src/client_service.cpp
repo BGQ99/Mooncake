@@ -2799,6 +2799,20 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                     [](const auto& response) { return response.has_value(); });
     pt_batch_start.End(any_start_succeeded ? 0 : -1);
 
+    std::vector<VSegmentLayoutEntry> merged_layouts;
+    for (const auto& response : start_responses) {
+        if (response && response->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(merged_layouts,
+                                     *response->vsegment_layouts);
+        }
+    }
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (!merged_layouts.empty()) {
+        batch_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                std::move(merged_layouts));
+    }
+
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
@@ -2808,7 +2822,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i]->replicas);
+            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,

@@ -242,6 +242,28 @@ TEST(VSegmentLayoutWireTest, BatchVectorRoundTripKeepsDedupTable) {
               "127.0.0.1:19000");
 }
 
+TEST(VSegmentLayoutWireTest, BatchPutStartRoundTripKeepsPerKeyLayouts) {
+    std::vector<tl::expected<PutStartResult, ErrorCode>> batch;
+    PutStartResult first{"op-1", {}};
+    first.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    batch.push_back(std::move(first));
+    batch.push_back(tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+
+    const auto bytes = struct_pack::serialize(batch);
+    std::vector<tl::expected<PutStartResult, ErrorCode>> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.size(), 2u);
+    ASSERT_TRUE(decoded[0].has_value());
+    EXPECT_EQ(decoded[0]->operation_id, "op-1");
+    ASSERT_TRUE(decoded[0]->vsegment_layouts.has_value());
+    ASSERT_EQ(decoded[0]->vsegment_layouts->size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().vsegment_id, "vs-1");
+    ASSERT_FALSE(decoded[1].has_value());
+    EXPECT_EQ(decoded[1].error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
 TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
     CachedQueryResultResponse cached{GetReplicaListResponse{}};
     cached.value.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
@@ -259,11 +281,11 @@ TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
               "vs-1");
 }
 
-// Batch RPCs keep their legacy wire type (vector<expected<...>>); the
-// deduplicated table rides on the first successful per-key response. This is
-// the same GetReplicaListResponse type, so old readers simply ignore the
-// compatible field. A separate batch envelope type would change the struct_pack
-// type code and break mixed-version decoding in both directions.
+// BatchGetReplicaList keeps its legacy wire type
+// (vector<expected<GetReplicaListResponse, ...>>); the deduplicated table rides
+// on the first successful per-key response. This is the same
+// GetReplicaListResponse type, so old readers simply ignore the compatible
+// field.
 TEST(VSegmentLayoutWireTest, BatchVectorCarriesTableOnFirstResponse) {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
     batch.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
