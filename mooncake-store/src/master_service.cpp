@@ -1928,6 +1928,8 @@ void MasterService::StopInterMasterRpc() {
 }
 
 
+#endif  // STORE_USE_ETCD
+
 uint32_t MasterService::GetOwnedSlotCount() const {
     std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
     if (!owned_slots_ready_) {
@@ -1974,6 +1976,7 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
     return os.str();
 }
 
+#ifdef STORE_USE_ETCD
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterService::InterMasterAllocateReplicas(
     const std::string& tenant_id, const std::string& key, uint64_t slice_length,
@@ -3285,7 +3288,6 @@ void MasterService::NoteVSegmentMountActivity() {}
 void MasterService::MaybeSpawnVSegmentInit() {}
 void MasterService::VSegmentInitThreadFunc() {}
 void MasterService::ConstructVSegmentService(vsegment::PartitionPhysicalQuotaSnapshot) {}
-uint32_t MasterService::GetOwnedSlotCount() const { return 0; }
 tl::expected<std::vector<Replica>, ErrorCode>
 MasterService::TryAllocateReplicasRemotely(
     const std::string&, const TenantId&, uint64_t, size_t,
