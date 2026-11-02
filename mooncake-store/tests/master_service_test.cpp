@@ -4348,7 +4348,9 @@ TEST_F(MasterServiceTest, StaleGenerationEvictedOnFastClientRemount) {
                     .has_value());
     auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
     ASSERT_TRUE(get_result2.has_value());
-    ASSERT_EQ(get_result2.value()[0]
+    ASSERT_FALSE(get_result2.value().replicas.empty());
+
+    ASSERT_EQ(get_result2.value().replicas[0]
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               new_segment.name);
