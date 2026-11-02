@@ -24,7 +24,7 @@ PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "real_client.cpp::batch_get_buffer_
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_buffer_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "real_client.cpp::batch_get_buffer_internal", "AllocBuffer")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "real_client.cpp::batch_get_buffer_internal", "SSDRead")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"real_client.cpp::batch_get_buffer_internal", "MemDiskRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_DATA_READ,   "real_client.cpp::batch_get_buffer_internal", "DataRead")
 
 // === get_into_internal steps ===
 PERF_KEY_DEF(GET_INTO_INTERNAL_QUERY,        "real_client.cpp::get_into_internal",         "Query")
@@ -38,7 +38,7 @@ PERF_KEY_DEF(GET_INTO_INTERNAL_DISK_READ,    "real_client.cpp::get_into_internal
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_QUERY,  "real_client.cpp::batch_get_into_internal",   "BatchQuery")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_into_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_ALLOC_BUFFER, "real_client.cpp::batch_get_into_internal", "AllocBuffer")
-PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_MEM_READ, "real_client.cpp::batch_get_into_internal", "MemRead")
+PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DIRECT_READ, "real_client.cpp::batch_get_into_internal", "DirectRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DISK_READ, "real_client.cpp::batch_get_into_internal", "DiskRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SSD_READ, "real_client.cpp::batch_get_into_internal", "SSDRead")
 
@@ -303,3 +303,10 @@ PERF_KEY_DEF(VSEGMENT_READ_WAIT,   "client_service.cpp::vsegment_read", "VSegWai
 PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
 PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")
 PERF_KEY_DEF(QUERY_RPC_TOTAL,     "master_client.cpp::Query",  "QueryRpcTotal")
+
+// === Replica-specific single-read points ===
+// Appended to preserve the numeric identity of all pre-existing PerfKeys.
+PERF_KEY_DEF(GET_INTERNAL_NOF_READ,       "real_client.cpp::get_buffer_internal", "NoFRead")
+PERF_KEY_DEF(GET_INTERNAL_VSEG_READ,      "real_client.cpp::get_buffer_internal", "VSegRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_NOF_READ,  "real_client.cpp::get_into_internal",   "NoFRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_VSEG_READ, "real_client.cpp::get_into_internal",   "VSegRead")
