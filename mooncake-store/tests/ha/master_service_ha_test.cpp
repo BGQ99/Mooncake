@@ -243,7 +243,11 @@ class MasterServiceHATest : public ::testing::Test {
         service.cvm_last_primary_ids_ = {service.master_id()};
         service.cvm_alive_master_ids_ = {service.master_id()};
         service.cvm_ring_revision_ = 10;
-        return service.ImportSlotMetadata(slot);
+        vsegment::VSegmentCommitBatch batch;
+        const auto import_error =
+            service.ImportSlotMetadata(slot, nullptr, &batch);
+        const auto durable_error = batch.Flush();
+        return import_error == ErrorCode::OK ? durable_error : import_error;
     }
 
     class AcceptVSegmentCommitter : public vsegment::VSegmentStateCommitter {
