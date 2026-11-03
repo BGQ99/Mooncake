@@ -327,8 +327,10 @@ VSegmentService::StartPutReplicasOwned(
         selected.push_back(result.replica.vsegment_id);
         results.push_back(std::move(result));
     }
-    const auto durable = batch.Flush();
-    if (durable != ErrorCode::OK) return tl::make_unexpected(durable);
+    // Match ordinary memory PutStart: journal submission protects ordering and
+    // backpressure, but the RPC does not wait for storage durability. A master
+    // failure may therefore lose an unfinished reservation in either path.
+    batch.DiscardDurabilityWaits();
     RefreshMetrics();
     return results;
 }

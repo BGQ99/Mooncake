@@ -2369,6 +2369,43 @@ TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
               (*result)[1].replica.vsegment_id);
 }
 
+TEST(VSegmentServiceTest, PutStartDoesNotWaitForJournalDurability) {
+    std::atomic<bool> allow_write{true};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{},
+        [&](const OpLogBatchRecord&, const DurablePrefix&) {
+            while (!allow_write.load()) std::this_thread::yield();
+            return ErrorCode::OK;
+        });
+    writer.Start();
+
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    auto committer =
+        std::make_shared<OrderedOpLogVSegmentCommitter>(&writer);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, std::move(committer)),
+              ErrorCode::OK);
+
+    allow_write = false;
+    auto started = std::async(std::launch::async, [&] {
+        return service.StartPutReplicasOwned("partition-1", {"put-1"}, 64);
+    });
+    const auto status = started.wait_for(std::chrono::seconds(2));
+    allow_write = true;
+    EXPECT_EQ(status, std::future_status::ready);
+    auto result = started.get();
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    ASSERT_EQ(result->size(), 1u);
+    writer.Stop();
+}
+
 TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
     const TenantId tenant = TenantId::Default();
     const std::string key = "profile-selected-object";
