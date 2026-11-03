@@ -2506,7 +2506,7 @@ TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
     EXPECT_EQ(request.segments[0].base_offset, 0u);
     EXPECT_EQ(request.segments[0].capacity, 4096u);
     // Partition 列表由 KV PT 生成（slot 数）。
-    EXPECT_EQ(request.partition_ids.size(), cvm::kSlotCount);
+    EXPECT_EQ(request.partition_ids.size(), cvm::SlotCount());
     EXPECT_EQ(request.profile_specs.size(), 1u);
     EXPECT_EQ(request.profile_specs[0].member_count, 2u);
 }
@@ -2766,7 +2766,7 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeBuildsProfilePerMedium) {
     auto result = planner.Plan(request);
     ASSERT_EQ(result.error, ErrorCode::OK) << result.detail;
     // 每个 partition 有 2 个 quota（DRAM 一个、NVMe 一个）。
-    // partition_ids.size() == kSlotCount，quotas.size() == 2 * kSlotCount。
+    // quotas.size() == 2 * SlotCount()。
     EXPECT_EQ(result.snapshot.quotas.size(),
               request.partition_ids.size() * 2);
 }

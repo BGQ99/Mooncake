@@ -269,7 +269,7 @@ class CvmController {
     // ---- RingSlot 归属缓存与 watch（§16.14.6 / §16.19.4）----
     // ring_slots_mutex_ 保护整个视图（group_count + assigns）：
     // RingSlotsWatchLoop / MembershipLoop 写，GetCached* 读。assigns 按
-    // rank 索引，G 上限 kSlotCount，size 与 group_count 允许暂不一致
+    // rank 索引，G 上限 SlotCount()，size 与 group_count 允许暂不一致
     //（成员死亡晋升的修正流未完成时）。
     std::mutex ring_slots_mutex_;
     uint32_t ring_slot_group_count_{0};

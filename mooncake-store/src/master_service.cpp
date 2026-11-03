@@ -1137,7 +1137,7 @@ ErrorCode LoadEffectivePartitionRoute(
             cluster_id, partition_id, route, version);
     }
     if (parsed != partition_id.size() ||
-        numeric >= cvm::kSlotCount) {
+        numeric >= cvm::SlotCount()) {
         return cvm::EtcdViewStore::LoadPartitionRoute(
             cluster_id, partition_id, route, version);
     }
@@ -1600,7 +1600,7 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
                 partition_id.find_first_not_of("0123456789") ==
                     std::string::npos &&
                 partition_id.size() <= 5 &&
-                std::stoul(partition_id) < cvm::kSlotCount;
+                std::stoul(partition_id) < cvm::SlotCount();
             if (numeric_slot) {
                 // The release hook stages state and ACK detaches it. Removing
                 // here would lose the manager before the release hook can
@@ -2196,7 +2196,7 @@ tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExpo
 tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
 MasterService::BuildSlotMetadataExportBatch(
     uint16_t first_slot, uint16_t last_slot, bool require_not_owned) {
-    if (first_slot > last_slot || last_slot >= cvm::kSlotCount)
+    if (first_slot > last_slot || last_slot >= cvm::SlotCount())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     std::shared_ptr<vsegment::VSegmentService> service;
     {
@@ -2603,7 +2603,7 @@ ErrorCode MasterService::ImportSlotMetadata(
 
 ErrorCode MasterService::OnSlotRangeAcquired(
     uint16_t first_slot, uint16_t last_slot, std::vector<ErrorCode>& results) {
-    if (first_slot > last_slot || last_slot >= cvm::kSlotCount)
+    if (first_slot > last_slot || last_slot >= cvm::SlotCount())
         return ErrorCode::INVALID_PARAMS;
     const size_t count = static_cast<size_t>(last_slot) - first_slot + 1;
     results.assign(count, ErrorCode::SLOT_MIGRATING);
@@ -4173,15 +4173,15 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 
 void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
-    expected_owned_.assign(cvm::kSlotCount, false);
+    expected_owned_.assign(cvm::SlotCount(), false);
     for (uint16_t slot : slots) {
-        if (slot < cvm::kSlotCount) {
+        if (slot < cvm::SlotCount()) {
             expected_owned_[slot] = true;
         }
     }
     // Retained slots remain ready. Newly acquired slots are not serviceable
     // until both object metadata and their vsegment state have been installed.
-    ready_owned_.resize(cvm::kSlotCount, false);
+    ready_owned_.resize(cvm::SlotCount(), false);
     uint32_t ready_count = 0;
     for (size_t slot = 0; slot < ready_owned_.size(); ++slot) {
         ready_owned_[slot] = ready_owned_[slot] && expected_owned_[slot];
@@ -4197,7 +4197,7 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
     if (!owned_slot_count_logged_ || slots.size() != last_logged_owned_count_) {
         LOG(INFO) << "Owned slots updated (consistent-hash ring): count="
-                  << slots.size() << "/" << cvm::kSlotCount
+                  << slots.size() << "/" << cvm::SlotCount()
                   << (owned_slot_count_logged_ ? " (changed)" : "");
         owned_slot_count_logged_ = true;
         last_logged_owned_count_ = slots.size();
@@ -4207,9 +4207,9 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
 
 void MasterService::MarkSlotsReady(const std::vector<uint16_t>& slots) {
     std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
-    if (ready_owned_.size() != cvm::kSlotCount) {
+    if (ready_owned_.size() != cvm::SlotCount()) {
         ready_owned_.assign(ready_owned_.size(), false);
-        ready_owned_.resize(cvm::kSlotCount, false);
+        ready_owned_.resize(cvm::SlotCount(), false);
     }
     for (uint16_t slot : slots) {
         if (slot < ready_owned_.size() && slot < expected_owned_.size() &&
@@ -4345,7 +4345,7 @@ ErrorCode MasterService::CheckVSegmentServiceability(
     if (!partition_id.empty() && partition_id.size() <= 5 &&
         partition_id.find_first_not_of("0123456789") == std::string::npos) {
         const auto slot = std::stoul(partition_id);
-        if (slot < cvm::kSlotCount)
+        if (slot < cvm::SlotCount())
             return CheckSlotServiceability(static_cast<uint16_t>(slot));
     }
     return ErrorCode::OK;  // Named Partitions use explicit PartitionRoute.
@@ -6719,7 +6719,7 @@ void MasterService::RestoreFromStandbySnapshot(
         if (kv_partition_enabled) {
             const std::vector<uint16_t> owned_slots = ResolveOwnedSlotsForCvm();
             if (!owned_slots.empty()) {
-                owned_slot_lookup.assign(cvm::kSlotCount, false);
+                owned_slot_lookup.assign(cvm::SlotCount(), false);
                 for (uint16_t slot : owned_slots) {
                     owned_slot_lookup[slot] = true;
                 }

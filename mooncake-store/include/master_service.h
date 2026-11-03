@@ -1806,7 +1806,7 @@ class MasterService {
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
-    // Helper to get the logical slot (Redis Cluster style, 16384 slots) for
+    // Helper to get the configured logical slot for
     // a tenant-scoped key. Slots are the unit of cross-master ownership.
     uint16_t getSlot(const TenantId& tenant_id,
                      const std::string& user_key) const {

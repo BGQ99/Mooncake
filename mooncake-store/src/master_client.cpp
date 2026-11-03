@@ -45,7 +45,7 @@ std::optional<uint16_t> ParsePartitionSlot(
     const char* end = begin + partition_id.size();
     const auto [ptr, error] = std::from_chars(begin, end, value);
     if (partition_id.empty() || error != std::errc{} || ptr != end ||
-        value >= cvm::kSlotCount) {
+        value >= cvm::SlotCount()) {
         return std::nullopt;
     }
     return static_cast<uint16_t>(value);
