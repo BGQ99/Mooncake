@@ -6,10 +6,12 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <algorithm>  // For std::max
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <optional>  // For std::optional
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -126,6 +128,9 @@ DEFINE_int32(
     max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
+DEFINE_int32(admin_metrics_log_interval_sec, 10,
+             "Interval in seconds for the admin metrics log and the periodic "
+             "VSegment status log (clamped to >= 1)");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
@@ -1195,6 +1200,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cvm_http_port = static_cast<uint16_t>(FLAGS_cvm_http_port);
     }
+    if ((google::GetCommandLineFlagInfo("admin_metrics_log_interval_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.admin_metrics_log_interval_sec =
+            std::max(1, FLAGS_admin_metrics_log_interval_sec);
+    }
     if ((google::GetCommandLineFlagInfo("cvm_http_host", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1520,17 +1532,18 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 #ifdef STORE_USE_ETCD
-// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
-// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
-// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
-// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
-// planner CLI 或 master POST /vsegment_quota 端点手工发布。
-void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
-    if (!FLAGS_vsegment_auto_plan) return;
+// --vsegment_auto_plan 策略解析（flags → VSegmentUserPolicy，一次解析两处
+// 使用：启动 bootstrap + supervisor 注入 MasterService 重试组件）。返回空
+// 表示未启用 / 参数不完整 / 后端不符（各告警一次，不阻断启动——quota 可
+// 随后经 planner CLI 或 master POST /vsegment_quota 端点手工发布，参数
+// 补齐后随重启生效）。
+std::optional<mooncake::vsegment::VSegmentUserPolicy>
+BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
+    if (!FLAGS_vsegment_auto_plan) return std::nullopt;
     if (config.ha_backend_type != "etcd") {
         LOG(WARNING) << "--vsegment_auto_plan requires the etcd HA backend; "
                         "skipping";
-        return;
+        return std::nullopt;
     }
     if (FLAGS_vsegment_member_count == 0 || FLAGS_vsegment_stripe_size == 0 ||
         FLAGS_vsegment_member_extent_size == 0) {
@@ -1538,8 +1551,34 @@ void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
             << "--vsegment_auto_plan is enabled but requires "
                "--vsegment_member_count, --vsegment_stripe_size and "
                "--vsegment_member_extent_size; skipping";
-        return;
+        return std::nullopt;
     }
+    mooncake::vsegment::VSegmentUserPolicy policy;
+    policy.member_count = FLAGS_vsegment_member_count;
+    policy.stripe_size = FLAGS_vsegment_stripe_size;
+    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
+    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    LOG(INFO) << "VSegment auto-plan policy: member_count="
+              << policy.member_count << ", stripe_size="
+              << policy.stripe_size << ", member_extent_size="
+              << policy.member_extent_size << ", reserved_ratio="
+              << policy.reserved_ratio << ", required_medium="
+              << (policy.required_medium.empty() ? "auto"
+                                                 : policy.required_medium)
+              << ", io_alignment=" << policy.io_alignment;
+    return policy;
+}
+
+// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
+// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
+// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
+// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
+// planner CLI 或 master POST /vsegment_quota 端点手工发布，或由
+// MasterService::MaybeRetryVSegmentAutoPlan 在运行期节流重试自愈。
+void TryAutoPlanVSegmentQuota(
+    const mooncake::MasterConfig& config,
+    const std::optional<mooncake::vsegment::VSegmentUserPolicy>& policy_opt) {
+    if (!policy_opt) return;
     const std::string connstring = ResolveHABackendConnstring(config);
     if (connstring.empty()) {
         LOG(WARNING) << "vsegment auto-plan: no etcd endpoints configured; "
@@ -1560,11 +1599,7 @@ void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
                   << " already published; skipping";
         return;
     }
-    mooncake::vsegment::VSegmentUserPolicy policy;
-    policy.member_count = FLAGS_vsegment_member_count;
-    policy.stripe_size = FLAGS_vsegment_stripe_size;
-    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
-    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    const auto& policy = *policy_opt;
     std::string summary;
     err = mooncake::vsegment::PlanAndPublishDiscoveredQuota(
         config.cluster_id, policy,
@@ -1572,12 +1607,15 @@ void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
         /*detail=*/nullptr, &summary);
     if (err == mooncake::ErrorCode::OK) {
         LOG(INFO) << "vsegment auto-plan published: " << summary;
+        mooncake::vsegment::LogVSegmentPoolFormed(config.cluster_id);
     } else if (err == mooncake::ErrorCode::ETCD_TRANSACTION_FAIL) {
         LOG(INFO) << "vsegment auto-plan: another instance published "
                      "concurrently; skipping";
     } else {
-        LOG(ERROR) << "vsegment auto-plan failed: "
-                   << mooncake::toString(err);
+        LOG(WARNING) << "VSegment auto-plan deferred: no eligible psegment "
+                        "pool yet ("
+                     << mooncake::toString(err)
+                     << "), will retry on psegment mount / heartbeat";
     }
 }
 #endif  // STORE_USE_ETCD
@@ -1842,13 +1880,31 @@ int main(int argc, char* argv[]) {
     if (master_config.enable_ha) {
 #ifdef STORE_USE_ETCD
         // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
-        // 一次性 bootstrap，仅当快照不存在时执行（详见函数注释）。
-        TryAutoPlanVSegmentQuota(master_config);
+        // 一次性 bootstrap（仅当快照不存在时执行，详见函数注释）；同时把
+        // 策略注入 supervisor → MasterService，供心跳/mount 触发点在快照
+        // 缺失期间节流重试发布（发布侧自愈，
+        // 见 MasterService::MaybeRetryVSegmentAutoPlan）。
+        const auto auto_plan_policy =
+            BuildVSegmentAutoPlanPolicy(master_config);
+        TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
 #endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
+#ifdef STORE_USE_ETCD
+        if (auto_plan_policy) {
+            supervisor_config.vsegment_auto_plan = true;
+            supervisor_config.vsegment_auto_plan_member_count =
+                auto_plan_policy->member_count;
+            supervisor_config.vsegment_auto_plan_stripe_size =
+                auto_plan_policy->stripe_size;
+            supervisor_config.vsegment_auto_plan_member_extent_size =
+                auto_plan_policy->member_extent_size;
+            supervisor_config.vsegment_auto_plan_reserved_ratio =
+                auto_plan_policy->reserved_ratio;
+        }
+#endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         return supervisor.Start();
     } else {
@@ -1879,7 +1935,8 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting);
+            master_config.enable_metric_reporting,
+            master_config.admin_metrics_log_interval_sec);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

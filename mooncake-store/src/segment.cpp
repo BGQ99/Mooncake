@@ -234,6 +234,13 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
     return ErrorCode::OK;
 }
 
+std::shared_ptr<LocalDiskSegment>
+ScopedSegmentAccess::GetClientLocalDiskSegment(const UUID& client_id) const {
+    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
+    return it == segment_manager_->client_local_disk_segment_.end() ? nullptr
+                                                                   : it->second;
+}
+
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
@@ -297,6 +304,31 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
         return false;
     }
     segment = mounted->second.segment;
+    return true;
+}
+
+bool SegmentManager::GetSegmentLocations(
+    const std::vector<UUID>& segment_ids,
+    std::vector<std::string>* endpoints,
+    std::vector<uint64_t>* bases) const {
+    if (!endpoints || !bases) return false;
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    endpoints->clear();
+    bases->clear();
+    endpoints->reserve(segment_ids.size());
+    bases->reserve(segment_ids.size());
+    for (const auto& segment_id : segment_ids) {
+        auto mounted = mounted_segments_.find(segment_id);
+        if (mounted == mounted_segments_.end()) {
+            return false;
+        }
+        const auto& segment = mounted->second.segment;
+        if (segment.te_endpoint.empty()) {
+            return false;
+        }
+        endpoints->push_back(segment.te_endpoint);
+        bases->push_back(static_cast<uint64_t>(segment.base));
+    }
     return true;
 }
 

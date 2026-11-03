@@ -31,6 +31,10 @@ inline std::string ResolveConfiguredHABackendConnstring(
 // The configuration for the master server
 struct MasterConfig {
     bool enable_metric_reporting;
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     uint32_t metrics_port;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
@@ -233,6 +237,10 @@ class MasterServiceSupervisorConfig {
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -257,6 +265,17 @@ class MasterServiceSupervisorConfig {
     // 使用）：见 MasterServiceConfig 同名字段说明。
     std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
     bool cvm_segments_vsegment_exclusive = false;
+    // vsegment auto-plan 重试策略：master.cpp 从 --vsegment_auto_plan /
+    // --vsegment_member_count / --vsegment_stripe_size /
+    // --vsegment_member_extent_size / --vsegment_reserved_ratio flags 解析
+    // 填充（flags 是唯一事实源，不进 JSON schema），supervisor 在 serve
+    // phase 前经 SetVSegmentAutoPlanPolicy 注入 MasterService。
+    // vsegment_auto_plan=false（或 member_count==0）表示未启用。
+    bool vsegment_auto_plan = false;
+    uint32_t vsegment_auto_plan_member_count = 0;
+    uint64_t vsegment_auto_plan_stripe_size = 0;
+    uint64_t vsegment_auto_plan_member_extent_size = 0;
+    double vsegment_auto_plan_reserved_ratio = 0.0;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
@@ -357,6 +376,8 @@ class MasterServiceSupervisorConfig {
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
+        admin_metrics_log_interval_sec =
+            config.admin_metrics_log_interval_sec;
         metrics_port = static_cast<int>(config.metrics_port);
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;

@@ -19,6 +19,12 @@ struct LogicalRange {
 };
 YLT_REFL(LogicalRange, offset, length);
 
+// 写路径加速：结构化相等比较（供 vsegment HA delta 构建使用，替代 JSON
+// 双序列化比较；语义与逐字段 JSON 对比一致）。
+inline bool operator==(const LogicalRange& left, const LogicalRange& right) {
+    return left.offset == right.offset && left.length == right.length;
+}
+
 struct ReservationResult {
     ErrorCode error{ErrorCode::OK};
     LogicalRange range;
@@ -33,6 +39,12 @@ struct ReservationRecord {
 };
 YLT_REFL(ReservationRecord, operation_id, range);
 
+inline bool operator==(const ReservationRecord& left,
+                       const ReservationRecord& right) {
+    return left.operation_id == right.operation_id &&
+           left.range == right.range;
+}
+
 enum class OperationOutcome : uint8_t { COMMITTED, ABORTED, RELEASED };
 struct CompletedOperationRecord {
     std::string operation_id;
@@ -44,6 +56,15 @@ struct CompletedOperationRecord {
 YLT_REFL(CompletedOperationRecord, operation_id, allocation_id, outcome,
          range, completion_revision);
 
+inline bool operator==(const CompletedOperationRecord& left,
+                       const CompletedOperationRecord& right) {
+    return left.operation_id == right.operation_id &&
+           left.allocation_id == right.allocation_id &&
+           left.outcome == right.outcome && left.range == right.range &&
+           left.completion_revision.value_or(0) ==
+               right.completion_revision.value_or(0);
+}
+
 struct LogicalAllocationSnapshot {
     uint64_t logical_capacity{0};
     std::vector<LogicalRange> free_ranges;
@@ -52,6 +73,14 @@ struct LogicalAllocationSnapshot {
 };
 YLT_REFL(LogicalAllocationSnapshot, logical_capacity, free_ranges,
          reservations, completed_operations);
+
+inline bool operator==(const LogicalAllocationSnapshot& left,
+                       const LogicalAllocationSnapshot& right) {
+    return left.logical_capacity == right.logical_capacity &&
+           left.free_ranges == right.free_ranges &&
+           left.reservations == right.reservations &&
+           left.completed_operations == right.completed_operations;
+}
 
 // Tracks only free space and in-flight PutStart reservations. Committed ranges
 // are represented by ObjectMetadata and are returned through Release().

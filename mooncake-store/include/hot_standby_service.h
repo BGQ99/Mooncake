@@ -216,6 +216,37 @@ class HotStandbyService {
         return state_machine_;
     }
 
+    // Simple in-memory metadata store implementation. Public so non-standby
+    // callers (MasterService OpLog self-recovery / cold-takeover replay) can
+    // reuse the same standby-side materialization primitives.
+    class StandbyMetadataStore : public MetadataStore {
+       public:
+        bool PutMetadata(const std::string& tenant_id, const std::string& key,
+                         const StandbyObjectMetadata& metadata) override;
+        bool Put(const std::string& key,
+                 const std::string& payload = std::string()) override;
+        std::optional<StandbyObjectMetadata> GetMetadata(
+            const std::string& tenant_id,
+            const std::string& key) const override;
+        bool Remove(const std::string& tenant_id,
+                    const std::string& key) override;
+        bool Exists(const std::string& tenant_id,
+                    const std::string& key) const override;
+        size_t GetKeyCountForTenant(
+            const std::string& tenant_id) const override;
+        size_t GetKeyCount() const override;
+        void Clear();
+
+        // Snapshot for promotion/restore.
+        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
+
+       private:
+        mutable std::mutex mutex_;
+        std::unordered_map<
+            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
+            store_;
+    };
+
    private:
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
@@ -250,34 +281,6 @@ class HotStandbyService {
 
     HotStandbyConfig config_;
 
-    // Simple in-memory metadata store implementation
-    class StandbyMetadataStore : public MetadataStore {
-       public:
-        bool PutMetadata(const std::string& tenant_id, const std::string& key,
-                         const StandbyObjectMetadata& metadata) override;
-        bool Put(const std::string& key,
-                 const std::string& payload = std::string()) override;
-        std::optional<StandbyObjectMetadata> GetMetadata(
-            const std::string& tenant_id,
-            const std::string& key) const override;
-        bool Remove(const std::string& tenant_id,
-                    const std::string& key) override;
-        bool Exists(const std::string& tenant_id,
-                    const std::string& key) const override;
-        size_t GetKeyCountForTenant(
-            const std::string& tenant_id) const override;
-        size_t GetKeyCount() const override;
-        void Clear();
-
-        // Snapshot for promotion/restore.
-        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
-
-       private:
-        mutable std::mutex mutex_;
-        std::unordered_map<
-            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
-            store_;
-    };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};

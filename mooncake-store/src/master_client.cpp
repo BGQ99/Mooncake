@@ -1,4 +1,4 @@
-﻿#include "master_client.h"
+#include "master_client.h"
 
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
@@ -36,6 +36,8 @@
 
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
+
+#include <optional>
 #include "spdiag/auto_perf.h"
 
 #if defined(MOONCAKE_RPC_SUBMIT_DIAG_BUILD) && \
@@ -54,7 +56,7 @@ std::optional<uint16_t> ParsePartitionSlot(
     const char* end = begin + partition_id.size();
     const auto [ptr, error] = std::from_chars(begin, end, value);
     if (partition_id.empty() || error != std::errc{} || ptr != end ||
-        value >= cvm::kSlotCount) {
+        value >= cvm::SlotCount()) {
         return std::nullopt;
     }
     return static_cast<uint16_t>(value);
@@ -78,16 +80,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetVSegmentView> {
-    static constexpr const char* value = "GetVSegmentView";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
-    static constexpr const char* value = "GetPSegmentEndpoint";
 };
 
 template <>
@@ -670,6 +662,12 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             }
         }());
     if (breakdown_log) {
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+        // client_overhead_us: local code time excluding the RPC wire call
+        // (pool lookup + future get + result parse + call-site glue).
         MC_LOG(INFO) << "master_rpc_client_breakdown method="
                      << RpcNameTraits<ServiceMethod>::value
                      << " pool_lookup_us="
@@ -680,10 +678,8 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                      << " result_get_us=" << result_get_us
                      << " result_parse_us=" << result_parse_us
                      << pool_timing
-                     << " total_us="
-                     << std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - total_start)
-                            .count()
+                     << " client_overhead_us=" << (total_us - rpc_call_us)
+                     << " total_us=" << total_us
                      << " status=" << (rpc_result ? "ok" : "rpc_fail");
     }
     return rpc_result;
@@ -858,9 +854,21 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     RoutedCallTiming* timing, const std::string& tenant_id,
-    const std::string& key, Args... args) {
+    const std::string& key, uint32_t rpc_stat_key, Args... args) {
     const auto t_routed_start = std::chrono::steady_clock::now();
+    // 可选的 SpDiag 统计（首段 RPC = 发起 ylt 请求到拿到结果的时延，与
+    // timing->rpc_first_us 同区间）：仅显式传入 PerfKey 的调用方记录
+    // （Query 传 QUERY_RPC_CALL），默认 0 不记录——本模板被 7 个 routed
+    // RPC 共享，不得污染彼此统计。PerfPoint 驻留协程帧按墙钟计量。
+    std::optional<SpDiag::PerfPoint> pt_rpc;
+    if (rpc_stat_key != 0) {
+        pt_rpc.emplace(rpc_stat_key, SpDiag::PerfLevel::MODULE);
+        pt_rpc->Start();
+    }
     auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+    if (pt_rpc) {
+        pt_rpc->End(result ? 0 : -1);
+    }
     if (timing) {
         timing->rpc_first_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t_routed_start)
@@ -966,6 +974,110 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     }
 
     return result;
+}
+
+template <typename ResultType, typename SendGroupFn>
+void MasterClient::RetryBatchOnStaleRoute(
+    const std::string& tenant_id, const std::vector<std::string>& keys,
+    std::vector<tl::expected<ResultType, ErrorCode>>& results,
+    SendGroupFn send_group) {
+    // 与 InvokeRoutedWithSlotRetry 同源的路由自愈，粒度从单 key 扩展为
+    // 失败子集：批量分组 RPC 的逐 key 结果由服务端逐 key 判定，路由瞬态
+    // （迁移窗口/成员切换/auto-plan 尚未收敛）只会命中批内一部分 key。
+    // 只重发失败 key（成功 key 的结果绝不被二次写入），有界 1 次。
+    // 收集四类可重试失败：
+    //   - STALE_ROUTE / SLOT_NOT_OWNED：路由过期 → 刷新路由 + 重分组重发；
+    //   - SLOT_MIGRATING：owner 已 expected 但元数据未就绪（迁移窗口）→
+    //     轻量退避一轮后与上类共用同一次重发（单 key 路径的 3 次退避在
+    //     batch 聚合下收敛为 1 次，秒级导入完成即成功，未完成靠上层重试）；
+    //   - UNAVAILABLE_IN_CURRENT_STATUS：首轮空分组占位（无 owner，可能
+    //     为 rank 空缺瞬态）→ 刷新后重分组可修复；服务端若真返回同码，
+    //     重发后仍失败保持终态，语义不变。
+    if (keys.size() != results.size()) {
+        return;  // 规模不匹配属调用方缺陷：保持首轮结果，不重试
+    }
+    std::vector<std::string> failed_keys;
+    std::vector<size_t> orig_indices;
+    bool has_migrating = false;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            const ErrorCode err = results[i].error();
+            if (err == ErrorCode::STALE_ROUTE ||
+                err == ErrorCode::SLOT_NOT_OWNED ||
+                err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                failed_keys.push_back(keys[i]);
+                orig_indices.push_back(i);
+            } else if (err == ErrorCode::SLOT_MIGRATING) {
+                has_migrating = true;
+                failed_keys.push_back(keys[i]);
+                orig_indices.push_back(i);
+            }
+        }
+    }
+    if (failed_keys.empty()) {
+        return;
+    }
+
+    // 迁移窗口轻量退避（仅含 MIGRATING 时）：给 slot import/OpLog replay
+    // 一个就绪窗口再重发，避免立即重发必然再次 MIGRATING。
+    if (has_migrating) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+
+    // 节流告警：与单 key 路径同款（首条立即、其后 60s 一条 + 窗口累计），
+    // 迁移/切换窗口内批量重试高频，绝不逐批打印。计数器按模板实例隔离，
+    // 实例数由批结果类型决定（有界）。
+    static std::atomic<uint64_t> batch_route_retry_count{0};
+    static std::atomic<int64_t> last_batch_route_retry_warn_ms{0};
+    batch_route_retry_count.fetch_add(1, std::memory_order_relaxed);
+    const int64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    int64_t last_ms =
+        last_batch_route_retry_warn_ms.load(std::memory_order_relaxed);
+    if ((last_ms == 0 || now_ms - last_ms >= 60000) &&
+        last_batch_route_retry_warn_ms.compare_exchange_strong(
+            last_ms, now_ms, std::memory_order_relaxed)) {
+        const uint64_t suppressed = batch_route_retry_count.exchange(
+            0, std::memory_order_relaxed);
+        LOG(WARNING) << "batch RPC hit routing transient (STALE_ROUTE/"
+                     << "SLOT_NOT_OWNED/SLOT_MIGRATING/no-owner), retried "
+                        "failed keys after refresh: "
+                     << suppressed << " batches since last notice";
+    }
+
+    // 打点复用单 key 路径的 CVM_ROUTE_STALE_RETRY：正常≈0，飙升即迁移动荡；
+    // 子集重新分组沿用 GroupKeysBySubmaster（自带 RouteGroup 子打点）。
+    SpDiag::PerfPoint pt_retry(PerfKey::CVM_ROUTE_STALE_RETRY,
+                               SpDiag::PerfLevel::KEY_MODULE);
+    pt_retry.Start();
+    if (RefreshSubmasterRouting() != ErrorCode::OK) {
+        // 刷新失败（etcd 瞬态）：保持首轮错误；后台 5s 路由刷新线程兜底。
+        pt_retry.End(-1);
+        return;
+    }
+    auto groups = GroupKeysBySubmaster(failed_keys, tenant_id);
+    bool all_ok = true;
+    for (auto& [submaster, local_indices] : groups) {
+        if (submaster.empty()) {
+            // 刷新后仍无 owner（rank 空缺/整段迁移中）：保持原终态错误。
+            all_ok = false;
+            continue;
+        }
+        std::vector<std::string> group_keys;
+        std::vector<size_t> group_orig;
+        group_keys.reserve(local_indices.size());
+        group_orig.reserve(local_indices.size());
+        for (size_t local : local_indices) {
+            group_keys.push_back(failed_keys[local]);
+            group_orig.push_back(orig_indices[local]);
+        }
+        if (!send_group(submaster, std::move(group_keys), group_orig)) {
+            all_ok = false;
+        }
+    }
+    pt_retry.End(all_ok ? 0 : -1);
 }
 
 MasterClient::~MasterClient() = default;
@@ -1237,8 +1349,8 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::ExistKey,
                                             bool>(
-        /*timing=*/nullptr, tenant_id_.value(), object_key, object_key,
-        tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), object_key,
+        /*rpc_stat_key=*/0, object_key, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1283,6 +1395,31 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<bool>(
+        tenant_id_.value(), object_keys, results,
+        [this, &results, tid = tenant_id_.value()](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+                    group_keys.size(), group_keys, tid);
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " keys");
     return results;
 }
@@ -1342,26 +1479,6 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
     return GetReplicaList(object_key, tenant_id_.value());
-}
-
-tl::expected<vsegment::VSegmentView, ErrorCode>
-MasterClient::GetVSegmentView(const std::string& partition_id,
-                              const std::string& vsegment_id) {
-    auto target = ResolveVSegmentSubmaster(partition_id);
-    if (!target) return tl::make_unexpected(target.error());
-    if (!target->empty()) {
-        return invoke_rpc_to<&WrappedMasterService::GetVSegmentView,
-                             vsegment::VSegmentView>(*target, partition_id,
-                                                     vsegment_id);
-    }
-    return invoke_rpc<&WrappedMasterService::GetVSegmentView,
-                      vsegment::VSegmentView>(partition_id, vsegment_id);
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-MasterClient::GetPSegmentEndpoint(const std::string& segment_id) {
-    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint,
-                      vsegment::PSegmentLocation>(segment_id);
 }
 
 vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
@@ -1434,20 +1551,32 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     // 与 routed（RPC 含重试/退避）分段。与 invoke_rpc 内层的
     // master_rpc_client_breakdown（pool_lookup/rpc_call/result_get）互补。
     const auto t0 = std::chrono::steady_clock::now();
+    // SpDiag 统计：Query 三段下钻（与 query_rpc_breakdown trace 字段同区
+    // 间）——RouteSwitch（路由解析/切换）、RpcCall（InvokeRoutedWithSlotRetry
+    // 内首段 RPC，见其 rpc_stat_key 参数）、RpcTotal（路由+RPC 全程）。统
+    // 计值与 trace 的 switch_us/rpc_first_us/total_us 可直接交叉对账。
+    SpDiag::PerfPoint pt_total(PerfKey::QUERY_RPC_TOTAL,
+                               SpDiag::PerfLevel::MODULE);
+    pt_total.Start();
     int64_t switch_us = 0;
     RoutedCallTiming timing;
 
     ErrorCode switch_err;
     {
+        SpDiag::PerfPoint pt_switch(PerfKey::QUERY_ROUTE_SWITCH,
+                                    SpDiag::PerfLevel::MODULE);
+        pt_switch.Start();
         const auto t_switch = std::chrono::steady_clock::now();
         switch_err = SwitchToSubmaster(tenant_id, object_key);
         switch_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_switch)
                 .count();
+        pt_switch.End(switch_err == ErrorCode::OK ? 0 : -1);
     }
     if (switch_err != ErrorCode::OK) {
         timer.LogResponse("error_code=", switch_err);
+        pt_total.End(-1);
         MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key
                      << "] switch_us[" << switch_us << "] rpc_first_us[0]"
                      << "] total_us["
@@ -1460,10 +1589,12 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = InvokeRoutedWithSlotRetry<
-        &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
-        &timing, tenant_id, object_key, object_key, tenant_id, trace_id,
-        client_id_);
+    auto result =
+        InvokeRoutedWithSlotRetry<&WrappedMasterService::GetReplicaList,
+                                  GetReplicaListResponse>(
+            &timing, tenant_id, object_key,
+            /*rpc_stat_key=*/static_cast<uint32_t>(PerfKey::QUERY_RPC_CALL),
+            object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
 
     const char* status = "ok";
@@ -1488,6 +1619,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
                  << "] retry_count[" << timing.retry_count
                  << "] backoff_count[" << timing.backoff_count << "] status["
                  << status << "]";
+    pt_total.End(result ? 0 : -1);
     return result;
 }
 
@@ -1543,6 +1675,33 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<GetReplicaListResponse>(
+        tenant_id, object_keys, results,
+        [this, &results, tenant_id, trace_id](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                                 GetReplicaListResponse>(
+                    group_keys.size(), group_keys, tenant_id, trace_id,
+                    client_id_);
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1568,13 +1727,14 @@ MasterClient::PutStart(const std::string& key,
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::PutStart, PutStartResult>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        total_slice_length, config, tenant_id_.value(), trace_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, total_slice_length, config, tenant_id_.value(),
+        trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
@@ -1598,16 +1758,16 @@ MasterClient::BatchPutStart(
     if (partition_router_.Size() == 0) {
         auto result =
             invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                             std::vector<Replica::Descriptor>>(
+                             PutStartResult>(
                 keys.size(), client_id_, keys, total_slice_lengths, config,
                 tenant_id_.value(), trace_id);
         timer.LogResponse("result=", result.size(), " operations");
         return result;
     }
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results(keys.size(),
-                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
 
     auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
     for (auto& [submaster, indices] : groups) {
@@ -1628,14 +1788,46 @@ MasterClient::BatchPutStart(
         }
 
         auto group_result = invoke_batch_rpc<
-            &WrappedMasterService::BatchPutStart,
-            std::vector<Replica::Descriptor>>(
+            &WrappedMasterService::BatchPutStart, PutStartResult>(
             group_keys.size(), client_id_, group_keys,
             group_total_slice_lengths, config, tenant_id_.value(), trace_id);
         for (size_t j = 0; j < indices.size(); ++j) {
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误
+    //（Client::StartBatchPut 收到后走 SetTerminalError，不再有下一轮）。
+    RetryBatchOnStaleRoute<PutStartResult>(
+        tenant_id_.value(), keys, results,
+        [this, &results, &config, &total_slice_lengths, trace_id](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            std::vector<uint64_t> group_total_slice_lengths;
+            group_total_slice_lengths.reserve(group_orig.size());
+            for (size_t idx : group_orig) {
+                group_total_slice_lengths.push_back(total_slice_lengths[idx]);
+            }
+            auto group_result = invoke_batch_rpc<
+                &WrappedMasterService::BatchPutStart, PutStartResult>(
+                group_keys.size(), client_id_, group_keys,
+                group_total_slice_lengths, config, tenant_id_.value(),
+                trace_id);
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1656,8 +1848,9 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutEnd,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
-        object_meta, replica_type, tenant_id_.value(), trace_id, operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key,
+        /*rpc_stat_key=*/0, client_id_, object_meta, replica_type,
+        tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1712,6 +1905,37 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id_.value(), keys, results,
+        [this, &results, &object_metas, replica_type, trace_id](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            std::vector<ObjectMeta> group_object_metas;
+            group_object_metas.reserve(group_orig.size());
+            for (size_t idx : group_orig) {
+                group_object_metas.push_back(object_metas[idx]);
+            }
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
+                    group_object_metas.size(), client_id_, group_object_metas,
+                    replica_type, tenant_id_.value(), trace_id);
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1730,8 +1954,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutRevoke,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1778,6 +2002,32 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id_.value(), keys, results,
+        [this, &results, replica_type](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
+                    group_keys.size(), client_id_, group_keys, replica_type,
+                    tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1802,8 +2052,8 @@ MasterClient::UpsertStart(const std::string& key,
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertStart, PutStartResult>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        total_slice_length, config, tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, total_slice_length, config, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1868,6 +2118,38 @@ MasterClient::BatchUpsertStart(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<std::vector<Replica::Descriptor>>(
+        tenant_id_.value(), keys, results,
+        [this, &results, &total_slice_lengths, &config](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            std::vector<uint64_t> group_total_slice_lengths;
+            group_total_slice_lengths.reserve(group_orig.size());
+            for (size_t idx : group_orig) {
+                group_total_slice_lengths.push_back(total_slice_lengths[idx]);
+            }
+            auto group_result = invoke_batch_rpc<
+                &WrappedMasterService::BatchUpsertStart,
+                std::vector<Replica::Descriptor>>(
+                group_keys.size(), client_id_, group_keys,
+                group_total_slice_lengths, config, tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1887,8 +2169,9 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
                                             void>(
-        /*timing=*/nullptr, tenant_id_.value(), object_meta.key, client_id_,
-        object_meta, replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), object_meta.key,
+        /*rpc_stat_key=*/0, client_id_, object_meta, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1941,6 +2224,37 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id_.value(), keys, results,
+        [this, &results, &object_metas](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            std::vector<ObjectMeta> group_object_metas;
+            group_object_metas.reserve(group_orig.size());
+            for (size_t idx : group_orig) {
+                group_object_metas.push_back(object_metas[idx]);
+            }
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
+                    group_object_metas.size(), client_id_, group_object_metas,
+                    tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -1959,8 +2273,8 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
 
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertRevoke, void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, client_id_, key,
-        replica_type, tenant_id_.value(), operation_id);
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
+        client_id_, key, replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2005,6 +2319,32 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id_.value(), keys, results,
+        [this, &results](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke,
+                                 void>(group_keys.size(), client_id_,
+                                       group_keys, tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -2021,8 +2361,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     }
 
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::Remove, void>(
-        /*timing=*/nullptr, tenant_id_.value(), key, key, force,
-        tenant_id_.value());
+        /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0, key,
+        force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2087,6 +2427,31 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id_.value(), keys, results,
+        [this, &results, force](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchRemove, void>(
+                    group_keys.size(), group_keys, force, tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }
@@ -2898,6 +3263,34 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
             results[indices[j]] = std::move(group_result[j]);
         }
     }
+
+    // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
+    // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
+    // tenant_id 为显式入参（调用方按 task 携带 tenant 定向），捕获引用
+    // 在同步执行窗口内有效。
+    RetryBatchOnStaleRoute<void>(
+        tenant_id, keys, results,
+        [this, &results, &tenant_id, replica_type](
+            const std::string& submaster, std::vector<std::string> group_keys,
+            const std::vector<size_t>& group_orig) {
+            SwitchToSubmasterByAddress(submaster);
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica,
+                                 void>(group_keys.size(), client_id_,
+                                       group_keys, tenant_id, replica_type);
+            if (group_result.size() != group_orig.size()) {
+                return false;
+            }
+            bool all_ok = true;
+            for (size_t j = 0; j < group_orig.size(); ++j) {
+                results[group_orig[j]] = std::move(group_result[j]);
+                if (!results[group_orig[j]]) {
+                    all_ok = false;
+                }
+            }
+            return all_ok;
+        });
+
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }

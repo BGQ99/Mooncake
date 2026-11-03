@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "vsegment/vsegment.h"
@@ -35,12 +36,55 @@ struct PartitionVSegmentSnapshot {
 YLT_REFL(PartitionVSegmentSnapshot, partition_id, config_generation,
          route_epoch, metadata_revision, vsegments, operation_vsegments);
 
+// An accepted journal submission; storage durability may be awaited separately.
+class VSegmentDeferredCommitHandle {
+   public:
+    virtual ~VSegmentDeferredCommitHandle() = default;
+};
+
 class VSegmentStateCommitter {
    public:
     virtual ~VSegmentStateCommitter() = default;
     virtual ErrorCode Commit(const PartitionVSegmentSnapshot& state,
                              const std::string& mutation,
                              std::string* detail) = 0;
+    // Synchronous committers remain compatible and return an empty handle.
+    virtual ErrorCode CommitDeferred(
+        const PartitionVSegmentSnapshot& state, const std::string& mutation,
+        std::shared_ptr<VSegmentDeferredCommitHandle>* handle,
+        std::string* detail) {
+        const auto error = Commit(state, mutation, detail);
+        if (handle) handle->reset();
+        return error;
+    }
+    virtual ErrorCode WaitDurable(
+        const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
+        std::string* /*detail*/) {
+        (void)handle;
+        return ErrorCode::OK;
+    }
+};
+
+// Explicit ownership of accepted commits. Callers must flush
+// before publishing readiness or acknowledging a metadata handoff.
+class VSegmentCommitBatch {
+   public:
+    void Add(std::shared_ptr<VSegmentStateCommitter> committer,
+             std::shared_ptr<VSegmentDeferredCommitHandle> handle) {
+        if (handle) commits_[std::move(committer)] = std::move(handle);
+    }
+    ErrorCode Flush(std::string* detail = nullptr) {
+        for (const auto& [committer, handle] : commits_) {
+            const auto error = committer->WaitDurable(handle, detail);
+            if (error != ErrorCode::OK) return error;
+        }
+        commits_.clear();
+        return ErrorCode::OK;
+    }
+
+   private:
+    std::unordered_map<std::shared_ptr<VSegmentStateCommitter>,
+                       std::shared_ptr<VSegmentDeferredCommitHandle>> commits_;
 };
 
 struct VSegmentPutStartResult {
@@ -87,6 +131,12 @@ class VSegmentManager {
                     std::shared_ptr<VSegmentStateCommitter> committer,
                     size_t max_operation_tombstones = 4096);
 
+    VSegmentManager(std::vector<PartitionVSegmentConfig> configs,
+                    const std::vector<VSegmentProfile>& profiles,
+                    std::string default_profile,
+                    std::shared_ptr<VSegmentStateCommitter> committer,
+                    size_t max_operation_tombstones = 4096);
+
     VSegmentAllocationResult Create(const std::string& profile_name);
     // Hot-path API: starts at most one background creation per
     // partition/profile and asks callers to retry while it is running.
@@ -97,9 +147,17 @@ class VSegmentManager {
                                     const std::string& profile_name = {},
                                     uint64_t expected_route_epoch = 0,
                                     const std::vector<std::string>&
-                                        excluded_vsegments = {});
+                                        excluded_vsegments = {},
+                                    VSegmentCommitBatch* batch = nullptr);
     ErrorCode SetRouteEpoch(uint64_t route_epoch);
-    ErrorCode EnsureInitialVSegments(std::string* detail = nullptr);
+    // A supplied batch defers the durability barrier to the caller.
+    ErrorCode EnsureInitialVSegments(std::string* detail = nullptr,
+                                     VSegmentCommitBatch* batch = nullptr);
+    ErrorCode WaitForDurable(
+        const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
+        std::string* detail = nullptr);
+    uint64_t RouteEpoch() const;
+    ErrorCode Deactivate(uint64_t route_epoch);
     ReservationResult ReservePut(const std::string& vsegment_id,
                                  const std::string& operation_id,
                                  uint64_t length,
@@ -109,7 +167,8 @@ class VSegmentManager {
                         const std::string& allocation_id,
                         LogicalRange* range = nullptr,
                         uint64_t expected_route_epoch = 0,
-                        const LogicalRange* expected_range = nullptr);
+                        const LogicalRange* expected_range = nullptr,
+                        VSegmentCommitBatch* batch = nullptr);
     ErrorCode AbortPut(const std::string& vsegment_id,
                        const std::string& operation_id,
                        uint64_t expected_route_epoch = 0);
@@ -138,6 +197,7 @@ class VSegmentManager {
     // provider 内的 invalid 锁（与 MountSegment 自愈 erase 方向一致）。
     void SetExcludedSegmentsProvider(
         std::function<std::set<std::string>()> provider) {
+        std::lock_guard<std::mutex> lock(mutex_);
         excluded_segments_provider_ = std::move(provider);
     }
 
@@ -150,10 +210,17 @@ class VSegmentManager {
     };
 
     VSegmentAllocationResult CreateSingleFlight(const std::string& profile_name,
-                                                 uint64_t expected_route_epoch = 0);
+                                                 uint64_t expected_route_epoch = 0,
+                                                 bool single_phase_persist = false,
+                                                 VSegmentCommitBatch* batch = nullptr);
+    VSegmentAllocationResult FinishCreate(VSegmentAllocationResult result);
     PartitionVSegmentSnapshot SnapshotLocked() const;
     ErrorCode PersistLocked(const std::string& mutation,
                             std::string* detail = nullptr);
+    // Submits under mutex_; the caller waits after releasing it.
+    ErrorCode PersistDeferredLocked(
+        const std::string& mutation, std::string* detail = nullptr,
+        std::shared_ptr<VSegmentDeferredCommitHandle>* fence_out = nullptr);
     void TrimOperationTombstonesLocked(ManagedVSegment& managed,
                                        size_t max_completed);
     std::string partition_id_;
@@ -169,6 +236,10 @@ class VSegmentManager {
     uint64_t route_epoch_{0};
     uint64_t metadata_revision_{0};
     std::shared_ptr<VSegmentStateCommitter> committer_;
+    // Also fences idempotent reads of an accepted, not-yet-durable mutation.
+    std::shared_ptr<VSegmentDeferredCommitHandle> latest_persist_;
+    std::mutex initial_creation_mutex_;
+    bool owned_{true};
     size_t max_operation_tombstones_{4096};
     mutable std::mutex pending_mutex_;
     std::unordered_map<std::string,

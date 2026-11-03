@@ -49,6 +49,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "vsegment/partition_quota_planner.h"
 #include "vsegment/vsegment_service.h"
 
 namespace mooncake {
@@ -185,9 +186,20 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+
+    // vsegment/psegment 术语的单行状态摘要（enabled/generation/profiles/
+    // installed partitions/vsegment count/池组成），供 admin 周期日志线程
+    // 输出独立的 "VSegment Status" 行。
+    std::string GetVSegmentStatusLogLine() const;
     void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
         vsegment_service_ = std::move(service);
     }
+    // supervisor 注入 vsegment auto-plan 重试策略（master --vsegment_auto_plan
+    // 系 flags 解析而来，serve phase 前设置一次）。member_count==0（默认，未
+    // 注入）表示关闭。注入后由 MaybeRetryVSegmentAutoPlan 在心跳与 mount
+    // 端点两个低频触发点重试发布配额快照，修复「submaster 先于 client 启动
+    // 时一次性 bootstrap 发现零段而永久放弃」的时序死锁。
+    void SetVSegmentAutoPlanPolicy(const vsegment::VSegmentUserPolicy& policy);
     const std::vector<vsegment::PartitionVSegmentSnapshot>&
     recovered_vsegment_snapshots() const {
         return recovered_vsegment_snapshots_;
@@ -195,10 +207,20 @@ class MasterService {
     void ClearRecoveredVSegmentSnapshots() {
         recovered_vsegment_snapshots_.clear();
     }
-    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& partition_id, const std::string& vsegment_id);
-    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
+    // 测试专用：阻塞等待 stale-evict 异步 drain 队列清空（含 1s debounce
+    // 与在途请求），上限 5s。生产代码勿用；non-etcd 构建为空操作。
+    void FlushStaleEvictQueueForTesting();
+    // Builds a deduplicated layout table for the given (partition_id,
+    // vsegment_id) pairs. Best-effort: entries that cannot be resolved are
+    // omitted (hard C has no legacy fallback; callers fail for those
+    // vsegments).
+    std::vector<VSegmentLayoutEntry> BuildVSegmentLayoutTable(
+        const std::vector<std::pair<std::string, std::string>>& vsegments);
+    // Attaches the runtime layout table for the vsegment replicas contained in
+    // `response`. No-op when the response has no vsegment replica or when the
+    // table cannot be resolved (best-effort; the client falls back).
+    void EnrichVSegmentLayouts(GetReplicaListResponse* response);
+    void InvalidateVSegmentLayoutCache();
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -290,6 +312,15 @@ class MasterService {
     tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
     InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
                                const std::string& requester_master_id);
+
+    // 心跳交接专用的批量导出变体（slot 就绪加速）：与 InterMasterExportSlotBatch
+    // 的差异在未 staged 的 slot——不做无门控即时构建，仅当本机已观察到失去该
+    // slot 归属（require_not_owned 门控）时才即时构建；仍持有归属的 slot 不出现
+    // 在响应中（调用方对其走单 slot 路径重试）。心跳交接路径没有 kMigrating
+    // 冻结写，快照稳定性完全依赖「源已观察到 lost 并停服」。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatchGated(uint16_t first_slot, uint16_t last_slot,
+                                    const std::string& requester_master_id);
 
     // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
     //（DropSlotMetadataRange）。源未观察到归属已切走时返回
@@ -1042,6 +1073,50 @@ class MasterService {
             vsegment_partitions = {});
 
     /**
+     * @name OpLog 流自恢复（冷接管 / 同身份重启）
+     *
+     * 复用 standby 侧原语（StandbyMetadataStore + OpLogApplier +
+     * OpLogBatchStandbyReader）按 source_id 重放一条 OpLog 流并导出
+     * 恢复态，供 RestoreFromStandbySnapshot 物化（P4 slot 过滤自动
+     * 只落本机 owned slots）。
+     *
+     * 适用：流主已消亡（lease 过期冷接管）或本机重启（serve 前无写入）。
+     * 约束：受 etcd compaction 窗口限制（默认 5m），越窗重放失败回退
+     * 旧语义（判空、客户端重建）。
+     */
+    ///@{
+    ErrorCode RecoverStateFromOpLogStream(
+        const std::string& source_id, bool& stream_present,
+        std::vector<StandbyObjectEntry>& objects,
+        std::vector<StandbySegmentInfo>& segments,
+        std::vector<vsegment::PartitionVSegmentSnapshot>& vsegment_partitions);
+
+    // 同身份重启失忆自愈：无 PromotionContext 时从本机流自恢复。
+    // serve 启动时调用一次；成功后登记 source 防止 ImportSlotMetadata
+    // 路径重复重放。
+    bool TrySelfRecoverFromOpLog();
+
+    // 死 owner（或自身旧世代）冷接管重放：ImportSlotMetadata 判空分支
+    // 前调用；每个 source 定局后仅尝试一次，瞬态失败可下轮重试。
+    bool TryRecoverFromDeadOwnerOpLog(const std::string& source_id);
+
+    // 环互备领养物化（互备 1.4）：supervisor RingStandbyRuntime 在
+    // ring-adopt staging（kMigrating 写屏障）期间的编排入口。与
+    // TryRecoverFromDeadOwnerOpLog 同通道（重放 source_id 流 + P4
+    // owned-slot 过滤 + 定局登记 + RestoreFromStandbySnapshot 物化，
+    // 幂等：已定局短路返回 OK），但返回 ErrorCode 三态供编排方决策：
+    //   OK        —— 已物化或已定局，可 CAS kMigrating→kStable 收尾；
+    //   INCOMPLETE_OPLOG_CATCH_UP —— 30s 重放预算耗尽（etcd 抖动），
+    //                瞬态：不收尾，写屏障保持，下轮重试；
+    //   其余 FATAL —— 流不可恢复（越窗 / durable prefix 缺失等）或
+    //                OpLog 未启用（UNAVAILABLE_IN_CURRENT_STATUS）：
+    //                按既有冷接管回退语义（判空、客户端冷重建）可收尾，
+    //                调用方须告警。stream_present 仅诊断（false=流不存在）。
+    ErrorCode AdoptMaterializeFromDeadOwner(const std::string& source_id,
+                                            bool& stream_present);
+    ///@}
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -1731,7 +1806,7 @@ class MasterService {
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
-    // Helper to get the logical slot (Redis Cluster style, 16384 slots) for
+    // Helper to get the configured logical slot for
     // a tenant-scoped key. Slots are the unit of cross-master ownership.
     uint16_t getSlot(const TenantId& tenant_id,
                      const std::string& user_key) const {
@@ -2009,6 +2084,24 @@ class MasterService {
     // Used to wake task cleanup thread immediately during shutdown.
     std::mutex task_cleanup_mutex_;
     std::condition_variable task_cleanup_cv_;
+
+    // Stale-generation eviction async drain（方案一 A 异步化）：纯 cv 唤醒
+    // 无空轮询；drain 前有 1s debounce 合并挂载风暴（worker 启动连挂
+    // N 段 → 一次 drain，而非 N 次全 host 扫描）。仅在 etcd 构建启动。
+    struct StaleEvictRequest {
+        std::string host_id;
+        std::string segment_name;
+        std::string te_endpoint;
+        UUID mounting_client;
+    };
+    std::thread stale_evict_thread_;
+    std::atomic<bool> stale_evict_running_{false};
+    std::mutex stale_evict_queue_mutex_;
+    std::condition_variable stale_evict_cv_;
+    std::vector<StaleEvictRequest> stale_evict_queue_;
+    // 入队未处理计数（含已 swap 出队列但在途的）：测试冲刷等待用。
+    // 去重覆盖不重复计数。
+    std::atomic<int> stale_evict_pending_{0};
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {
@@ -2442,11 +2535,86 @@ class MasterService {
     // etcd publication). Only started in HA mode when a stable master_id is
     // configured.
     std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
+    // slot_owner_heartbeat_ 生命周期写（Start/Stop 路径）与跨线程 Kick 读的
+    // 互斥：Kick 触发点在心跳线程之外（后台首建线程、mount RPC 线程），
+    // 防止对 unique_ptr 的并发读写。锁内绝不 join（Stop 在锁外执行）。
+    std::mutex slot_heartbeat_kick_mutex_;
+    void KickSlotHeartbeat();  // 事件驱动触发下一轮立即 reconcile（见 SlotOwnerHeartbeat::Kick）
     // Inter-master RPC client (CVM multi-submaster coordination): etcd-driven
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
     std::shared_ptr<vsegment::VSegmentService> vsegment_service_;
+    // vsegment_service_ 首建互斥（双检锁内层）：同步路径（冷启动）与后台首
+    // 建线程共用；临界区仅含 Load + make_shared + provider 注入（毫秒级），
+    // 锁等待可忽略；稳态走外层空判快路径，零成本。
+    std::mutex vsegment_service_init_mutex_;
+    // Runtime-resolved vsegment layouts for inline responses, keyed by
+    // vsegment_id. Cleared on segment lifecycle changes; best-effort entries
+    // are omitted on resolution failure.
+    mutable std::mutex vsegment_layout_cache_mutex_;
+    std::unordered_map<std::string, VSegmentLayoutEntry>
+        vsegment_layout_cache_;
+    // ----- vsegment 首建状态机（运行期异步门控）-----
+    // 心跳线程绝不内联执行分钟级的「首建 + 首次全量 reconcile sweep」：
+    //   kIdle       未初始化（或后台初始化失败已复位，等待重触发）
+    //   kInProgress 后台初始化线程执行 Load → 首建 → 首次全量 sweep
+    //   kReady      vsegment_service_ 已发布且首次 sweep 已完成
+    // 门控期间所有 RefreshVSegmentOwnership 运行期调用返回
+    // VSEGMENT_SERVICE_NOT_READY——对全部调用方均为可重试语义：
+    // slot_migrator 的 on_acquire pending 路径、P4 reshard 下一轮重拉、
+    // 心跳周期 reconcile 跳过本周期。冷启动（StartSlotOwnerHeartbeat
+    // 初始调用，gate 置 true 之前）仍走同步路径，错误硬失败启动，与历史
+    // 行为一致。
+    // kNoQuota: the quota snapshot is absent (vsegment disabled or not yet
+    // published). Slot readiness does NOT depend on vsegment in this state —
+    // the runtime gate must let slot imports proceed (mirrors the cold-start
+    // semantics of RefreshVSegmentOwnership for ETCD_KEY_NOT_EXIST). The
+    // background init thread keeps re-probing each heartbeat so a runtime
+    // quota publish (auto-plan / POST) transitions to kReady.
+    enum class VSegmentInitState { kIdle, kInProgress, kReady, kNoQuota };
+    std::atomic<VSegmentInitState> vsegment_init_state_{
+        VSegmentInitState::kIdle};
+    // Independent re-probe in-flight flag for the background init thread.
+    // Never encoded into vsegment_init_state_: encoding it (the kNoQuota ->
+    // kInProgress CAS) turned every slot-admission release into a full
+    // kInProgress window (init thread's etcd Get), throttling slot readiness
+    // to ~1 slot per heartbeat. With this flag the spawn path is invisible
+    // to the gate: kNoQuota stays kNoQuota while probing.
+    std::atomic<bool> vsegment_init_probe_in_flight_{false};
+    std::thread vsegment_init_thread_;
+    std::mutex vsegment_init_spawn_mutex_;  // 保护线程 spawn/join 生命周期
+    // StartSlotOwnerHeartbeat 初始同步调用完成后置 true：此前的调用走同步
+    // 路径（构造+sweep 内联），之后的运行期调用走异步门控。
+    std::atomic<bool> vsegment_runtime_gate_active_{false};
+    void MaybeSpawnVSegmentInit();   // kIdle → 拉起后台首建线程（幂等）
+    void VSegmentInitThreadFunc();   // 后台：Load→首建→发布→首次全量 sweep
+    ErrorCode RunVSegmentOwnershipReconcile(
+        const std::string& acquiring,
+        vsegment::VSegmentCommitBatch* batch = nullptr);
+    // 构造 + provider 注入 + 原子发布（先配置后发布）。前提：持有
+    // vsegment_service_init_mutex_ 且复检 vsegment_service_ 为空。
+    void ConstructVSegmentService(vsegment::PartitionPhysicalQuotaSnapshot quota);
+    // ----- vsegment auto-plan 重试（--vsegment_auto_plan 发布侧自愈）-----
+    // 配额快照发布侧的状态机：启动 bootstrap（master.cpp）只在进程启动时
+    // 试一次，发现零段即永久放弃；本组件在快照缺失期间由心跳
+    // （RefreshVSegmentOwnership 的 KEY_NOT_EXIST 分支）与 mount/remount
+    // 尾部两个触发点节流重试 PlanAndPublishDiscoveredQuota，发布成功后由
+    // 下一次心跳的既有 Load 路径拉起 VSegmentService。etcd Create 原子首写
+    // 保证多 submaster 并发重试 first-writer-wins。
+    bool MaybeRetryVSegmentAutoPlan(const char* trigger);
+    // W6 静默期信号（集群级）：把最近一次 mount/remount 的墙钟毫秒写入
+    // etcd 共享 key（cvm::VSegmentMountActivityKey），由
+    // PlanAndPublishDiscoveredQuota 在发布前读取并等待静默——对全部触发
+    // 方统一生效。
+    void NoteVSegmentMountActivity();
+    vsegment::VSegmentUserPolicy vsegment_auto_plan_policy_{};  // member_count==0 ⇒ 关闭
+    mutable std::mutex vsegment_auto_plan_mutex_;  // 叶子锁：仅保护下方状态
+    bool vsegment_auto_plan_published_{false};     // 发布成功（含并发赢家）锁存
+    bool vsegment_auto_plan_gave_up_{false};       // INVALID_PARAMS 终态锁存
+    std::chrono::steady_clock::time_point
+        vsegment_auto_plan_last_attempt_{};
+    int vsegment_auto_plan_attempts_{0};  // 日志状态变化控制（首条 INFO 后 VLOG）
     // Decoded before Partition ownership is activated. The route lifecycle
     // consumes the matching state when it creates each local manager.
     std::vector<vsegment::PartitionVSegmentSnapshot>
@@ -2512,6 +2680,14 @@ class MasterService {
     std::vector<bool> expected_owned_;
     std::vector<bool> ready_owned_;
     bool owned_slots_ready_{false};
+    // ready/expected 计数（owned_slots_mutex_ 保护）：饱和（ready==expected
+    // 且 >0）转变时打一条「全部就绪可写入」INFO——vsegment 发布成功后写入
+    // 可行性的明确观测点（此前 MarkSlotsReady 完全静默，只能从 admin
+    // metrics 的 owned_slots 间接推断）。all_ready_logged_ 为饱和去重标记：
+    // 进入饱和打一条，离开饱和静默复位，稳态零输出。
+    uint32_t ready_slot_count_{0};
+    uint32_t expected_slot_count_{0};
+    bool all_ready_logged_{false};
     // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
     bool owned_slot_count_logged_{false};
     std::size_t last_logged_owned_count_{0};
@@ -2528,16 +2704,40 @@ class MasterService {
     // HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
-    // 方案一 A（te_endpoint 代际替换）：worker 每次进程启动都以新 client_id
-    // 重挂段，P2PHANDSHAKE 协议下 te_endpoint 端口随进程变化。MountSegment
-    // 尾部调用本方法：检测「同 segment_name + 同 host_id + 不同 te_endpoint」
-    // 的旧代残留（worker 重启前的死段）并立即清理——内存段两阶段卸载 +
-    // etcd 挂载记录/描述符（RemoveSegmentOwnerForCvm）+ invalid 集合卫生，
-    // 不等 TTL reaper 过期。设计假设：同一 host 的同 name worker 单进程
-    // 部署（进程内所有段共享同一 te_endpoint；跨 boot 端口必变）。
-    // 非 P2PHANDSHAKE 协议（te_endpoint 为固定 hostname，跨 boot 不变）
-    // 检测条件不成立，自动 no-op，由 TTL reaper 与方案一 B 兜底。
-    void EvictStaleGenerationForHost(const Segment& incoming);
+    // 方案一 A（代际替换）：worker 每次进程启动都以新 client_id 重挂段。
+    // stale_evict_thread_ drain 时调用本方法（MountSegment 尾部经
+    // EnqueueStaleGenerationEvict 异步入队，见下方），在「同 segment_name
+    // + 同 host_id」前提
+    // 下按以下任一判据识别旧代残留（worker 重启前的死段）并立即清理：
+    // a) te_endpoint 不同：P2PHANDSHAKE 协议端口随进程变化（原逻辑）；
+    // b) owner client_id 不同：非 P2PHANDSHAKE（te_endpoint 为固定
+    //    hostname，跨 boot 不变）快速重注册场景。segment_name=
+    //    local_hostname_ 按 host 唯一，同 name 不同 client_id 即旧进程
+    //    代；活 client 幂等重挂（ReMount/重复 Mount）client_id 相同，
+    //    不会误杀。
+    // 清理动作：内存段两阶段卸载 + etcd 挂载记录/描述符
+    // （RemoveSegmentOwnerForCvm）+ invalid 集合卫生 + 同 host 旧代
+    // client 的 LOCAL_DISK 段对称卸载，不等 TTL reaper 过期。
+    // 设计假设：同一 host 的同 name worker 单进程部署。P2-8-2 已为
+    // LocalDiskSegment 增加 segment_name（MountSegment 尾部补登）：已
+    // 登记内存段挂载的 co-tenant client 按 name 过滤、不会误清；残留
+    // 风险仅剩「只挂 LOCAL_DISK、从未挂内存段」的 client（无 name 上下
+    // 文，退化为 host 级归并）。
+    void EvictStaleGenerationForHost(const Segment& incoming,
+                                     const UUID& mounting_client);
+    // 方案一 A 异步化：MountSegment 尾部仅入队（µs 级），完整清理
+    // （LOCAL_DISK 对称卸载 + 内存段两阶段卸载 + etcd 清理 +
+    // ClearInvalidHandles）由 stale_evict_thread_ 延迟执行，把同步
+    // etcd 事务与锁竞争移出 RPC 关键路径（MountSegment 30s 卡顿两大
+    // 主因）。队列按 (host_id, segment_name) 去重、最新 mounting_client
+    // 胜出；drain 以 shared_lock(snapshot_mutex_) 补持 helper 的锁假设
+    //（snapshot → client → segment → shard），并在 helper 内前置校验
+    // 参考 client 仍持有该 name 段（防快速连续重启窗口内误杀新代）；
+    // 已 swap 出队的在途请求若被更新的同键请求取代则作废
+    //（superseded_by_newer_mount），交由最新参考执行。
+    void EnqueueStaleGenerationEvict(const Segment& incoming,
+                                     const UUID& mounting_client);
+    void StaleEvictThreadFunc();
     // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
     // master 列表，按一致性哈希环（cvm::ResolveOwnedSlotsOnRing）计算本机
     // 应拥有的 slot 集合。etcd 读取失败时沿用上一轮结果（sticky），避免
@@ -2569,7 +2769,12 @@ class MasterService {
     //      经 InterMasterRpc 直传拉取 export 并物化到本地，成功后回 ack。
     // 数据字节始终留在 segment，不搬移。二者均运行在心跳线程。
     ErrorCode ExportSlotMetadata(uint16_t slot);
-    ErrorCode ImportSlotMetadata(uint16_t slot);
+    // Installation only; the range caller owns the durable barrier and ACK.
+    ErrorCode ImportSlotMetadata(
+        uint16_t slot, const SlotMetadataExport* prefetched_export,
+        vsegment::VSegmentCommitBatch* batch);
+    ErrorCode OnSlotRangeAcquired(uint16_t first_slot, uint16_t last_slot,
+                                  std::vector<ErrorCode>& results);
 
     // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
     // require_not_owned（默认 true，§15 单 slot 交接语义）：要求本机已失去
@@ -2577,7 +2782,10 @@ class MasterService {
     //（kMigrating 冻结写保证快照稳定；切 owner 后源仍持有未 ack 数据，
     // 重拉幂等）。
     tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
-        uint16_t slot, bool require_not_owned = true) const;
+        uint16_t slot, bool require_not_owned = true);
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    BuildSlotMetadataExportBatch(uint16_t first_slot, uint16_t last_slot,
+                                  bool require_not_owned);
     // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
     ErrorCode DropSlotMetadataLocal(uint16_t slot);
     // 段级批量版 DropSlotMetadataLocal（§16.16.5，P4 reshard ack 后的源侧
@@ -2616,9 +2824,13 @@ class MasterService {
     // 显式路由，owner 必须是本机）。安装后调用 RefreshVSegmentOwnership 激活。
     ErrorCode InstallSlotMetadataExport(
         const SlotMetadataExport& export_payload,
-        const partition::PartitionRoute& effective_route);
+        const partition::PartitionRoute& effective_route,
+        vsegment::VSegmentCommitBatch* batch = nullptr);
     std::thread reshard_driver_thread_;
     std::atomic<bool> reshard_driver_running_{false};
+    std::mutex reshard_wake_mutex_;
+    std::condition_variable reshard_wake_cv_;
+    bool reshard_wake_pending_{false};
     // 防同 rank 并发驱动：进行中的 (rank -> 目标 epoch)。
     std::mutex reshard_inflight_mutex_;
     std::map<uint32_t, uint64_t> reshard_inflight_;
@@ -2843,6 +3055,12 @@ class MasterService {
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
 
+    // OpLog 流自恢复（冷接管 / 同身份重启）：source 定局登记与 4.2 卡死
+    // 分支的分区级日志去重（防 heartbeat 周期重试刷屏）。
+    std::mutex oplog_replay_mutex_;
+    std::set<std::string> oplog_replay_finalized_sources_;
+    std::set<std::string> missing_recovery_warned_partitions_;
+
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
@@ -2853,7 +3071,9 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
-    ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
+    ErrorCode RefreshVSegmentOwnership(
+        const std::string& acquiring = {},
+        vsegment::VSegmentCommitBatch* batch = nullptr);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

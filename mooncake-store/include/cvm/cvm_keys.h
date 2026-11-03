@@ -41,7 +41,7 @@ inline std::string MasterRegistrationKey(const std::string& cluster_namespace,
     return MasterRegistrationPrefix(cluster_namespace) + master_id;
 }
 
-// "/cvm/<namespace>/cluster_meta" — RingMeta { submaster_count } (§15.3).
+// "/cvm/<namespace>/cluster_meta" — cluster-wide RingMeta (§15.3).
 // Cluster-wide ring configuration read by clients to locally derive the same
 // primary ring as the masters.
 inline std::string ClusterMetaKey(const std::string& cluster_namespace) {
@@ -67,6 +67,14 @@ inline std::string SegmentViewSnapshotKey(const std::string& cluster_namespace) 
 inline std::string VSegmentPartitionQuotaSnapshotKey(
     const std::string& cluster_namespace) {
     return SnapshotPrefix(cluster_namespace) + "vsegment_partition_quota";
+}
+
+// 集群级 mount 活动时间戳（墙钟毫秒，十进制串）：任意 submaster 的
+// mount/remount 处理器刷新；PlanAndPublishDiscoveredQuota 发布前读取并
+// 等待静默（W6：防滚动部署中段发布覆盖不完整拓扑的一次性快照）。
+inline std::string VSegmentMountActivityKey(
+    const std::string& cluster_namespace) {
+    return SnapshotPrefix(cluster_namespace) + "vsegment_mount_activity";
 }
 
 // ---- Segment neutral entity + per-master mount keys (§3 view layout) ----
@@ -120,7 +128,7 @@ inline std::string RingSlotAssignPrefix(
 }
 
 // "/cvm/<namespace>/ring_slots/<rank>"
-// rank 零填充 5 位：G 上限 kSlotCount = 16384，rank 最大 16383 为 5 位数，
+// rank 零填充 5 位：G 上限 SlotCount()（最大 16384），rank 最大 16383，
 // %03u 在 rank >= 1000 时字典序 != 数值序（"1000" < "999"），会破坏 range
 // 扫描与 PrefixEnd 的排序前提。5 位覆盖全部合法 rank。
 inline std::string RingSlotAssignKey(const std::string& cluster_namespace,

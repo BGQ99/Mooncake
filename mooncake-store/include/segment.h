@@ -90,6 +90,13 @@ inline std::ostream& operator<<(
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    // P2-8-2：该 client 内存段挂载的 segment_name（MountSegment 尾部
+    // 补登），代际驱逐 LOCAL_DISK 对称清理的 name 级 co-tenant 过滤
+    // 依据：非空且与新代段 name 不同 → 同 host 多 name 部署的旁路
+    // client，跳过卸载。空 = 尚未见过内存段挂载（legacy / 仅
+    // LOCAL_DISK client），退化为 host 级归并（原行为）。读写均持
+    // offloading_mutex_；offloading/promotion 业务路径不触碰本字段。
+    std::string segment_name;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
@@ -280,6 +287,16 @@ class ScopedSegmentAccess {
      * Called when a client expires to clean up its local disk segment.
      */
     void UnmountLocalDiskSegment(const UUID& client_id);
+
+    /**
+     * @brief Look up a client's LocalDiskSegment bookkeeping entry.
+     * @return nullptr when the client has no local disk segment. The
+     * returned shared_ptr keeps the entry alive beyond this accessor's
+     * scope; field access on it still requires
+     * LocalDiskSegment::offloading_mutex_.
+     */
+    std::shared_ptr<LocalDiskSegment> GetClientLocalDiskSegment(
+        const UUID& client_id) const;
 
    private:
     SegmentManager* segment_manager_;
@@ -491,6 +508,14 @@ class SegmentManager {
     ScopedSegmentAccess getSegmentAccess() {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
+
+    // Bulk read of segment runtime locations under a shared lock. Returns false
+    // if any segment is missing or has no transport endpoint. Unlike
+    // getSegmentAccess()/GetSegment(), this does not take the segment mutex
+    // exclusively.
+    bool GetSegmentLocations(const std::vector<UUID>& segment_ids,
+                             std::vector<std::string>* endpoints,
+                             std::vector<uint64_t>* bases) const;
 
     /**
      * @brief Get RAII-style access to use allocators

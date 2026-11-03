@@ -23,6 +23,7 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "mooncake_logging.h"
@@ -153,6 +154,69 @@ std::string FormatWallClock(std::chrono::system_clock::time_point tp) {
     std::snprintf(out, sizeof(out), "%s.%06lld", buf,
                   static_cast<long long>(us));
     return out;
+}
+
+struct ReplicaObservabilityInfo {
+    std::string type{"unknown"};
+    std::string remote_endpoint{"-"};
+};
+
+ReplicaObservabilityInfo DescribeReplicaForObservability(
+    const Replica::Descriptor &replica,
+    const std::unordered_set<std::string> &local_endpoints,
+    const UUID &client_id) {
+    ReplicaObservabilityInfo info;
+    if (replica.is_memory_replica()) {
+        info.remote_endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        info.type = local_endpoints.count(info.remote_endpoint) > 0
+                        ? "memory_local"
+                        : "memory_remote";
+    } else if (replica.is_nof_replica()) {
+        info.remote_endpoint = replica.get_nof_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        info.type = local_endpoints.count(info.remote_endpoint) > 0
+                        ? "nof_local"
+                        : "nof_remote";
+    } else if (replica.is_vsegment_replica()) {
+        // A vsegment spans multiple member endpoints, so there is no single
+        // remote endpoint or meaningful local/remote suffix to report here.
+        info.type = "vsegment";
+    } else if (replica.is_local_disk_replica()) {
+        const auto &descriptor = replica.get_local_disk_descriptor();
+        info.remote_endpoint = descriptor.transport_endpoint;
+        info.type = descriptor.client_id == client_id ? "local_disk_local"
+                                                       : "local_disk_remote";
+    } else if (replica.is_disk_replica()) {
+        info.type = "disk";
+    }
+    return info;
+}
+
+PerfKey SelectGetBufferReadPerfKey(const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) {
+        return PerfKey::GET_INTERNAL_MEM_READ;
+    }
+    if (replica.is_nof_replica()) {
+        return PerfKey::GET_INTERNAL_NOF_READ;
+    }
+    if (replica.is_vsegment_replica()) {
+        return PerfKey::GET_INTERNAL_VSEG_READ;
+    }
+    return PerfKey::GET_INTERNAL_DISK_READ;
+}
+
+PerfKey SelectGetIntoReadPerfKey(const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) {
+        return PerfKey::GET_INTO_INTERNAL_MEM_READ;
+    }
+    if (replica.is_nof_replica()) {
+        return PerfKey::GET_INTO_INTERNAL_NOF_READ;
+    }
+    if (replica.is_vsegment_replica()) {
+        return PerfKey::GET_INTO_INTERNAL_VSEG_READ;
+    }
+    return PerfKey::GET_INTO_INTERNAL_DISK_READ;
 }
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -421,9 +485,11 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
-    return QueryResult(
+    QueryResult filtered(
         {replica}, qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt);
+    filtered.vsegment_layouts = qr.vsegment_layouts;
+    return filtered;
 }
 }  // namespace
 
@@ -734,7 +800,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    size_t offload_rpc_thread_num, bool enable_client_http_server, int client_http_port) {
+    size_t offload_rpc_thread_num, bool enable_client_http_server,
+    int client_http_port, const std::string &ub_numa_nodes_config) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -926,29 +993,54 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // For UB, mount ONE segment per NUMA node (each bound to its node,
-        // location="cpu:N"). Memory is spread across ALL NUMA nodes by count,
-        // not just NIC-bearing ones: this works even with a single bonded
-        // device (e.g. bonding_dev_0, NUMA=-1) where NIC-NUMA discovery would
-        // be empty, and it relies only on the (decimal) NUMA count, so it is
-        // unaffected by the hex "numa" attribute. Each segment then drives
-        // selectDevice (cpu:N -> local NIC, else any) and chip affinity
-        // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
-        // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
-        // and MC_URMA_BONDING_MULTIPATH_ENABLE.
+        // For UB, mount one segment per selected NUMA node (location="cpu:N").
+        // ub_numa_nodes selects an explicit comma-separated node list. When it
+        // is unset, preserve the existing behavior of using every discovered
+        // NUMA node on multi-NUMA hosts. MC_UB_NUMA_NODES provides the same
+        // override for callers that do not use ConfigDict or the service CLI.
 #ifdef USE_UB
         std::vector<int> ub_numa_nodes;
         if (protocol == "ub") {
-            int numa_count = client_->GetNumaNodeCount();
-            if (numa_count > 1) {
-                std::string nodes_str;
-                for (int i = 0; i < numa_count; ++i) {
-                    ub_numa_nodes.push_back(i);
-                    if (i) nodes_str += ",";
-                    nodes_str += std::to_string(i);
+            const auto available_nodes = client_->GetNumaNodes();
+            std::string requested_nodes = ub_numa_nodes_config;
+            if (requested_nodes.empty()) {
+                const char *env_nodes = std::getenv("MC_UB_NUMA_NODES");
+                if (env_nodes != nullptr) requested_nodes = env_nodes;
+            }
+
+            bool explicit_selection = !requested_nodes.empty();
+            if (explicit_selection) {
+                auto parsed_nodes = try_parse_numa_nodes(requested_nodes);
+                if (!parsed_nodes.has_value()) {
+                    MC_LOG(ERROR)
+                        << "Invalid UB NUMA node list '" << requested_nodes
+                        << "': expected unique non-negative node IDs separated "
+                           "by commas";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count=" << numa_count
-                          << ", nodes=[" << nodes_str << "]";
+                for (int node : parsed_nodes.value()) {
+                    if (!std::binary_search(available_nodes.begin(),
+                                            available_nodes.end(), node)) {
+                        MC_LOG(ERROR)
+                            << "Requested UB NUMA node " << node
+                            << " is not present in the local topology";
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                }
+                ub_numa_nodes = std::move(parsed_nodes.value());
+            } else if (available_nodes.size() > 1) {
+                ub_numa_nodes = available_nodes;
+            }
+
+            if (!ub_numa_nodes.empty()) {
+                std::string nodes_str;
+                for (int node : ub_numa_nodes) {
+                    if (!nodes_str.empty()) nodes_str += ",";
+                    nodes_str += std::to_string(node);
+                }
+                MC_LOG(INFO) << "UB per-NUMA mode: selection="
+                             << (explicit_selection ? "explicit" : "auto")
+                             << ", nodes=[" << nodes_str << "]";
             }
         }
 #endif  // USE_UB
@@ -962,29 +1054,37 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
-            // node, each physically bound to its node and registered with
-            // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+            // Split this chunk across the selected NUMA nodes. The aligned page
+            // count is divided evenly; any remainder is assigned one page at a
+            // time to the first nodes, so the total allocation is only rounded
+            // once instead of once per node.
 #ifdef USE_UB
             if (!ub_numa_nodes.empty()) {
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 size_t n = ub_numa_nodes.size();
-                size_t per_node_size = align_up(segment_size / n, page_sz);
-                if (per_node_size == 0) {
-                    MC_LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
-                                     "too small for " << n << " NUMA nodes";
+                size_t aligned_size = align_up(segment_size, page_sz);
+                size_t page_count = aligned_size / page_sz;
+                if (page_count < n) {
+                    MC_LOG(ERROR) << "UB per-NUMA: segment has " << page_count
+                                  << " aligned pages, fewer than the " << n
+                                  << " selected NUMA nodes";
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                for (int node : ub_numa_nodes) {
+                size_t base_pages = page_count / n;
+                size_t extra_pages = page_count % n;
+                for (size_t i = 0; i < n; ++i) {
+                    int node = ub_numa_nodes[i];
+                    size_t node_size =
+                        (base_pages + (i < extra_pages ? 1 : 0)) * page_sz;
                     // Use UB's own allocator bound to this node: numa_alloc_onnode
                     // via libnuma, registered in the store-memory table, so URMA
                     // can register it. (A raw mmap+mbind buffer cannot be
                     // registered by urma_register_seg -- it fails with error
                     // 2048 because the VMA has no backing pages at reg time.)
                     void *ptr = mooncake::ub_allocate_memory_onnode(
-                        /*alignment=*/page_sz, per_node_size, node);
+                        /*alignment=*/page_sz, node_size, node);
                     if (!ptr) {
                         MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
                                          "segment for node " << node;
@@ -992,14 +1092,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     }
                     // numa_alloc-backed => free via ub_free_memory/numa_free,
                     // NOT munmap. Track with UbSegmentDeleter accordingly.
-                    ub_segment_ptrs_.emplace_back(
-                        ptr, UbSegmentDeleter{per_node_size});
+                    ub_segment_ptrs_.emplace_back(ptr,
+                                                  UbSegmentDeleter{node_size});
 
                     std::string loc = genCpuNodeName(node);  // "cpu:<node>"
-                    MC_LOG(INFO) << "Mounting UB per-NUMA segment: node=" << node
-                              << ", size=" << per_node_size << ", loc=" << loc;
-                    auto mr = client_->MountSegment(ptr, per_node_size, protocol,
-                                                    loc);
+                    MC_LOG(INFO)
+                        << "Mounting UB per-NUMA segment: node=" << node
+                        << ", size=" << node_size << ", loc=" << loc;
+                    auto mr =
+                        client_->MountSegment(ptr, node_size, protocol, loc);
                     if (!mr.has_value()) {
                         MC_LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
                                    << toString(mr.error());
@@ -1371,6 +1472,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
+    std::string ub_numa_nodes = get_config(config, CONFIG_KEY_UB_NUMA_NODES);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
@@ -1428,7 +1530,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                           local_buffer_size, protocol, rdma_devices,
                           master_server_addr, nullptr, ipc_socket_path, 50052,
                           enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          offload_rpc_thread_num, enable_client_http_server, client_http_port);
+                          offload_rpc_thread_num, enable_client_http_server,
+                          client_http_port, ub_numa_nodes);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -3099,10 +3202,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Select best replica: prefer local MEMORY, then any MEMORY,
-    // then LOCAL_DISK, then DISK.
+    // Select the best replica using the shared memory/NoF/vsegment/disk policy.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
-    // MEMORY / DISK are handled via client_->Get below.
+    // MEMORY / NoF / VSEGMENT / DISK are handled via client_->Get below.
     SpDiag::PerfPoint pt_select(PerfKey::GET_INTERNAL_SELECT_REPLICA,
                                 SpDiag::PerfLevel::MODULE);
     pt_select.Start();
@@ -3121,26 +3223,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
 
-    // Set replica_type for breakdown log
-    if (replica.is_memory_replica()) {
-        const auto &endpoint = replica.get_memory_descriptor()
-                                   .buffer_descriptor.transport_endpoint_;
-        remote_endpoint = endpoint;
-        bool is_local = local_endpoints.count(endpoint) > 0;
-        replica_type = is_local ? "memory_local" : "memory_remote";
-    } else if (replica.is_local_disk_replica()) {
-        const auto &ld_desc = replica.get_local_disk_descriptor();
-        remote_endpoint = ld_desc.transport_endpoint;
-        bool is_local_holder = (ld_desc.client_id == client_->getClientId());
-        replica_type =
-            is_local_holder ? "local_disk_local" : "local_disk_remote";
-    } else if (replica.is_nof_replica()) {
-        replica_type = "nof";
-        remote_endpoint =
-            replica.get_nof_descriptor().buffer_descriptor.transport_endpoint_;
-    } else {
-        replica_type = "disk";
-    }
+    const auto replica_info = DescribeReplicaForObservability(
+        replica, local_endpoints, client_->getClientId());
+    replica_type = replica_info.type;
+    remote_endpoint = replica_info.remote_endpoint;
 
     if (total_length == 0) {
         return nullptr;
@@ -3232,9 +3318,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return buffer_handle;
     }
 
-    // MEMORY / DISK: use client_->Get.  FilterQueryResult ensures
-    // Client::Get internal FindFirstCompleteReplica can only see
-    // the replica we selected, preventing accidental LOCAL_DISK picks.
+    // Direct-transfer replicas and DISK use client_->Get. FilterQueryResult
+    // ensures Client::Get internal FindFirstCompleteReplica can only see the
+    // replica we selected, preventing accidental LOCAL_DISK picks.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (replica.is_disk_replica() &&
@@ -3245,9 +3331,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                      << "Ensure client_buffer_allocator_ returns host memory.";
     }
 
-    const PerfKey read_key = replica.is_memory_replica()
-                                 ? PerfKey::GET_INTERNAL_MEM_READ
-                                 : PerfKey::GET_INTERNAL_DISK_READ;
+    const PerfKey read_key = SelectGetBufferReadPerfKey(replica);
     SpDiag::PerfPoint pt_read(read_key, SpDiag::PerfLevel::MODULE);
     pt_read.Start();
     std::vector<Slice> slices;
@@ -3574,8 +3658,8 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        // Select best replica: prefer local MEMORY, then any MEMORY,
-        // then LOCAL_DISK, then DISK.
+        // Select the best replica using the shared
+        // memory/NoF/vsegment/disk policy.
         SpDiag::PerfPoint pt_bsel(PerfKey::GET_BATCH_INTERNAL_SELECT_REPLICA,
                                   SpDiag::PerfLevel::MODULE);
         pt_bsel.Start();
@@ -3595,22 +3679,10 @@ RealClient::batch_get_buffer_internal(
         // Per-key replica type. Accumulate into one string and emit a single
         // aggregated line after the loop. Gated by breakdown_log.
         if (breakdown_log) {
-            std::string rtype;
-            if (replica.is_memory_replica()) {
-                const auto &ep = replica.get_memory_descriptor()
-                                     .buffer_descriptor.transport_endpoint_;
-                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
-                                                      : "memory_remote";
-            } else if (replica.is_local_disk_replica()) {
-                const auto &ld = replica.get_local_disk_descriptor();
-                rtype = (ld.client_id == client_->getClientId())
-                            ? "local_disk_local"
-                            : "local_disk_remote";
-            } else if (replica.is_nof_replica()) {
-                rtype = "nof";
-            } else {
-                rtype = "disk";
-            }
+            const auto rtype = DescribeReplicaForObservability(
+                                   replica, local_endpoints,
+                                   client_->getClientId())
+                                   .type;
             replica_types_log += key;
             replica_types_log += '=';
             replica_types_log += rtype;
@@ -3674,9 +3746,9 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
-    // 3. Execute batch get for memory/disk replicas
+    // 3. Execute the mixed batch of direct and local-file reads.
     if (!valid_ops.empty()) {
-        SpDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ,
+        SpDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_DATA_READ,
                                   SpDiag::PerfLevel::MODULE);
         pt_bget.Start();
         std::vector<std::string> batch_keys;
@@ -3972,8 +4044,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Select best replica: prefer local MEMORY, then any MEMORY,
-    // then LOCAL_DISK, then DISK.
+    // Select the best replica using the shared memory/NoF/vsegment/disk policy.
     SpDiag::PerfPoint pt_select(PerfKey::GET_INTO_INTERNAL_SELECT_REPLICA,
                                 SpDiag::PerfLevel::MODULE);
     pt_select.Start();
@@ -3991,27 +4062,8 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
     auto query_value = std::move(query_result.value());
     auto replica = *best_replica;
     auto total_size = calculate_total_size(replica);
-    std::string replica_type;
-    std::string remote_endpoint = "-";
-    if (replica.is_memory_replica()) {
-        const auto &endpoint = replica.get_memory_descriptor()
-                                   .buffer_descriptor.transport_endpoint_;
-        remote_endpoint = endpoint;
-        bool is_local = local_endpoints.count(endpoint) > 0;
-        replica_type = is_local ? "memory_local" : "memory_remote";
-    } else if (replica.is_local_disk_replica()) {
-        const auto &ld_desc = replica.get_local_disk_descriptor();
-        remote_endpoint = ld_desc.transport_endpoint;
-        bool is_local_holder = (ld_desc.client_id == client_->getClientId());
-        replica_type =
-            is_local_holder ? "local_disk_local" : "local_disk_remote";
-    } else if (replica.is_nof_replica()) {
-        replica_type = "nof";
-        remote_endpoint =
-            replica.get_nof_descriptor().buffer_descriptor.transport_endpoint_;
-    } else {
-        replica_type = "disk";
-    }
+    auto replica_info = DescribeReplicaForObservability(
+        replica, local_endpoints, client_->getClientId());
 
     return RangedReadMetadata{
         .query_result = std::move(query_value),
@@ -4031,10 +4083,10 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
             std::chrono::duration_cast<std::chrono::microseconds>(
                 t_select - t_local_endpoints)
                 .count(),
-        .replica_type = std::move(replica_type),
+        .replica_type = std::move(replica_info.type),
         .replica_count = replica_count,
         .local_endpoint = client_->GetSegmentEndpoint(),
-        .remote_endpoint = std::move(remote_endpoint)};
+        .remote_endpoint = std::move(replica_info.remote_endpoint)};
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -4207,7 +4259,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
             auto filtered_qr =
                 FilterQueryResult(query_result, replica, verify_checksum);
+            SpDiag::PerfPoint pt_read(SelectGetIntoReadPerfKey(replica),
+                                      SpDiag::PerfLevel::MODULE);
+            pt_read.Start();
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            pt_read.End(get_result ? 0 : -1);
             if (!get_result) {
                 LOG(ERROR) << "Get failed for key: " << key
                            << " with error: " << toString(get_result.error());
@@ -4215,7 +4271,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             }
             if (auto r = scatter_host_to_maybe_device(
                     dst, tmp_handle.ptr(), total_size,
-                    "MEMORY full read, key: " + key);
+                    "direct full read, key: " + key);
                 !r) {
                 return tl::unexpected(r.error());
             }
@@ -4227,8 +4283,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
         auto filtered_qr =
             FilterQueryResult(query_result, replica, verify_checksum);
-        SpDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
-                                  SpDiag::PerfLevel::MODULE);
+        const PerfKey read_key = SelectGetIntoReadPerfKey(replica);
+        SpDiag::PerfPoint pt_read(read_key, SpDiag::PerfLevel::MODULE);
         pt_read.Start();
         auto get_result = client_->Get(key, filtered_qr, slices);
         pt_read.End(get_result ? 0 : -1);
@@ -4322,7 +4378,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "ranged reads only support memory/disk replicas";
+        LOG(ERROR) << "partial ranged reads only support memory replicas";
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
@@ -4437,6 +4493,10 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
                 status = "disk_fail";
             } else if (metadata.replica.is_memory_replica()) {
                 status = "mem_fail";
+            } else if (metadata.replica.is_nof_replica()) {
+                status = "nof_fail";
+            } else if (metadata.replica.is_vsegment_replica()) {
+                status = "vsegment_fail";
             } else {
                 status = toString(read_result.error());
             }
@@ -5712,8 +5772,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             continue;
         }
 
-        // Select best replica: prefer local MEMORY, then any MEMORY,
-        // then LOCAL_DISK, then DISK.
+        // Select the best replica using the shared
+        // memory/NoF/vsegment/disk policy.
         SpDiag::PerfPoint pt_select(
             PerfKey::GET_BATCH_INTO_INTERNAL_SELECT_REPLICA,
             SpDiag::PerfLevel::MODULE);
@@ -5734,22 +5794,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Per-key replica type. Accumulate into one string and emit a single
         // aggregated line after the loop. Gated by breakdown_log.
         if (breakdown_log) {
-            std::string rtype;
-            if (replica.is_memory_replica()) {
-                const auto &ep = replica.get_memory_descriptor()
-                                     .buffer_descriptor.transport_endpoint_;
-                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
-                                                      : "memory_remote";
-            } else if (replica.is_local_disk_replica()) {
-                const auto &ld = replica.get_local_disk_descriptor();
-                rtype = (ld.client_id == client_->getClientId())
-                            ? "local_disk_local"
-                            : "local_disk_remote";
-            } else if (replica.is_nof_replica()) {
-                rtype = "nof";
-            } else {
-                rtype = "disk";
-            }
+            const auto rtype = DescribeReplicaForObservability(
+                                   replica, local_endpoints,
+                                   client_->getClientId())
+                                   .type;
             replica_types_log += key;
             replica_types_log += '=';
             replica_types_log += rtype;
@@ -5790,7 +5838,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY and NoF both use the batched transfer path.
+        // Direct-transfer replicas (MEMORY, NoF, or vsegment) read directly
+        // into the user buffer. nof_count 保留 nof 侧 mem/nof 拆分口径。
         if (replica.is_nof_replica()) ++nof_count;
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
@@ -5827,7 +5876,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                          << "] start_time[" << FormatWallClock(t0_wall)
                          << "] query_us[" << query_us << "] prep_us[" << prep_us
                          << "] read_us[0] total_us[" << total_us
-                         << "] mem_ops[0] nof_ops[0] disk_ops[0] ssd_offload_ops[0]"
+                         << "] direct_ops[0] mem_ops[0] nof_ops[0] disk_ops[0] ssd_offload_ops[0]"
                          << " success[0] replicas[" << replica_types_log << "]";
         }
         return results;
@@ -5848,9 +5897,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
-        SpDiag::PerfPoint pt_mem_read(PerfKey::GET_BATCH_INTO_INTERNAL_MEM_READ,
-                                      SpDiag::PerfLevel::MODULE);
-        pt_mem_read.Start();
+        SpDiag::PerfPoint pt_direct_read(
+            PerfKey::GET_BATCH_INTO_INTERNAL_DIRECT_READ,
+            SpDiag::PerfLevel::MODULE);
+        pt_direct_read.Start();
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
@@ -5867,7 +5917,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 batch_get_success = false;
             }
         }
-        pt_mem_read.End(batch_get_success ? 0 : -1);
+        pt_direct_read.End(batch_get_success ? 0 : -1);
     }
 
     // ---- DISK replicas: BatchGet into CPU temp buffers, then scatter ----
@@ -6039,6 +6089,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] direct_ops[" << valid_operations.size()
                      << "] mem_ops[" << (valid_operations.size() - nof_count)
                      << "] nof_ops[" << nof_count << "] disk_ops["
                      << disk_operations.size() << "] ssd_offload_ops["
@@ -6338,9 +6389,9 @@ RealClient::batch_get_into_multi_buffers_internal(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
-        // Select best replica: prefer MEMORY (direct RDMA to GPU), then
-        // LOCAL_DISK, then DISK. Master may return multiple replicas in any
-        // order, so always scan rather than blindly taking replicas[0].
+        // Select the best replica using the shared policy. This multi-buffer
+        // implementation still rejects direct replica classes other than
+        // MEMORY below.
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
@@ -6349,20 +6400,13 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         const auto replica = *best_replica;
-        // Capture replica info for MC_LOG per-key output
-        if (replica.is_memory_replica()) {
-            per_key_replica_type[i] = "memory";
-            per_key_endpoint[i] = std::string(replica.get_memory_descriptor()
-                                                   .buffer_descriptor
-                                                   .transport_endpoint_);
-        } else if (replica.is_local_disk_replica()) {
-            per_key_replica_type[i] = "local_disk";
-            per_key_endpoint[i] =
-                std::string(replica.get_local_disk_descriptor()
-                                .transport_endpoint);
-        } else if (replica.is_disk_replica()) {
-            per_key_replica_type[i] = "disk";
-            // DISK 副本无 transport_endpoint，缺失不输出
+        // Use the same replica names as the other get paths. DISK and
+        // VSEGMENT have no single endpoint, so that field stays absent.
+        const auto replica_info = DescribeReplicaForObservability(
+            replica, local_endpoints, client_->getClientId());
+        per_key_replica_type[i] = replica_info.type;
+        if (replica_info.remote_endpoint != "-") {
+            per_key_endpoint[i] = replica_info.remote_endpoint;
         }
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];

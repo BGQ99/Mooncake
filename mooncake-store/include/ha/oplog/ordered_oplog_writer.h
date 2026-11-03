@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 
@@ -64,6 +65,9 @@ class OrderedOpLogWriter {
 
     bool IsAccepting() const;
     bool IsCallbackThread() const;
+    // Waits for storage durability, independently of the callback queue.
+    ErrorCode WaitDurable(uint64_t sequence_id,
+                          std::chrono::milliseconds warning_interval);
     ErrorCode LastError() const;
     void Start();
     void Stop();

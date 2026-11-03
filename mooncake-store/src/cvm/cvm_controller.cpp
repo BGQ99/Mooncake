@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <set>
@@ -107,7 +109,8 @@ enum StepOutcome {
 
 // 补位阶段/归属推进路径索引（LogStepOutcome / last_phase_outcome_ 用）：
 // 0-3 为补位四阶段（TryAssignRankForSelf 拆分），4-5 为同一
-// ReconcileRole 周期内的另外两条归属推进路径（晋升 / 兼管自愈）。
+// ReconcileRole 周期内的另外两条归属推进路径（晋升 / 兼管自愈），
+// 6 为已归属成员环互备配对（JoinAsStandbyRing，互备 1.1）。
 enum AssignPhase {
     kPhaseRepair = 0,
     kPhaseClaimDead = 1,
@@ -115,7 +118,58 @@ enum AssignPhase {
     kPhaseJoinStandby = 3,
     kPhasePromote = 4,
     kPhaseTakeover = 5,
+    kPhaseJoinStandbyRing = 6,
 };
+
+// 环互备配对总开关实现（MC_STANDBY_MUTUAL_PAIRING，互备分步交付的灰度
+// 闸门）：OFF 时已归属成员保持现状（不配对、不回放），与未启用本特性
+// 行为等价。必须在互备回放运行时（1.3）部署后才可开启——否则空
+// standby_ids 记录会被晋升路径优先采纳而导出空元数据（TryPromote 让位
+// 规则）。首次读取后进程内缓存（周期判定热路径零 getenv 开销）。
+// 公有门面：CvmController::StandbyMutualPairingEnabled（供 1.1 门控与
+// 1.3.2 supervisor 运行时共用同一缓存值）。
+bool MutualPairingToggleEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MC_STANDBY_MUTUAL_PAIRING");
+        if (value == nullptr) {
+            return false;
+        }
+        const std::string v(value);
+        return v == "1" || v == "true" || v == "on";
+    }();
+    return enabled;
+}
+
+// address（"host:port"）提取 host：按末个 ':' 切分（兼容 IPv6 字面量，
+// port 段在最后一个 ':' 之后）。
+// 提取失败返回空串，调用方按保守语义处理（无法判定跨机即不配对）。
+std::string HostOfAddress(const std::string& address) {
+    const size_t pos = address.rfind(':');
+    if (pos == std::string::npos || pos == 0) {
+        return "";
+    }
+    return address.substr(0, pos);
+}
+
+// 跨机判定（环互备配对用）：两个 master_id 的 address host 是否相同。
+// 任一地址缺失或 host 提取失败时保守返回 true（按同机处理 → 顺延候选），
+// 宁可不配对也不冒双 rank 同故障域的风险。已知局限：同节点以不同别名
+//（hostname vs IP）注册会绕过判定，跨机约束按注册 address 字面一致性
+// 生效。
+bool SamePrimaryHost(const std::string& lhs, const std::string& rhs,
+                     const std::map<std::string, std::string>& address_by_master) {
+    const auto lit = address_by_master.find(lhs);
+    const auto rit = address_by_master.find(rhs);
+    if (lit == address_by_master.end() || rit == address_by_master.end()) {
+        return true;  // 地址缺失：保守按同机
+    }
+    const std::string lhs_host = HostOfAddress(lit->second);
+    const std::string rhs_host = HostOfAddress(rit->second);
+    if (lhs_host.empty() || rhs_host.empty()) {
+        return true;  // 提取失败：保守按同机
+    }
+    return lhs_host == rhs_host;
+}
 
 }  // namespace
 
@@ -124,6 +178,16 @@ CvmController::CvmController(Config config) : config_(std::move(config)) {
 }
 
 CvmController::~CvmController() { Stop(); }
+
+void CvmController::SetSlotsChangedCallback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(slots_changed_mutex_);
+    slots_changed_callback_ = std::move(callback);
+}
+
+void CvmController::NotifySlotsChanged() {
+    std::lock_guard<std::mutex> lock(slots_changed_mutex_);
+    if (slots_changed_callback_) slots_changed_callback_();
+}
 
 void CvmController::SetDelegate(CvmServiceDelegate* delegate) {
     delegate_ = delegate;
@@ -134,6 +198,16 @@ ErrorCode CvmController::Start() {
         return ErrorCode::OK;
     }
 
+    const uint32_t effective_group_count =
+        std::max<uint32_t>(1, config_.submaster_count);
+    if (effective_group_count > SlotCount()) {
+        LOG(ERROR) << "CvmController::Start invalid partition config: "
+                   << "submaster_count=" << config_.submaster_count
+                   << ", slot_count=" << SlotCount()
+                   << ". slot_count must be at least submaster_count.";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     LOG(INFO) << "CvmController::Start begin: cluster_namespace="
               << config_.cluster_namespace << ", master_id="
               << config_.master_id << ", address=" << config_.address
@@ -142,6 +216,7 @@ ErrorCode CvmController::Start() {
               << config_.registration_lease_ttl_sec << ", http_host="
               << config_.http_host << ", http_port=" << config_.http_port
               << ", submaster_count=" << config_.submaster_count
+              << ", slot_count=" << SlotCount()
               << ", sync_interval_ms=" << config_.sync_interval.count();
 
     // NOTE: the etcd client is a process-global singleton (EtcdHelper); the
@@ -194,6 +269,7 @@ ErrorCode CvmController::Start() {
     // submaster_count，也不能在未知旧 G 的情况下盲写覆盖。
     RingMeta ring_meta;
     ring_meta.submaster_count = config_.submaster_count;
+    ring_meta.slot_count = SlotCount();
     bool ring_meta_valid = true;
     {
         RingMeta existing;
@@ -201,6 +277,25 @@ ErrorCode CvmController::Start() {
         const ErrorCode meta_err = EtcdViewStore::LoadClusterMeta(
             config_.cluster_namespace, existing, meta_version);
         if (meta_err == ErrorCode::OK) {
+            if (existing.slot_count != SlotCount()) {
+                LOG(ERROR)
+                    << "CvmController::Start slot count mismatch: cluster="
+                    << existing.slot_count << ", local=" << SlotCount()
+                    << ", env=" << kSlotCountEnv
+                    << ". Use the same value on every master and client; "
+                       "changing it requires a fresh cluster namespace.";
+                (void)EtcdHelper::RevokeLease(lease_id_);
+                return ErrorCode::INVALID_PARAMS;
+            }
+            if (std::max<uint32_t>(1, existing.slot_group_count) >
+                SlotCount()) {
+                LOG(ERROR) << "CvmController::Start invalid cluster metadata: "
+                           << "slot_group_count="
+                           << existing.slot_group_count
+                           << ", slot_count=" << SlotCount();
+                (void)EtcdHelper::RevokeLease(lease_id_);
+                return ErrorCode::INVALID_PARAMS;
+            }
             ring_meta.slot_group_count = existing.slot_group_count;
         } else if (meta_err == ErrorCode::ETCD_KEY_NOT_EXIST) {
             // 新集群首启：meta 尚未创建，正常写入（G 默认 0，随后由
@@ -227,7 +322,8 @@ ErrorCode CvmController::Start() {
                      << " (clients may fall back to stale ring until retried)";
     } else {
         LOG(INFO) << "CvmController::Start SaveClusterMeta ok: submaster_count="
-                  << config_.submaster_count;
+                  << config_.submaster_count
+                  << ", slot_count=" << ring_meta.slot_count;
     }
 
     masters_watch_state_ = std::make_unique<WatchState>();
@@ -372,6 +468,7 @@ void CvmController::MastersWatchLoop() {
             if (delegate_) {
                 delegate_->OnMembershipChanged();
             }
+            NotifySlotsChanged();
 
             if (broken) {
                 // watch 已断开（goroutine 已自清理并退出），退出内层循环
@@ -433,6 +530,7 @@ void CvmController::RingSlotsWatchLoop() {
             // 幽灵写防护（§16.14.6）：本 refresh 让本机「不再是 owner」的
             // 判定即时生效。
             RefreshRingSlotsCache();
+            NotifySlotsChanged();
 
             if (broken) {
                 break;
@@ -484,9 +582,23 @@ void CvmController::RefreshRingSlotsCache() {
         warn_stale_if_seen();
         return;
     }
+    if (meta.slot_count != SlotCount()) {
+        LOG(ERROR) << "CvmController ring metadata slot count mismatch: cluster="
+                   << meta.slot_count << ", local=" << SlotCount()
+                   << ", keeping the previous routing view";
+        warn_stale_if_seen();
+        return;
+    }
     uint32_t group_count = meta.slot_group_count;
     if (group_count == 0) {
         group_count = 1;  // 防御：G=0 非法，按退化单主处理
+    }
+    if (group_count > SlotCount()) {
+        LOG(ERROR) << "CvmController invalid ring metadata: groups="
+                   << group_count << ", slot_count=" << SlotCount()
+                   << ", keeping the previous routing view";
+        warn_stale_if_seen();
+        return;
     }
 
     std::vector<RingSlotAssign> assigns;
@@ -550,6 +662,16 @@ void CvmController::RefreshRingSlotsCache() {
     }
     ring_slot_group_count_ = group_count;
     ring_slots_cache_ = std::move(next);
+    // 与缓存同一临界区同步 revision（LoadAllRingSlotAssigns 的 range read
+    // header ModRevision），保证 route_epoch 门控数据（cvm_ring_revision_）
+    // 与 assigns 视图一致；Load 失败路径在上方提前 return，旧值随旧缓存一并
+    // 保留（宁可旧，不可无——与 G/ranks 的失败语义对齐）。
+    ring_slots_revision_ = version;
+}
+
+int64_t CvmController::GetCachedRingSlotsRevision() {
+    std::lock_guard<std::mutex> lock(ring_slots_mutex_);
+    return ring_slots_revision_;
 }
 
 bool CvmController::GetCachedRingSlotAssign(uint32_t rank,
@@ -635,7 +757,8 @@ RingSlotsView CvmController::BuildRingSlotsView() {
         snapshot.push_back(assign);  // map 按序遍历 = rank 升序
     }
     // assigns 与 G 同锁拷入快照，消费方不会观测到两者错配。
-    return RingSlotsView(std::move(snapshot), ring_slot_group_count_);
+    return RingSlotsView(std::move(snapshot), ring_slot_group_count_,
+                         static_cast<uint64_t>(ring_slots_revision_));
 }
 
 void CvmController::KeepaliveLoop() {
@@ -764,6 +887,48 @@ MasterRole CvmController::ComputeDesiredRole() {
     return current_role_.load();
 }
 
+// Admin Metrics 拉取式低频只读视图：计数口径与 JoinAsStandby 一致
+//（standby_ids 中任一成员存活即视为已配对）。uncovered 只度量
+// 「primary 存活但零存活 standby」的稳态缺口；primary 死亡与迁移中
+// 的 rank 属瞬态，单列不计入。
+std::string CvmController::GetStandbyCoverageSummary() {
+    std::vector<MasterRegistration> members;
+    if (!LoadRankedMembers(members) || members.empty()) {
+        return "unavailable";
+    }
+    const RingSlotsView view = BuildRingSlotsView();
+    if (!view.active()) {
+        return "inactive";
+    }
+    int total = 0, covered = 0, primary_dead = 0, migrating = 0;
+    for (const auto& a : view.assigns()) {
+        ++total;
+        if (a.primary_id.empty() || !IsMemberAlive(members, a.primary_id)) {
+            ++primary_dead;
+            continue;
+        }
+        if (static_cast<SlotState>(a.state) == SlotState::kMigrating) {
+            ++migrating;
+            continue;
+        }
+        bool has_live_standby = false;
+        for (const auto& sid : a.standby_ids) {
+            if (IsMemberAlive(members, sid)) {
+                has_live_standby = true;
+                break;
+            }
+        }
+        if (has_live_standby) {
+            ++covered;
+        }
+    }
+    return "ranks=" + std::to_string(total) + ", covered=" +
+           std::to_string(covered) + ", uncovered=" +
+           std::to_string(total - covered - primary_dead - migrating) +
+           ", primary_dead=" + std::to_string(primary_dead) +
+           ", migrating=" + std::to_string(migrating);
+}
+
 std::string CvmController::GetPrimaryAddress() {
     std::vector<MasterRegistration> members;
     if (!LoadRankedMembers(members) || members.empty()) {
@@ -829,10 +994,10 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
     }
     const size_t standby_rank = my_index - primary_count;
 
-    // 本 standby 负责的 slot 区间 [start, end)，与其它 standby 均分 16384。
-    const uint16_t start = static_cast<uint16_t>(standby_rank * kSlotCount /
+    // 本 standby 负责的 slot 区间 [start, end)，与其它 standby 均分。
+    const uint16_t start = static_cast<uint16_t>(standby_rank * SlotCount() /
                                                  standby_count);
-    const uint16_t end = static_cast<uint16_t>((standby_rank + 1) * kSlotCount /
+    const uint16_t end = static_cast<uint16_t>((standby_rank + 1) * SlotCount() /
                                                standby_count);
 
     // 本地一致性哈希环：primary_ids = 排序去重后的前 submaster_count 个成员，
@@ -866,6 +1031,117 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
                   << end << "), source_count=" << sources.size();
     }
     return sources;
+}
+
+std::vector<MasterRegistration> CvmController::GetRingStandbySources() {
+    // 环互备职责源（互备 1.3.1）：遍历 ring 视图，凡 standby_ids 含本机
+    // master_id 的 rank，取该 rank 的 primary 作为回放源（OpLog 流命名空间
+    // = primary master_id，MasterSource 由 supervisor 层转换）。角色不过滤
+    //（双角色语义：本机 serving 自己 rank 的同时跟随他 rank 流）。
+    // 防自配对防御性排除（CAS 端 JoinAsStandbyRing 已有防御，此处兜底）。
+    // members 即存活全集（lease 驱动）：primary 已死的 rank 自然缺席——
+    // 其流不再推进，跟随无意义，晋升窗口由互备 1.4 处理。
+    // 供低频拉取（2-5s）：LoadRankedMembers + BuildRingSlotsView 均为
+    // live etcd 读，勿在请求热路径调用。
+    std::vector<MasterRegistration> members;
+    if (!LoadRankedMembers(members) || members.empty()) {
+        return {};
+    }
+    const RingSlotsView view = BuildRingSlotsView();
+    if (!view.active()) {
+        return {};  // 环模型未启用 / 记录为空：无职责
+    }
+    std::vector<MasterRegistration> sources;
+    // OpLog 流按 primary master_id 命名（非按 rank）：caretaker 多 rank
+    // 共享同一 primary 时去重——同一流跟随一次即覆盖其全部 rank，
+    // 晋升物化由 P4 owned-slot 过滤按 rank 裁剪。
+    std::set<std::string> seen_primaries;
+    for (const auto& a : view.assigns()) {
+        bool mine = false;
+        for (const auto& sid : a.standby_ids) {
+            if (sid == config_.master_id) {
+                mine = true;
+                break;
+            }
+        }
+        if (!mine || a.primary_id.empty() ||
+            a.primary_id == config_.master_id) {
+            continue;  // 非本机职责 / 空 primary / 防自配对
+        }
+        if (!seen_primaries.insert(a.primary_id).second) {
+            continue;  // 同一 primary 的流已入源：去重
+        }
+        for (const auto& m : members) {
+            if (m.master_id == a.primary_id) {
+                sources.push_back(m);  // 仅存活 primary 入源
+                break;
+            }
+        }
+    }
+    return sources;
+}
+
+std::vector<CvmController::StagedRingAdoption>
+CvmController::FindStagedRingAdoptions() {
+    // 互备 1.4 ②：枚举 ring-adopt staging rank（staging 签名 = primary=
+    // 本机 且 kMigrating 且 migrating_to 为空——reshard 阶段 1 的
+    // migrating_to=目标、迁出 barrier 的 primary=源，均不落入此签名）。
+    // 供 supervisor RingStandbyRuntime 低频拉取（5s，与 GetRingStandby
+    // Sources 同轮询），staging 集稳态为空，零开销。视图为锁内快照，
+    // dead primary 记录单独加锁拷贝（写入方 ReconcileRole 线程）。
+    std::vector<StagedRingAdoption> out;
+    const RingSlotsView view = BuildRingSlotsView();
+    if (!view.active()) {
+        return out;  // 环模型未启用：无 staging 可能
+    }
+    std::map<uint32_t, std::string> staged;
+    {
+        std::lock_guard<std::mutex> lock(ring_slots_mutex_);
+        staged = staged_adoption_source_;
+    }
+    for (const auto& a : view.assigns()) {
+        if (a.primary_id != config_.master_id ||
+            static_cast<SlotState>(a.state) != SlotState::kMigrating ||
+            !a.migrating_to_id.empty()) {
+            continue;
+        }
+        StagedRingAdoption item;
+        item.rank = a.rank;
+        item.epoch = a.epoch;
+        const auto it = staged.find(a.rank);
+        if (it != staged.end()) {
+            item.dead_primary_id = it->second;
+        }
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+ErrorCode CvmController::FinalizeRingAdoption(
+    uint32_t rank, uint64_t expected_epoch,
+    const std::string& dead_primary_id) {
+    // 互备 1.4 ③：物化完成后 kMigrating→kStable 收尾。epoch CAS 单赢家：
+    // 检测后 epoch 已被并发推进时返回 STALE_ROUTE（他方收尾 / 管理员
+    // reshard / 领养者失秩让位），调用方静默接受——下轮检测按新视图重判。
+    // standby 列表保留（nullptr）：P3 不做补位（§16.15.3），原列表在
+    // staging CAS 时已去掉本机。dead_primary_id 仅入日志语境（old_owner）。
+    RingSlotAssign out;
+    const ErrorCode err = EtcdViewStore::AdoptRankViaCAS(
+        config_.cluster_namespace, rank, expected_epoch, config_.master_id,
+        SlotState::kStable, "", out, nullptr, "ring-adopt-complete",
+        dead_primary_id);
+    if (err == ErrorCode::OK) {
+        std::lock_guard<std::mutex> lock(ring_slots_mutex_);
+        staged_adoption_source_.erase(rank);
+    }
+    return err;
+}
+
+bool CvmController::StandbyMutualPairingEnabled() {
+    // 公有静态门面：转发匿名命名空间进程级缓存实现。调用方——
+    // TryAssignRankForSelf 已归属门控（互备 1.1）与 supervisor
+    // RingStandbyRuntime::Start（互备 1.3.2）——两侧始终同值。
+    return MutualPairingToggleEnabled();
 }
 
 bool CvmController::TryPromoteDeadPrimaryRanks(
@@ -967,21 +1243,50 @@ bool CvmController::TryPromoteDeadPrimaryRanks(
             }
         }
 
-        // CAS 抢 owner（§16.15.4：晋升先于 serving）。state 强制 kStable：
-        // 源在 kMigrating 中挂掉的 reshard 即中止（迁移窗口数据由已安装
-        // 部分保留，缺口走冷启动重建），残留 intent 由 AdoptRankViaCAS
-        // 幂等删除（§16.16.7），需要迁移由管理员重新发起。
+        // 互备 1.4 staging 门控：环互备开关下「已归属 serving 成员」
+        //（本机是某存活 rank 的 primary）领养额外 rank——角色不变
+        //（kPrimary→kPrimary），supervisor 升级序列不触发，直接
+        // kStable 发布即空元数据 serve。改走 staging-first：CAS
+        // kMigrating（migrating_to 留空 = ring-adopt 标记）——写屏障立即
+        // 生效且 ImportSlotMetadata 暂缓就绪，物化（OpLog 流重放，复用
+        // 冷接管通道）与 kStable 收尾由 supervisor RingStandbyRuntime
+        // 编排（FindStagedRingAdoptions / FinalizeRingAdoption）。
+        // 纯 standby 领养者（is_primary=false）走原 kStable 直抢——角色
+        // 翻转 kStandby→kPrimary 由 supervisor 升级序列在 serve 前物化。
+        // 开关 OFF 时保持原语义（1.4 未全量部署前行为不变）。
+        const bool serving_adopter =
+            StandbyMutualPairingEnabled() &&
+            view.is_primary(config_.master_id);
+
+        // CAS 抢 owner（§16.15.4：晋升先于 serving）。非 staging 路径
+        // state 强制 kStable：源在 kMigrating 中挂掉的 reshard 即中止
+        //（迁移窗口数据由已安装部分保留，缺口走冷启动重建），残留 intent
+        // 由 AdoptRankViaCAS 幂等删除（§16.16.7），需要迁移由管理员重新
+        // 发起。staging 路径同取 clear_intent=true（接管语义）。
         RingSlotAssign out;
         const ErrorCode err = EtcdViewStore::AdoptRankViaCAS(
             config_.cluster_namespace, a.rank, a.epoch, config_.master_id,
-            SlotState::kStable, "", out, &new_standbys, "promoted",
-            a.primary_id);
+            serving_adopter ? SlotState::kMigrating : SlotState::kStable,
+            "", out, &new_standbys,
+            serving_adopter ? "ring-adopt" : "promoted", a.primary_id);
         if (err == ErrorCode::OK) {
+            if (serving_adopter) {
+                // 记录被领养 rank 的死 primary（物化重放的流命名空间），
+                // 供 RingStandbyRuntime 检测消费；FinalizeRingAdoption
+                // 清除。与 dead_primary_since_ 同锁同线程家族。
+                std::lock_guard<std::mutex> lock(ring_slots_mutex_);
+                staged_adoption_source_[a.rank] = a.primary_id;
+            }
             LogStepOutcome(kPhasePromote, kStepDone,
                            "rank=" + std::to_string(a.rank) +
-                               " promoted (dead primary " + a.primary_id +
-                               ", timeout_bypass=" +
-                               std::to_string(timeout_bypass) + ")");
+                               (serving_adopter ? " ring-adopt staged (dead primary "
+                                                : " promoted (dead primary ") +
+                               a.primary_id +
+                               (serving_adopter
+                                    ? ")"
+                                    : ", timeout_bypass=" +
+                                          std::to_string(timeout_bypass) +
+                                          ")"));
             return true;
         }
         if (err == ErrorCode::STALE_ROUTE) {
@@ -1009,7 +1314,7 @@ bool CvmController::TryPromoteDeadPrimaryRanks(
 bool CvmController::TryBootstrapRingSlots() {
     // 新集群冷启动 bootstrap（§16.15.3 关键段）：本机是唯一存活成员 →
     // 创建全 G 个 rank——rank0 原生持有，rank1..G-1 由本机兼管
-    // （primary_id 相同，§16.8.1 隐含判定），保证 16384 slot 自始有
+    // （primary_id 相同，§16.8.1 隐含判定），保证全部 slot 自始有
     // owner。G = submaster_count（部署常量，§16.8 前提）随 cluster_meta
     // 一并定型，此后恒不变（冷操作才能改）。
     const uint32_t group_count =
@@ -1018,6 +1323,7 @@ bool CvmController::TryBootstrapRingSlots() {
     RingMeta meta;
     meta.submaster_count = config_.submaster_count;
     meta.slot_group_count = group_count;
+    meta.slot_count = SlotCount();
     const ErrorCode meta_err = EtcdViewStore::SaveClusterMeta(
         config_.cluster_namespace, meta);
     if (meta_err != ErrorCode::OK) {
@@ -1067,7 +1373,8 @@ void CvmController::LogStepOutcome(int phase, int outcome,
     static const char* kPhaseNames[] = {"repair-missing-ranks",
                                         "claim-dead-primary", "claim-caretaker",
                                         "join-standby", "promote-dead-primary",
-                                        "designated-takeover"};
+                                        "designated-takeover",
+                                        "join-standby-ring"};
     static const char* kOutcomeNames[] = {"no-candidate", "done", "abort"};
     const int last =
         last_phase_outcome_[phase].load(std::memory_order_relaxed);
@@ -1152,7 +1459,18 @@ bool CvmController::TryAssignRankForSelf(
     }
 
     if (view.is_assigned(config_.master_id)) {
-        return changed;  // 已有归属（含迁移目标）：无需补位
+        // 已有归属（含迁移目标）：不参与 ①/② 接管（接管面收缩到未归属
+        // 待命池 + standby 晋升，防一成员故障引发全员接管风暴）。环互备
+        // 配对（互备 1.1）挂在 MC_STANDBY_MUTUAL_PAIRING 开关后面：
+        // 回放运行时（1.3）未部署前必须保持 OFF——空 standby_ids 记录
+        // 会被 TryPromote 优先晋升而导出空元数据（正确性闸门）。
+        if (!StandbyMutualPairingEnabled()) {
+            return changed;
+        }
+        // 指派候选者由确定性环拓扑推导（全集群对同一 rank 唯一写者），
+        // 无 CAS 竞争，故无需「最早的未归属成员」轮次门控。
+        const int step = JoinAsStandbyRing(view, members, group_count);
+        return step == kStepDone ? true : changed;
     }
 
     // 「排序最早的未归属存活成员」门控（§16.18.2）：按 rank 升序逐个补，
@@ -1428,13 +1746,28 @@ int CvmController::JoinAsStandby(
     const std::vector<MasterRegistration>& members) {
     // ③ primary 存活但无存活 standby 的 rank（§16.18.2 步 2，rank 升序）：
     // CAS 加入 standby_ids（1:1 整体替换，§16.18.1；顺带清死亡 standby）。
-    // kMigrating 的 rank 跳过（迁移瞬态，完成后下周期补）。
-    int dead_or_empty = 0, migrating = 0, already_paired = 0;
+    // kMigrating 的 rank 跳过（迁移瞬态，完成后下周期补——注意：该「下周期
+    // 补」仅对 N+ 部署（成员数 > submaster_count，待命池非空）的未归属
+    // 候选者可达；submaster_count=N 满配部署下迁移完成的新 owner 属「已
+    // 归属」成员，被 TryAssignRankForSelf 阶段 0 门控挡在本 phase3 之外——
+    // 该缺口由已归属成员环互备配对（JoinAsStandbyRing，互备 1.1）补齐：
+    // 满 N 部署下由环拓扑指派各 rank 的 standby，开关见
+    // StandbyMutualPairingEnabled。
+    int dead_or_empty = 0, migrating = 0, already_paired = 0, self_primary = 0;
     for (const auto& a : view.assigns()) {
         if (a.primary_id.empty() || !IsMemberAlive(members, a.primary_id)) {
             ++dead_or_empty;
             VLOG(1) << "assign phase3 skip rank=" << a.rank
                     << ": primary dead or empty";
+            continue;
+        }
+        // 防自配对：本机是该 rank 的 primary 时不能同时担任其 standby
+        //（当前门控下未归属候选者不会命中；为未来放开已归属成员互备
+        // 预置的防御）。
+        if (a.primary_id == config_.master_id) {
+            ++self_primary;
+            VLOG(1) << "assign phase3 skip rank=" << a.rank
+                    << ": self is primary";
             continue;
         }
         if (static_cast<SlotState>(a.state) == SlotState::kMigrating) {
@@ -1483,7 +1816,131 @@ int CvmController::JoinAsStandby(
                    "scanned=" + std::to_string(view.assigns().size()) +
                        ", dead_or_empty=" + std::to_string(dead_or_empty) +
                        ", migrating=" + std::to_string(migrating) +
-                       ", already_paired=" + std::to_string(already_paired));
+                       ", already_paired=" + std::to_string(already_paired) +
+                       ", self_primary=" + std::to_string(self_primary));
+    return kStepNoCandidate;
+}
+
+int CvmController::JoinAsStandbyRing(
+    const RingSlotsView& view,
+    const std::vector<MasterRegistration>& members,
+    uint32_t group_count) {
+    // 已归属成员环互备（互备 1.1，调用方已验证开关 + 已归属身份）：
+    //   - 指派规则（确定性推导，免协商免竞争）：rank r 的唯一指派候选者
+    //     = 沿 rank 升序环找下一个「有存活 primary 的 rank」的 primary；
+    //     候选者与目标 primary 同机（跨机约束，SamePrimaryHost 保守语义）
+    //     或即目标 primary 兼任自身（caretaker 多 rank）时顺延下一个；
+    //     全环顺延失败 → 该 rank 本周期不配对。
+    //   - 仅「指派候选者 == 本机」才 CAS（1:1 整体替换，同阶段 ③ 语义，
+    //     顺带清死亡 standby）。指派唯一 → 全集群对同一 rank 唯一写者，
+    //     CAS 冲突仅来自并发写（epoch 竞态），kStepAbort 下周期重判。
+    //   - 已有存活 standby 的 rank 不强制重拓扑：防成员变动期配对抖动，
+    //     旧配对保持到该 standby 自然死亡后由新指派接续。
+    //   - 单周期单动作（与阶段 ①-③ 一致）：多 rank 指派（caretaker
+    //     场景本机可被指派多个 rank）跨多个周期逐步配齐。
+    //   - kMigrating 跳过（迁移瞬态，完成后下周期重判）；本机是迁移目标
+    //     不影响配对资格（standby 职责仅与目标 rank 相关）。
+    if (group_count == 0) {
+        return kStepNoCandidate;
+    }
+    // rank 升序快照（确定性单动作顺序 + 环顺延查找）。
+    std::map<uint32_t, const RingSlotAssign*> by_rank;
+    for (const auto& na : view.assigns()) {
+        by_rank.emplace(na.rank, &na);
+    }
+    // master_id → address（跨机判定用；members 为存活全集，查找必中）。
+    std::map<std::string, std::string> address_by_master;
+    for (const auto& m : members) {
+        address_by_master.emplace(m.master_id, m.address);
+    }
+
+    int dead_or_empty = 0, migrating = 0, already_paired = 0, self_primary = 0,
+        same_host_skip = 0, not_designated = 0;
+    for (const auto& [rank, ap] : by_rank) {
+        (void)rank;
+        const RingSlotAssign& a = *ap;
+        if (a.primary_id.empty() || !IsMemberAlive(members, a.primary_id)) {
+            ++dead_or_empty;
+            continue;
+        }
+        if (static_cast<SlotState>(a.state) == SlotState::kMigrating) {
+            ++migrating;  // 迁移瞬态：完成后下周期重判
+            continue;
+        }
+        bool has_live_standby = false;
+        for (const auto& sid : a.standby_ids) {
+            if (IsMemberAlive(members, sid)) {
+                has_live_standby = true;
+                break;
+            }
+        }
+        if (has_live_standby) {
+            ++already_paired;  // 不强制重拓扑：旧配对保持到自然死亡
+            continue;
+        }
+        if (a.primary_id == config_.master_id) {
+            ++self_primary;  // 防自配对（caretaker 顺延链可达自身）
+            continue;
+        }
+        // 环指派 + 跨机顺延：推导本 rank 的唯一指派候选者。
+        std::string designated;
+        for (uint32_t step = 1; step < group_count; ++step) {
+            const uint32_t next_rank = (a.rank + step) % group_count;
+            const auto next_it = by_rank.find(next_rank);
+            if (next_it == by_rank.end()) {
+                continue;  // 记录缺失（防御：阶段 0 已补建）：顺延
+            }
+            const std::string& cand = next_it->second->primary_id;
+            if (cand.empty() || !IsMemberAlive(members, cand)) {
+                continue;  // 该 rank 无存活 primary：顺延
+            }
+            if (cand == a.primary_id) {
+                continue;  // 目标 primary 兼任（caretaker 多 rank）：顺延
+            }
+            if (SamePrimaryHost(cand, a.primary_id, address_by_master)) {
+                ++same_host_skip;  // 跨机约束：同机顺延
+                continue;
+            }
+            designated = cand;
+            break;
+        }
+        if (designated != config_.master_id) {
+            // 空候选（单成员/全同机）或指派他人：不动（指派者自会处理）。
+            ++not_designated;
+            continue;
+        }
+        // 指派本机：CAS 加入 standby_ids（1:1 整体替换，同阶段 ③ 原语）。
+        std::vector<std::string> new_standbys{config_.master_id};
+        RingSlotAssign out;
+        const ErrorCode err = EtcdViewStore::CASSwitchRingSlotOwner(
+            config_.cluster_namespace, a.rank, a.epoch, a.primary_id,
+            static_cast<SlotState>(a.state), a.migrating_to_id, out,
+            &new_standbys);
+        if (err == ErrorCode::OK) {
+            LogStepOutcome(kPhaseJoinStandbyRing, kStepDone,
+                           "rank=" + std::to_string(a.rank) +
+                               " joined as standby (ring pairing), primary=" +
+                               a.primary_id +
+                               ", new_epoch=" + std::to_string(out.epoch));
+            return kStepDone;
+        }
+        if (err != ErrorCode::STALE_ROUTE) {
+            LOG(WARNING) << "CvmController standby-ring-join CAS failed: rank="
+                         << a.rank << ", err=" << err;
+        }
+        LogStepOutcome(kPhaseJoinStandbyRing, kStepAbort,
+                       "rank=" + std::to_string(a.rank) +
+                           " CAS unresolved (contested or raced)");
+        return kStepAbort;  // 满配或被抢：下周期重判
+    }
+    LogStepOutcome(kPhaseJoinStandbyRing, kStepNoCandidate,
+                   "scanned=" + std::to_string(by_rank.size()) +
+                       ", dead_or_empty=" + std::to_string(dead_or_empty) +
+                       ", migrating=" + std::to_string(migrating) +
+                       ", already_paired=" + std::to_string(already_paired) +
+                       ", self_primary=" + std::to_string(self_primary) +
+                       ", same_host_skip=" + std::to_string(same_host_skip) +
+                       ", not_designated=" + std::to_string(not_designated));
     return kStepNoCandidate;
 }
 

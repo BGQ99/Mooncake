@@ -47,6 +47,11 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /**
+     * @brief Optional runtime layout table carried by the RPC response.
+     * Only populated for vsegment replicas; shared across a batch.
+     */
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
@@ -764,9 +769,9 @@ class Client {
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
     [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
 
-    // Return the total number of NUMA nodes (counted from the local topology,
-    // which has one cpu:N entry per node regardless of NIC presence).
-    [[nodiscard]] int GetNumaNodeCount() const;
+    // Return sorted NUMA node IDs from the local topology. The topology has one
+    // cpu:N entry per node regardless of NIC presence.
+    [[nodiscard]] std::vector<int> GetNumaNodes() const;
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
@@ -865,25 +870,32 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code,
-                           std::set<std::string>* failed_endpoints = nullptr);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     // failed_endpoints：vsegment 传输失败归因用。vsegment 副本 Descriptor 仅含
     // 逻辑位置，物理端点在传输 plan 中解析；失败时 best-effort 上报 plan 中
     // 全部条带成员端点（无法定位具体失败成员，误报由 worker 重挂载时
     // MountSegment 的 erase 自愈兜底）。非 vsegment 副本不填充。
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices,
-                            std::set<std::string>* failed_endpoints = nullptr);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferReadRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -967,6 +979,12 @@ class Client {
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+    // 上一批次 Put 是否含失败 key（relaxed atomic：观测性辅助，非正确性；
+    // 并发批量下尽力转变检测）。失败→恢复的转变批次打一条 INFO——与
+    // CollectResults 的逐 key ERROR 对应，作为「客户端写入恢复」的明确
+    // 观测点（如 SLOT_MIGRATING 风暴后 master 就绪、写入重新流通），
+    // 稳态成功批次静默。
+    std::atomic<bool> last_batch_put_failed_{false};
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
         std::vector<PutOperation>& ops);
@@ -994,10 +1012,6 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
-    std::unique_ptr<vsegment::VSegmentViewProvider> vsegment_view_provider_;
-    std::unique_ptr<vsegment::SegmentEndpointResolver>
-        vsegment_endpoint_resolver_;
-    std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
     // Registered client memory used when Copy/Move reads a non-local source
@@ -1129,7 +1143,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const std::vector<VSegmentLayoutEntry>* layouts);
 
     /**
      * @brief Copy an object's replica to target segments

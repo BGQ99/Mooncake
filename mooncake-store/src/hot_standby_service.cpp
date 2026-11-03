@@ -54,7 +54,23 @@ bool HotStandbyService::StandbyMetadataStore::PutMetadata(
     const StandbyObjectMetadata& metadata) {
     const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[normalized][key] = metadata;
+    // 单调 seq 防护（重放幂等）：严格更旧的条目不覆盖已存储的更新条目。
+    // 正常 standby 跟随（按流序应用）不会触发；防的是 OpLog 重放路径
+    // （MasterService 自恢复 / 冷接管死 owner 重放）复用本原语时的
+    // 重复 / 乱序二次应用——定局集合（oplog_replay_finalized_sources_）
+    // 是内存态，跨重启丢失后二次重放由此兜底。seq 相等时保持旧语义
+    // （覆盖），不改同 seq 边角行为。
+    auto& tenant_store = store_[normalized];
+    const auto found = tenant_store.find(key);
+    if (found != tenant_store.end() &&
+        metadata.last_sequence_id < found->second.last_sequence_id) {
+        VLOG(1) << "StandbyMetadataStore: stale entry skipped tenant="
+                << normalized << ", key=" << key
+                << ", incoming_seq=" << metadata.last_sequence_id
+                << ", stored_seq=" << found->second.last_sequence_id;
+        return true;
+    }
+    tenant_store[key] = metadata;
     VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
             << ", key=" << key << ", replicas=" << metadata.replicas.size()
             << ", size=" << metadata.size;
@@ -817,36 +833,12 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 }
 
 bool HotStandbyService::ApplyVSegmentState(const OpLogEntry& entry) {
-    vsegment::VSegmentOpLogRecord record;
-    try {
-        struct_json::from_json(record, entry.payload);
-    } catch (const std::exception& error) {
-        LOG(ERROR) << "Failed to decode vsegment state: " << error.what();
-        return false;
-    }
-    if (record.partition_id.empty() ||
-        record.state.partition_id != record.partition_id ||
-        record.state.route_epoch != record.route_epoch ||
-        record.state.metadata_revision != record.metadata_revision) {
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(vsegment_mutex_);
-    auto found = vsegment_partitions_.find(record.partition_id);
-    if (found != vsegment_partitions_.end()) {
-        const auto& current = found->second;
-        if (record.metadata_revision <= current.metadata_revision) return true;
-        if (record.metadata_revision != current.metadata_revision + 1 ||
-            record.route_epoch < current.route_epoch) {
-            return false;
-        }
-        found->second = std::move(record.state);
-    } else {
-        if (record.metadata_revision != 1) return false;
-        vsegment_partitions_.emplace(record.partition_id,
-                                     std::move(record.state));
-    }
-    return true;
+    std::string detail;
+    const auto error = vsegment::ApplyVSegmentStateEntry(entry, vsegment_partitions_, &detail);
+    if (error != ErrorCode::OK)
+        LOG(ERROR) << "Failed to replay vsegment state: " << detail;
+    return error == ErrorCode::OK;
 }
 
 void HotStandbyService::CollectVSegmentPartitions(

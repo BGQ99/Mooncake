@@ -69,10 +69,6 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default",
         uint64_t client_trace_id = 0, const UUID& client_id = {});
-    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& partition_id, const std::string& vsegment_id);
-    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -118,7 +114,7 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,
@@ -307,10 +303,24 @@ class WrappedMasterService {
                                 vsegment::PartitionVSegmentSnapshot>&
                                 vsegment_partitions = {});
 
+    // 同身份重启失忆自愈（缺陷3修复）：无 PromotionContext 时从本机
+    // OpLog 流自恢复。Internal（supervisor 调用），NOT an RPC endpoint.
+    bool TrySelfRecoverFromOpLog();
+
+    // 环互备领养物化（互备 1.4）：supervisor RingStandbyRuntime 在
+    // ring-adopt staging 期间的编排入口，三态语义见
+    // MasterService::AdoptMaterializeFromDeadOwner。Internal（supervisor
+    // 调用），NOT an RPC endpoint.
+    ErrorCode AdoptMaterializeFromDeadOwner(const std::string& source_id,
+                                            bool& stream_present);
+
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).
     void SetCvmLeaseId(EtcdLeaseId lease_id);
     void SetCvmController(cvm::CvmController* controller);
+    // vsegment auto-plan 重试策略注入（--vsegment_auto_plan flags 解析），
+    // 转发给内部 MasterService（见 MasterService::SetVSegmentAutoPlanPolicy）。
+    void SetVSegmentAutoPlanPolicy(const vsegment::VSegmentUserPolicy& policy);
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 
@@ -328,6 +338,11 @@ class WrappedMasterService {
     // ownership resolver has populated the local lookup). Forwarded to the
     // wrapped MasterService for use by periodic admin metrics reporting.
     uint32_t GetOwnedSlotCount() const;
+
+    // One-line vsegment/psegment status summary (vsegment enabled state,
+    // quota generation/profiles, installed partitions, vsegment count and
+    // pool composition). Forwarded for the periodic VSegment Status log.
+    std::string GetVSegmentStatusLogLine() const;
 
     // Inter-master allocation forwarding (CVM plan B): allocate memory
     // replicas in this submaster's locally mounted segments on behalf of a
@@ -391,6 +406,15 @@ class WrappedMasterService {
     tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
     InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
                                const std::string& requester_master_id);
+
+    // 心跳交接专用的批量导出变体（slot 就绪加速）：未 staged 的 slot 仅在
+    // 源已观察到失去归属时即时构建（require_not_owned 门控），仍持有归属的
+    // slot 缺席于响应（调用方对其走单 slot 路径重试）。新方法独立注册而非
+    // 改既有签名——滚动升级期间旧 peer 无此方法，调用方收到 RPC 错误后
+    // 回退单 slot 路径，兼容语义由调用方保证。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatchGated(uint16_t first_slot, uint16_t last_slot,
+                                    const std::string& requester_master_id);
 
     // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
     //（DropSlotMetadataRange）。源未观察到归属已切走时返回

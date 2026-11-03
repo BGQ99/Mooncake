@@ -52,12 +52,29 @@ class OrderedOpLogVSegmentCommitter final : public VSegmentStateCommitter {
                      const std::string& mutation,
                      std::string* detail) override;
 
+    // Submission order determines the delta chain. WaitDurable observes the
+    // writer's storage prefix and does not depend on its callback thread.
+    ErrorCode CommitDeferred(
+        const PartitionVSegmentSnapshot& state, const std::string& mutation,
+        std::shared_ptr<VSegmentDeferredCommitHandle>* handle,
+        std::string* detail) override;
+    ErrorCode WaitDurable(
+        const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
+        std::string* detail) override;
+
    private:
     OrderedOpLogWriter* writer_;
     std::chrono::milliseconds durable_wait_warning_interval_;
     std::mutex mutex_;
     std::unordered_map<std::string, PartitionVSegmentSnapshot> last_states_;
 };
+
+// Caller serializes access to states. Both standby and cold recovery use
+// this path so full checkpoints and incremental records share validation.
+ErrorCode ApplyVSegmentStateEntry(
+    const OpLogEntry& entry,
+    std::unordered_map<std::string, PartitionVSegmentSnapshot>& states,
+    std::string* detail = nullptr);
 
 // Replays legacy full-state and current delta records after a snapshot.
 ErrorCode ReplayVSegmentState(

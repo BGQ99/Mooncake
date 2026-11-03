@@ -162,7 +162,7 @@ class MasterClient {
     /**
      * @brief Connects to the master service
      * @param master_addr Master service address (IP:Port)
-     * @return ErrorCode indicating success/failure
+     * @return Per-key PutStartResult values or error codes
      */
     [[nodiscard]] ErrorCode Connect(
         const std::string& master_addr = kDefaultMasterAddress);
@@ -258,11 +258,6 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
-    [[nodiscard]] tl::expected<vsegment::VSegmentView, ErrorCode>
-    GetVSegmentView(const std::string& partition_id,
-                    const std::string& vsegment_id);
-    [[nodiscard]] tl::expected<vsegment::PSegmentLocation, ErrorCode>
-    GetPSegmentEndpoint(const std::string& segment_id);
     [[nodiscard]] vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -318,8 +313,7 @@ class MasterClient {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config);
@@ -1019,7 +1013,26 @@ class MasterClient {
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> InvokeRoutedWithSlotRetry(
         RoutedCallTiming* timing, const std::string& tenant_id,
-        const std::string& key, Args... args);
+        const std::string& key, uint32_t rpc_stat_key, Args... args);
+
+    /**
+     * @brief Batch 路由自愈（与 InvokeRoutedWithSlotRetry 的单 key 版互补）。
+     * 首轮批量分组 RPC 收到 STALE_ROUTE / SLOT_NOT_OWNED / SLOT_MIGRATING
+     * / 无 owner 空分组（UNAVAILABLE_IN_CURRENT_STATUS）的 key 子集：
+     * 含 SLOT_MIGRATING 时先轻量退避一轮（60ms，等 slot import/replay
+     * 就绪），再 RefreshSubmasterRouting 刷新路由后仅对失败子集重新分组
+     * 重发一次（有界 1 次）；重发后仍失败的 key 保持终态错误，语义与首轮一致。
+     * @param tenant_id 失败子集重新分组用租户。
+     * @param results 原批结果（in/out）：send_group 写回，其余不动。
+     * @param send_group(submaster, group_keys, group_orig_indices) 负责单组
+     * 重发并把组内结果写回 results（group_orig_indices 为组内 key 在原批
+     * 中的下标）；返回组内是否全部成功（仅用于打点）。
+     */
+    template <typename ResultType, typename SendGroupFn>
+    void RetryBatchOnStaleRoute(
+        const std::string& tenant_id, const std::vector<std::string>& keys,
+        std::vector<tl::expected<ResultType, ErrorCode>>& results,
+        SendGroupFn send_group);
 
     /**
      * @brief Switches the underlying RPC pool to the given submaster address.

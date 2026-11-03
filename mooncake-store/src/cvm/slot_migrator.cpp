@@ -56,10 +56,17 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
 
     // 释放：旧 owner stage 导出元数据（on_release 投递到内存缓存，等新
     // owner RPC 拉取）。slot 归属不再写 etcd，故此处无 Delete 操作。
-    for (uint16_t slot : released) {
-        if (on_release_) {
-            on_release_(slot);
+    for (size_t i = 0; i < released.size();) {
+        size_t end = i + 1;
+        while (end < released.size() && end - i < 128 &&
+               released[end] == released[end - 1] + 1)
+            ++end;
+        if (on_release_range_) {
+            on_release_range_(released[i], released[end - 1]);
+        } else if (on_release_) {
+            for (size_t j = i; j < end; ++j) on_release_(released[j]);
         }
+        i = end;
     }
     if (!released.empty()) {
         LOG(INFO) << "SlotMigrator released master_id=" << config_.master_id
@@ -74,14 +81,45 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
     std::vector<uint16_t> pending;
     acquired_slots.reserve(gained.size());
     pending.reserve(gained.size());
-    for (uint16_t slot : gained) {
-        ErrorCode err = on_acquire_ ? on_acquire_(slot) : ErrorCode::OK;
-        if (err == ErrorCode::OK) {
-            acquired_slots.push_back(slot);
-        } else {
+    auto record_result = [&](uint16_t slot, ErrorCode error) {
+        if (error == ErrorCode::OK) acquired_slots.push_back(slot);
+        else {
             pending.push_back(slot);
-            last_err = err;
+            last_err = error;
         }
+    };
+    // 段级批量 acquire（slot 就绪加速）：gained 升序天然聚成连续区间（slot
+    // 归属按 rank 段划分），足够长的区间整段回调（实现内部按旧 owner 分组
+    // 合并 RPC），短区间 / 未设置批量钩子 / 整段失败时退回逐 slot 路径，
+    // 分类与重试语义完全一致。
+    constexpr size_t kMinRangeAcquireBatchSize = 8;
+    for (size_t i = 0; i < gained.size();) {
+        size_t j = i;
+        while (j + 1 < gained.size() && gained[j + 1] == gained[j] + 1) {
+            ++j;
+        }
+        const size_t range_len = j - i + 1;
+        bool range_done = false;
+        if (on_acquire_range_ && range_len >= kMinRangeAcquireBatchSize) {
+            std::vector<ErrorCode> results(range_len, ErrorCode::OK);
+            const ErrorCode range_err =
+                on_acquire_range_(gained[i], gained[j], results);
+            if (range_err == ErrorCode::OK && results.size() == range_len) {
+                for (size_t k = 0; k < range_len; ++k) {
+                    record_result(gained[i + k], results[k]);
+                }
+                range_done = true;
+            }
+            // 整段失败（实现未兜底的异常路径）→ 逐 slot 兜底重放。
+        }
+        if (!range_done) {
+            for (size_t k = 0; k < range_len; ++k) {
+                const uint16_t slot = gained[i + k];
+                record_result(slot,
+                              on_acquire_ ? on_acquire_(slot) : ErrorCode::OK);
+            }
+        }
+        i = j + 1;
     }
     if (!acquired_slots.empty()) {
         LOG(INFO) << "SlotMigrator acquired master_id=" << config_.master_id
@@ -106,7 +144,7 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
                             pending.end(), std::back_inserter(final_set));
     }
     last_owned_slots_ = std::move(final_set);
-    return last_err;
+    return pending.empty() ? ErrorCode::OK : last_err;
 }
 
 }  // namespace cvm
