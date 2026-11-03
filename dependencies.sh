@@ -93,8 +93,11 @@ INSTALL_SPDK=false
 # 批量排空、大 I/O 与 per-I/O trace 开关只在 v6 生效。
 # Modified By Yida (urma_enable_v2): SE_Review v2 生命周期收敛 (da037fbc7) 与
 # Round 7 v2 阶段遥测与 queued response 生命周期修复；wire v4，两端必须同版本部署。
+# Modified By Senorita (urma_enable_v2 前移): qpair drain 收尾（retire posted
+# receive refs）、split I/O qpair 容量、URMA/NVMe 读取尾段阶段遥测与
+# urma_stage_buffer 统一缓冲处理（9b5cd59ca..e12b7cb21，共 5 提交）。
 SPDK_URMA_REPO_DEFAULT="https://github.com/yyyuanhao426-hash/spdk.git"
-SPDK_URMA_REF_DEFAULT="4f8a8466d495df8bb9eb42d62e6b3282174b5e1e" # urma_enable_v2
+SPDK_URMA_REF_DEFAULT="e12b7cb213a9c1a2a22b99ab4732c8c11f95032c" # urma_enable_v2
 SPDK_REPO_URL=""
 SPDK_REF="v23.01.1"
 WITH_URMA=false
