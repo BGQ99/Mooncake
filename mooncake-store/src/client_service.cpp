@@ -3000,7 +3000,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     ReportFailedEndpointsToMasters(failed_endpoints);
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         SpDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
@@ -3043,7 +3043,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         };
         MC_LOG(INFO) << "client_put_breakdown trace_id=" << trace_id
                      << " key=" << key << " slices=" << slices.size()
-                     << " replicas=" << start_result.value().size()
+                     << " replicas=" << start_result.value().replicas.size()
                      << " checksum_us="
                      << elapsed_us(breakdown_start, checksum_end)
                      << " prepare_us=" << elapsed_us(checksum_end, prepare_end)

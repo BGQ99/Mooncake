@@ -1,24 +1,23 @@
-# Mooncake 930 分支编译部署 + JD Benchmark 测试流程
+# Mooncake 930 分支编译部署 + 1-1 Get Benchmark 测试流程
 
-> 目标：把合并后的 `nof-gdr-supercache-snapshot-930` 分支（上游 930 + 我们的 NoF/URMA
-> 实现 + JD bench 兼容层）编译部署到集群，然后用 JD 的
-> **Mooncake-Performance** 基准套件（`python benchmark.py -f configs/basic/demo.json`
-> 用法）跑冒烟与正式场景。
+> 目标：把 `nof-gdr-supercache-snapshot-930` 分支（commit `706551a8`）编译部署到集群节点，
+> 然后用 `stress_cluster_bench` 跑 NoF 1-1 Get 性能测试（单 source / 多并发组合）。
 >
-> - 代码：`~/nof/upstream/mooncake-supercache-nof-gdr-worktree`（分支
->   `nof-gdr-supercache-snapshot-930`，HEAD `d4ab36cb`，commit 链
->   abcc31fb → 83c710f5(env 兼容层) → dd41299f → 3e1b45f9(上游合并) → 089da5b8(bench 合并) → d4ab36cb(SPDK pin)）
-> - bench：`~/nof/upstream/Mooncake-Performance`（编排机即可，勿需编译；语义见其 README）
-> - 关联文档：[`../mooncake_nof_deployment.md`](../mooncake_nof_deployment.md)（部署踩坑总账）、
->   [`mooncake_deployment_gdr.md`](mooncake_deployment_gdr.md)（GDR 叠加）、
->   skill `mooncake-nof-bench`（集群拓扑 / 环境变量 / 历史基线）、
->   `Mooncake-Performance/README.md`（bench 全语义）
+> - 代码仓库：`https://github.com/LeeJace993/Mooncake.git`，分支 `nof-gdr-supercache-snapshot-930`
+> - HEAD commit：`706551a8`（`docs: add nof-gdr-930 build/deploy + JD benchmark runbook`）
+> - SPDK：pin `e12b7cb213a9c1a2a22b99ab4732c8c11f95032c`（urma_enable_v2，wire v4 遥测 72B）
+> - 关联文档：skill `mooncake-nof-bench`（集群拓扑 / 环境变量 / 历史基线）
 >
-> 集群拓扑沿用 skill：node1 141.61.84.245 / node2 141.61.84.247 / node3 141.61.84.149 /
-> node4 141.61.84.151，任意节点可任角色；SSH
-> `ssh -i ~/.ssh/urma_diag_key -o BatchMode=yes -o StrictHostKeyChecking=no root@<ip>`。
-> 下文以「**target 节点**（SPDK NoF target，挂 SSD）」「**store 节点**（master + metadata
-> + store client）」「**client 节点**（仅 bench client）」指代，跑测试前先按用户指定定角色。
+> 集群拓扑：node1 141.61.84.245 / node2 141.61.84.247 / node3 141.61.84.149 /
+> node4 141.61.84.151，任意节点可任角色。
+>
+> SSH（本机 Git bash → ssh.exe）：
+> ```bash
+> "/c/Program Files (x86)/Git/bin/ssh.exe" \
+>   -i /c/Users/y00988740/.ssh/urma_diag_key \
+>   -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+>   root@<node-ip> "<command>"
+> ```
 
 ---
 
@@ -26,135 +25,190 @@
 
 | 编号 | 进程 | 节点 | 启动方式 | 生命周期 | 存活确认 |
 |---|---|---|---|---|---|
-| P0 | `nvmf_tgt`（NoF target） | target | `sudo -E nvmf_tgt -m 0xfc` + RPC（§3.1） | 常驻；**target 重启后重来** | `ss -tlnp \| grep 4420` |
-| P1 | `http_metadata_server` | store | `python -m mooncake.http_metadata_server --port 8080` | 常驻 | `curl http://127.0.0.1:8080/metadata` |
-| P2 | `mooncake_master` | store | `./build/mooncake-store/mooncake_master --port 50051 --metrics_port 9003` | 常驻 | `ss -tlnp \| grep 50051` |
-| P3 | NoF SSD 注册（一次性） | store | `python -m mooncake.mooncake_ssd_register --transport-type URMA …` | 跑一次即退 | master 日志/`:9003` 看到 SSD |
-| P4 | `mooncake_client`（store 实例） | store | `./build/mooncake-store/mooncake_client --global_segment_size 4GB …` | 常驻 | 日志 SPDK env 初始化成功 |
-| P5 | JD bench（编排机驱动） | client/store | `python benchmark.py -f …`（编排机发起，ssh 到各节点拉起 client 进程） | 按场景 | `outputs/<ts>/` 有 CSV |
+| P0 | `nvmf_tgt`（NoF target） | target | `nvmf_tgt -m 0xfc --wait-for-rpc -r <sock>` + RPC（§3.1） | 常驻；**target 重启后重来** | `ss -tlnp \| grep 4420` |
+| P1 | `http_metadata_server` | store/reader | `python -m mooncake.http_metadata_server --port 8080` | 常驻 | `curl http://127.0.0.1:8080/metadata` |
+| P2 | `mooncake_master` | store/reader | `mooncake_master --rpc_port=50051 --metrics_port=9003 ...` | 常驻 | `ss -tlnp \| grep 50051` |
+| P3 | NoF SSD 注册（一次性） | reader | `nof_register <nqn> <nsid> <traddr> <trsvcid> <trtype> <master_addr> [size_bytes]` | 跑一次即退 | master 日志/`:9003` 看到 SSD |
+| P4 | `mooncake_client`（store 实例） | store | `mooncake_client --host <IP> ... --device_names udmac0d1e2` | 常驻 | 日志 "UbTransport init done" |
+| P5 | `stress_cluster_bench` | reader | `./stress_cluster_bench --scenario=segment_read ...` | 按 duration 退出 | 日志 "Throughput (avg)" |
 
 ⚠️ **master 重启后 NoF segment 丢失**（segment 挂在 master 内存里），P3 必须重跑；
-target 重启则 P0 全套（vfio 绑定 + takeover + RPC + P3）重来。
+target 重启则 P0 全套（vfio 绑定 + RPC + P3）重来。
 
 ---
 
-## 1. 编译（store 节点；client 节点用 wheel）
+## 1. 编译部署
 
-只有 store 节点（要跑 master/store client/注册工具）需要完整编译；target 节点只装
-SPDK；client 节点只装 mooncake Python 包（wheel，见 §1.4）。
+### 1.1 前提：SPDK e12b7cb21（两节点都要）
 
-### 1.1 依赖一键安装（store 节点 + target 节点）
-
-```bash
-cd ~/nof/upstream/mooncake-supercache-nof-gdr-worktree
-sudo ./dependencies.sh -y --with-spdk --with-urma=<UMDK 安装前缀>
-# 例（按各节点实际路径，find /home/yin/gdr -name urma_api.h 先定位）：
-# sudo ./dependencies.sh -y --with-spdk --with-urma=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk
-```
-
-脚本行为：系统包 → git submodule（含 **extern/yalantinglibs**，930 起在树内消费，
-当前 pin `43948ffb`，必须包含我们的 `e46cbf08`）→ 从子模块构建安装 ylt → Go →
-SPDK。SPDK 来源由分支内 `dependencies.sh` 钉死：
-
-- repo `https://github.com/yyyuanhao426-hash/spdk.git`
-- ref `e12b7cb213a9c1a2a22b99ab4732c8c11f95032c`（urma_enable_v2，qpair drain 收尾 +
-  stage 遥测 + urma_stage_buffer，5 提交前移）
-
-⚠️ **initiator/target 两端必须同一 commit**（wire v4 遥测 72B，v3/v4 不能混用）。
-两端装完后都自检：
+SPDK 已预装在两节点的 `/home/yin/nof/spdk` 和 `/usr/local/bin/nvmf_tgt`（`make install`）。
+如需重编：
 
 ```bash
-ls /usr/local/include/spdk/nvme_urma.h            # URMA 分支头文件
+# 在节点上
+cd /home/yin/nof/spdk
+git log --oneline -1        # 必须 e12b7cb213a9c1a2a22b99ab4732c8c11f95032c
+./configure --with-rdma --with-urma=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk \
+            --disable-unit-tests   # e12b7cb21+ 需加此 flag 避开 spdk_get_ticks 链接回归
+make -j$(nproc) && make install
+# 验收
+ls /usr/local/include/spdk/nvme_urma.h
 ls /usr/local/lib/libspdk_nvme.a
-cd <spdk 源码树> && git log --oneline -1           # 必须 e12b7cb2…
 ```
 
-⚠️ `make install` 末尾报 `hatchling`/`uv` Error 2 ≠ 失败（ADR-0018）：以
-`/usr/local/lib/libspdk_nvme.a` 存在为准。
+⚠️ **两端 SPDK 必须同一 commit**（wire v4 遥测 72B，v3/v4 不能混用）。
 
-930 新增说明：`mooncake-common/common.cmake` 优先 `add_subdirectory(extern/yalantinglibs)`
-在树内消费 ylt，不再依赖系统安装的 ylt 版本；老文档里「单独重建安装 yalantinglibs」
-一步对编译不再是必需（dependencies.sh 里的安装对 wheel 打包仍无害）。
-可选 `-DYLT_ENABLE_URMA=ON` 启用上游 URMA RPC transport（`MC_YLT_URMA_*`），
-JD bench 走 tcp RPC + ub/NoF 数据面，**不需要**它。
-
-### 1.2 编译 Mooncake（store 节点）
+### 1.2 克隆 930 分支
 
 ```bash
-cd ~/nof/upstream/mooncake-supercache-nof-gdr-worktree
-python3 -m venv ~/venvs/mooncake-bench && source ~/venvs/mooncake-bench/bin/activate
-pip install -U pip && pip install aiohttp paramiko   # metadata server / 注册脚本运行期依赖
+# 在节点上
+cd /home/yin/nof
+git clone --branch nof-gdr-supercache-snapshot-930 \
+          --recurse-submodules \
+          https://github.com/LeeJace993/Mooncake.git \
+          mooncake-930
+cd mooncake-930
+git log --oneline -1        # 必须 706551a8
+```
 
+⚠️ **node2 代理陷阱**：node2 的 `~/.gitconfig` 配了坏代理 `141.1.139.187:8989`（不可达）。
+clone 前必须覆盖：
+
+```bash
+export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
+export GIT_CONFIG_COUNT=2 \
+       GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0=http://127.0.0.1:3128 \
+       GIT_CONFIG_KEY_1=https.proxy GIT_CONFIG_VALUE_1=http://127.0.0.1:3128
+# 然后再 git clone
+```
+
+### 1.3 Python venv + 依赖
+
+```bash
+cd /home/yin/nof/mooncake-930
+python3 -m venv ~/venvs/mooncake-bench
+source ~/venvs/mooncake-bench/bin/activate
+pip install -U pip && pip install aiohttp paramiko   # metadata server / 注册脚本运行期依赖
+```
+
+### 1.4 修复源码 bug：client_service.cpp:3046
+
+⚠️ **930 分支自带一个编译错误**：`client_service.cpp` 第 3046 行调用了
+`start_result.value().size()`，但 `PutStartResult` 结构体（定义在 `rpc_types.h:98`）
+没有 `size()` 方法，只有 `replicas`（vector）。需手动修复：
+
+```bash
+cd /home/yin/nof/mooncake-930
+# 修复前先备份
+cp mooncake-store/src/client_service.cpp mooncake-store/src/client_service.cpp.bak_706551a8
+# 将 .size() 改为 .replicas.size()
+sed -i '3046s/start_result.value().size()/start_result.value().replicas.size()/' \
+    mooncake-store/src/client_service.cpp
+# 验证
+sed -n '3046p' mooncake-store/src/client_service.cpp
+# 应输出： << " replicas=" << start_result.value().replicas.size()
+```
+
+### 1.5 cmake + make
+
+两节点的 UMDK 头文件路径不同，cmake 参数有差异：
+
+#### node4（UMDK_tool 头文件完整）
+
+```bash
+cd /home/yin/nof/mooncake-930
+source ~/venvs/mooncake-bench/bin/activate
 mkdir -p build && cd build
-export UMDK_ROOT=/home/yin/gdr/UMDK_netlab   # cmake 期要头文件（含 is_gpu_seg 才有 GDR）；
-                                             # 无 GPU Direct 需求也必须能找到 urma_api.h/liburma
 cmake .. -DUSE_NOF=ON \
          -DUSE_NOF_URMA=ON \
          -DUSE_UB=ON \
          -DCMAKE_BUILD_TYPE=Release \
-         -DUMDK_ROOT=$UMDK_ROOT
-         # GPU Direct 叠加：再加 -DUSE_NOF_GPU_DIRECT=ON -DUSE_CUDA=ON
+         -DUMDK_ROOT=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk \
+         -DURMA_LIBRARY=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so
 make -j$(nproc)
-make install     # 二进制 + pybind store.so + mooncake_*.py 装进 configure 时的 venv
+make install
 ```
 
-验收：
+#### node2（UMDK_tool/include/ 为空，用系统头）
 
 ```bash
-ls build/mooncake-store/mooncake_master build/mooncake-store/mooncake_client
+cd /home/yin/nof/mooncake-930
+source ~/venvs/mooncake-bench/bin/activate
+mkdir -p build && cd build
+# node2 的 UMDK_tool_netlab-sp4_umdk/include/ 不存在，必须用 URMA_ROOT 指向系统头
+cmake .. -DUSE_NOF=ON \
+         -DUSE_NOF_URMA=ON \
+         -DUSE_UB=ON \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DURMA_ROOT=/usr/include/ub/umdk/urma \
+         -DURMA_LIBRARY=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so
+make -j$(nproc)
+make install
+```
+
+⚠️ **`-DURMA_LIBRARY` 必须显式指定**：系统 `/usr/lib64/liburma.so`（旧版）缺少
+`urma_register_seg_dmabuf` 符号，链接会报 `undefined reference`。
+`/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so` 有此符号，必须显式传入。
+
+⚠️ **node2 FetchContent 代理**：cmake 的 FindUrma.cmake 和 spdiag FetchContent
+会从 `atomgit.com` / `gitcode.com` clone。node2 坏代理下会失败，cmake 前设好
+§1.2 的代理环境变量。
+
+### 1.6 验收
+
+```bash
+# 二进制存在
+ls -la build/mooncake-store/src/mooncake_master      # ~8.5 MB
+ls -la build/mooncake-store/src/mooncake_client      # ~15 MB
+ls -la build/mooncake-store/src/nof_register          # ~171 MB
+ls -la build/mooncake-store/benchmarks/stress_cluster_bench  # ~465 MB
+
+# make install 到 /usr/local
+ls -la /usr/local/bin/mooncake_master /usr/local/bin/mooncake_client
+
+# store.so 导入
 python -c "from mooncake.store import MooncakeDistributedNoFRegister; print('store.so OK')"
-# cmake 日志确认：USE_NOF_URMA=ON, SPDK URMA transport enabled for NoF
+
+# nof_register 用法
+./build/mooncake-store/src/nof_register 2>&1 | head -1
+# Usage: nof_register <nqn> <nsid> <traddr> <trsvcid> <trtype> <master_addr> [size_bytes]
+
+# liburma 符号
+nm -D /home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so | grep urma_register_seg_dmabuf
+# 应输出：0000000000027150 T urma_register_seg_dmabuf
 ```
-
-⚠️ **venv 一致性**：`make install` 装进 configure 时激活的 Python；后续运行 master、
-注册脚本、bench 都用同一个 venv，否则 `from mooncake.store import ...` ImportError。
-
-⚠️ **UMDK 两个路径可以不同**：cmake 期 `-DUMDK_ROOT` 要头文件；运行期
-`LD_LIBRARY_PATH` 要 `liburma.so.0`（用 SPDK configure 时 `--with-urma=` 的同一前缀的
-lib 目录）。`ldd` 确认不指向 `/usr/lib64` 旧版。
-
-### 1.3 target 节点 SPDK
-
-target 只需 §1.1 的 SPDK 步骤（可手动 clone 编译：`git clone -b urma_enable_v2
-https://github.com/yyyuanhao426-hash/spdk.git` 后 checkout `e12b7cb21`，
-`./scripts/pkgdep.sh && ./configure --with-rdma --with-urma=<UMDK> && make -j && make install`）。
-**不需要** Mooncake 代码——注册脚本通过 SSH 读 target 的 listener RPC 信息。
-
-### 1.4 mooncake Python 包分发（client 节点 + 编排机远端节点）
-
-JD bench 的测试进程是 Python client（`store.so` 的 pybind 封装）。两种装法：
-
-```bash
-# 方式 A（推荐，多节点分发）：store 节点打 wheel 后拷贝安装
-cd ~/nof/upstream/mooncake-supercache-nof-gdr-worktree
-./scripts/build_wheel.sh            # 用法：./scripts/build_wheel.sh [python_version] [output_dir]
-pip install dist/mooncake_transfer_engine-*.whl   # 在每个 client 节点执行
-
-# 方式 B（单节点/与编译同机）：直接用 make install 装好的那个 venv
-```
-
-> wheel 构建需要完整 `build/`（engine.so + store.so 已编出），故先做 §1.2 的
-> `make -j`。client 节点装 wheel 后同样需要：UMDK 运行库
-> （`LD_LIBRARY_PATH`）、大页内存（USE_NOF 构建的 client 启动会初始化 SPDK env）。
 
 ---
 
-## 2. 前置检查（所有参与节点）
+## 2. 运行期环境变量
+
+所有 930 进程（nvmf_tgt、master、client、bench）启动前必须设置：
 
 ```bash
-# UB 栈内核模块与设备（两端）
-lsmod | grep -E 'udma|ummu|ubcore|uburma'
-ls /dev/uburma/udmac0d1e2                # 本环境 bonding_dev_0 不可用，用 udmac0d1e2
-
-# 大页（两端都要；client 初始化 SPDK env 也吃大页）
-sudo sysctl -w vm.nr_hugepages=2048 && grep Huge /proc/meminfo
-
-# 编排机 → 所有节点 ssh 免密（bench 靠 ssh/scp 驱动）
-ssh -i ~/.ssh/urma_diag_key root@<ip> true
-
-# 端口预检：master 50051、metadata 8080、metrics 9003、bench client 9201..9200+N
-ss -tlnp | grep -E '50051|8080|9003|920'
+export SPDK_URMA_DEV_NAME=udmac0d1e2          # URMA 设备名（本环境 bonding_dev_0 不可用）
+export SPDK_URMA_CAPSULE_TRANSPORT=urma       # URMA capsule 传输
+export MC_HIFREQ_LOG_SAMPLE_RATE=0            # 关闭高频日志采样（默认 1.0 全采样刷屏！）
+export MC_SLICE_SIZE=1048576                  # 1MB 切片
+export MC_STORE_MEMCPY=1                      # 启用 local_memory memcpy 优化
+export MC_STORE_MEMCPY_INLINE=1               # inline 执行 host memcpy
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
 ```
+
+⚠️ **`MC_HIFREQ_LOG_SAMPLE_RATE` 默认 1.0 陷阱**：未设时默认全采样，不是 0！
+所有进程启动必须显式设 `=0`，否则日志刷屏污染性能测量。采样率是 `static const`
+（`mooncake_logging.cpp:309`），进程启动时一次性解析，运行中无法改。
+
+### NoF 性能调优变量（按需）
+
+| 变量 | 推荐值 | 说明 |
+|------|--------|------|
+| `MC_NOF_WORKERS` | 4 | NoF worker 线程数（≥ qpairs） |
+| `MC_NOF_QPAIRS_PER_SEGMENT` | 4 | 每 segment 的 qpair lane 数（4qp 突破到 ~47 GB/s） |
+| `MC_NOF_INFLIGHT_BYTES_LIMIT` | 50331648 (48M) | segment 总预算（代码自动 ÷ lane_count） |
+| `MC_NOF_SUBMIT_CHUNK_BYTES` | 131072 (128K) | 单次 I/O chunk 大小 |
+| `MC_NVME_IO_QUEUE_SIZE` | 256 | 单 qpair 队列深度 |
+| `MC_NVME_IO_QUEUE_REQUESTS` | 512 | 单 qpair request 数 |
+| `MC_NOF_WHOLE_POOL_REGISTER` | 1 | 整池注册开关 |
 
 ---
 
@@ -162,276 +216,790 @@ ss -tlnp | grep -E '50051|8080|9003|920'
 
 ### 3.1 target 节点：NoF target（P0）
 
-优先用 skill 的 `target_nvme_takeover.sh` 流程（BDF 动态解析、SIGTERM 60s+SIGKILL
-fallback，见 `nof-bench.md` §4.7）；等价手动路径：
-
 ```bash
-# target 节点；CPU 亲和避开 0/1（Round 8 结论，生产 pin 2-7 → mask 0xfc）
+# target 节点（如 node4）
 export SPDK_URMA_DEV_NAME=udmac0d1e2
 export SPDK_URMA_CAPSULE_TRANSPORT=urma
-sudo -E nvmf_tgt -m 0xfc &          # 或 setsid nohup 后台化，日志进 /tmp
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
 
-sudo scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a <BDF>
-sudo scripts/rpc.py nvmf_create_transport -t URMA
-sudo scripts/rpc.py nvmf_create_subsystem nqn.2026-01.io.spdk:mooncake-jd -a -s JD0001
-sudo scripts/rpc.py nvmf_subsystem_add_ns nqn.2026-01.io.spdk:mooncake-jd Nvme0n1
-sudo scripts/rpc.py nvmf_subsystem_add_listener nqn.2026-01.io.spdk:mooncake-jd \
-     -t URMA -a <target 精确 IP> -s 4420     # ⚠️ 必须精确 IP，不能 0.0.0.0
+# 1. vfio-pci 绑定 SSD（以单盘 nvme0 / BDF a4:00.0 为例）
+modprobe vfio-pci
+echo "vfio-pci" > /sys/bus/pci/devices/0000:a4:00.0/driver_override
+echo "0000:a4:00.0" > /sys/bus/pci/drivers/nvme/unbind
+echo "0000:a4:00.0" > /sys/bus/pci/drivers_probe
+
+# 2. 启动 nvmf_tgt（CPU 亲和 mask 0xfc = cores 2-7，避开 CPU 0/1）
+setsid nohup nvmf_tgt -m 0xfc --wait-for-rpc -r /var/tmp/spdk.sock \
+    > /tmp/nvmf_tgt.log 2>&1 < /dev/null & disown
+
+# 3. SPDK RPC 序列
+scripts/rpc.py -s /var/tmp/spdk.sock rpc_get_methods   # 确认 tgt 就绪
+scripts/rpc.py -s /var/tmp/spdk.sock iobuf_set_options \
+    small_pool_count=12288 small_bufsize=8192 large_pool_count=512 large_bufsize=4194304
+scripts/rpc.py -s /var/tmp/spdk.sock framework_start_init
+
+# 4. 创建 bdev（单盘）
+scripts/rpc.py -s /var/tmp/spdk.sock bdev_nvme_attach_controller \
+    -b Nvme0 -t PCIe -a 0000:a4:00.0
+# 多盘 RAID0（如 11 盘）：
+# scripts/rpc.py -s /var/tmp/spdk.sock bdev_raid_create \
+#     -b R11_RAID0 -r raid0 -s 256 \
+#     -z "Nvme0n1 Nvme1n1 Nvme2n1 ... Nvme10n1"
+
+# 5. 创建 NoF transport
+scripts/rpc.py -s /var/tmp/spdk.sock nvmf_create_transport \
+    -t URMA -c urma --max-io-size 4194304 \
+    --iobuf-large-cache-size 32 --iobuf-small-cache-size 1024 \
+    --dev-name udmac0d1e2 --eid-index 0
+
+# 6. 创建 subsystem + namespace + listener
+NQN=nqn.2026-01.io.spdk:mooncake-jd
+scripts/rpc.py -s /var/tmp/spdk.sock nvmf_create_subsystem "$NQN" -a -s JD0001
+scripts/rpc.py -s /var/tmp/spdk.sock nvmf_subsystem_add_ns "$NQN" Nvme0n1
+scripts/rpc.py -s /var/tmp/spdk.sock nvmf_subsystem_add_listener "$NQN" \
+    -t URMA -a 141.61.84.151 -s 4420 -f IPv4
 ```
 
-也可在 store 节点用 `python -m mooncake.spdk_tgt_create --transport-type URMA …`
-远程拉起（大 I/O 需 `--max-io-size/--iobuf-options`，见部署文档阶段 4）。
+⚠️ **listener 必须加 `-f IPv4`**：不加则 adrfam=unknown，host 连接被拒
+（`Subsystem does not allow host ... to connect at this address`）。
+
+⚠️ **listener 必须用精确 IP**，不能 `0.0.0.0`。
 
 ### 3.2 store 节点：master 三件套（P1/P2/P4）
 
-每个进程独立窗口/pane 前台跑。公共 env：
+如果 target 节点同时做 store（单节点部署），在同一节点启动：
 
 ```bash
 export SPDK_URMA_DEV_NAME=udmac0d1e2
 export SPDK_URMA_CAPSULE_TRANSPORT=urma
-export LD_LIBRARY_PATH=<UMDK lib>:/usr/local/lib:$LD_LIBRARY_PATH
-export MC_HIFREQ_LOG_SAMPLE_RATE=0        # 性能跑必须显式 0（默认 1.0 全采样刷屏）
+export MC_HIFREQ_LOG_SAMPLE_RATE=0
 export MC_SLICE_SIZE=1048576
 export MC_STORE_MEMCPY=1 MC_STORE_MEMCPY_INLINE=1
-```
-
-```bash
-# T2: P1 metadata
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
 source ~/venvs/mooncake-bench/bin/activate
-python -m mooncake.http_metadata_server --port 8080
 
-# T3: P2 master
-./build/mooncake-store/mooncake_master --port 50051 --metrics_port 9003
+# P1: metadata server
+setsid nohup python -m mooncake.http_metadata_server --port 8080 \
+    > /tmp/metadata.log 2>&1 < /dev/null & disown
 
-# T5: P4 store 实例（内存段载体；纯 NoF 时数据落 SSD，段给默认即可）
-./build/mooncake-store/mooncake_client \
-  --host <store 节点 IP> \
-  --metadata_server http://<store 节点 IP>:8080/metadata \
-  --master_server_address <store 节点 IP>:50051 \
-  --protocol ub --global_segment_size 4GB --threads 4
+# P2: master（930 用 --rpc_port，不是旧文档的 --port）
+setsid nohup mooncake_master \
+    --rpc_port=50051 \
+    --metrics_port=9003 \
+    --enable_http_metadata_server \
+    --http_metadata_server_port=8080 \
+    --rpc_address=141.61.84.151 \
+    --rpc_thread_num=32 \
+    --eviction_high_watermark_ratio=0.9 \
+    --default_kv_lease_ttl=3600000 \
+    --nof_heartbeat_failures_threshold=999999 \
+    --nof_heartbeat_interval_sec=3600 \
+    > /tmp/master.log 2>&1 < /dev/null & disown
+
+# P4: store client（内存段载体；--device_names 必须指定 udmac0d1e2）
+setsid nohup mooncake_client \
+    --host 141.61.84.151 \
+    --metadata_server http://141.61.84.151:8080/metadata \
+    --master_server_address 141.61.84.151:50051 \
+    --protocol ub --device_names udmac0d1e2 \
+    --global_segment_size 4GB --threads 4 \
+    > /tmp/client.log 2>&1 < /dev/null & disown
 ```
 
-### 3.3 NoF SSD 注册（P3，一次性，master 重启后重跑）
+⚠️ **mooncake_client 必须加 `--device_names udmac0d1e2`**：默认 `bonding_dev_0`
+不可用（`urma_create_device` 失败），会报 `No available RNIC` 并 fallback 到
+`mock_urma_device`。
+
+### 3.3 NoF SSD 注册（P3，一次性）
 
 ```bash
-# store 节点，同一 venv；脚本 SSH 到 target 读 listener 信息
-python -m mooncake.mooncake_ssd_register \
-  --master_server_address <store 节点 IP>:50051 \
-  --spdk_target_info "ip:<target IP> path:<target 上 spdk 源码目录>" \
-  --transport-type URMA \
-  --username root --key-file ~/.ssh/id_rsa
+# 在 reader/store 节点执行（与 master 同节点）
+NQN=nqn.2026-01.io.spdk:mooncake-jd
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
+
+# C++ 直注工具（930 新增，免 SSH 读 RPC，适合脚本化）
+nof_register "$NQN" 1 141.61.84.151 4420 URMA 141.61.84.151:50051 10737418240
+# 参数：<nqn> <nsid> <traddr> <trsvcid> <trtype> <master_addr> [size_bytes]
+# size_bytes 必须 > 0，否则 segment.cpp:1361 拒绝（"buffer=0 or size=0 is invalid"）
 ```
 
-⚠️ `--transport-type` 默认 RDMA，**必须显式 URMA**，否则 listener 被过滤。
-930 也新增了 C++ 直注工具：`nof_register <nqn> <nsid> <traddr> <trsvcid> <trtype>
-<master_addr> [size_bytes]`（免 SSH 读 RPC，适合脚本化）。
-
-验收：master `:9003` metrics / 日志出现注册的 SSD；`list_segments` 可见 NoF segment。
+验收：master `:9003` metrics / 日志出现注册的 SSD；`curl http://<IP>:9003` 可见
+NoF segment capacity。
 
 ---
 
-## 4. 冒烟测试（部署后 → JD bench 前）
+## 4. 冒烟测试
 
-部署完成后不要直接上 JD bench，先按**从底到顶**四级冒烟，每级通过再进下一级
-（承接旧部署手册阶段 8 的验证阶梯；均为一次性运行，P3 注册完成后即可开始）。
+部署完成后，按以下顺序验证通路。
 
 ### 4.1 通路级：SPDK endpoint 直测（store 节点）
 
 ```bash
-# EP 与 §3.1 创建的 subsystem/nsid 对应；多 target 逗号分隔传给 --endpoints
-export EP="trtype:URMA adrfam:IPv4 traddr:<target IP> trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd ns:1"
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
+EP="trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd ns:1"
 
-# ① 对齐单测（512B/4K/128K/1M 对齐矩阵）
+# ① 对齐单测
 ./build/mooncake-store/tests/nof_buffer_alignment_test
 
 # ② host 内存 read 基线
 ./build/mooncake-store/benchmarks/nof_worker_pool_bench \
-  --endpoints "$EP" --op=read --io_size=128K --iodepth=64 \
-  --duration_sec=20 --range_bytes=1G
+    --endpoints "$EP" --op=read --io_size=128K --iodepth=64 \
+    --duration_sec=20 --range_bytes=1G
 ```
 
-通过标准：①全部 PASS；②IOPS/带宽稳定输出、errors=0。GPU Direct 节点追加
-③`--op=verify --memory=cuda`（fill→H2D→WRITE→READ→D2H→memcmp 的决定性测试，
-先小 `--iodepth/--verify_rounds`，见旧部署手册 8.3）。
+通过标准：①全部 PASS；②IOPS/带宽稳定输出、errors=0。
+实测参考（node4 单 SSD）：11.3 GiB/s，92.6K IOPS，fail_iops=0。
 
-### 4.2 Store 级 KV 冒烟：显式 NoF 参数版（store 节点）
+### 4.2 两节点 1-1 Get 冒烟（跨节点）
+
+在 reader 节点（如 node2）执行，target 在另一节点（如 node4）：
+
+#### Prefill（segment_write，预填数据到 NoF SSD）
 
 ```bash
-python mooncake-store/benchmarks/store_kv_bench.py \
-  --scenario verify_write \
-  --metadata-server http://<store 节点 IP>:8080/metadata \
-  --master-server <store 节点 IP>:50051 \
-  --local-hostname <store 节点 IP>:50071 \
-  --protocol ub \
-  --memory-replica-num 0 \
-  --nof-replica-num 1
+export SPDK_URMA_DEV_NAME=udmac0d1e2
+export SPDK_URMA_CAPSULE_TRANSPORT=urma
+export MC_HIFREQ_LOG_SAMPLE_RATE=0
+export MC_SLICE_SIZE=1048576
+export MC_STORE_MEMCPY=1 MC_STORE_MEMCPY_INLINE=1
+export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib
+
+./build/mooncake-store/benchmarks/stress_cluster_bench \
+    --scenario=segment_write --protocol=tcp \
+    --local_hostname=141.61.84.247:50370 \
+    --metadata_server=http://141.61.84.151:8080/metadata \
+    --master_server=141.61.84.151:50051 \
+    --nof_segments='traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd trtype:URMA adrfam:IPv4 ns:1' \
+    --num_keys=256 --value_size=4194304 --replica_num=0 --global_segment_size=0 --nof_replica_num=1 \
+    --num_threads=16 --batch_size=16 --key_include_value_size=true \
+    --nof_qpairs_per_segment=4 --nof_whole_pool_register=true --local_buffer_size=1073741824
 ```
 
-通过：read-after-write 校验 100%，无 staging fallback。
-⚠️ `--memory-replica-num` 与 `--nof-replica-num` 不能同时 0（脚本参数校验直接报错）。
+通过：`All segments write complete: 256 succeeded, 0 failed` +
+`Segment verification: errors=0`。
+实测参考（node2→node4 单 SSD）：5.66 GiB/s，failed=0。
 
-### 4.3 兼容层冒烟：env 覆盖路径（本分支核心，必做）
-
-JD bench 不传任何 NoF 参数，全靠 `83c710f5` 的 env 覆盖——上 bench 前先用同一工具
-证明覆盖路径真的生效（注意：**不带** `--memory-replica-num/--nof-replica-num`，
-吃脚本默认值 mem=1/nof=0，看 env 能否覆盖它）：
+#### Read（segment_read，1-1 Get 基准）
 
 ```bash
-MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=0 \
-python mooncake-store/benchmarks/store_kv_bench.py \
-  --scenario verify_write \
-  --metadata-server http://<store 节点 IP>:8080/metadata \
-  --master-server <store 节点 IP>:50051 \
-  --local-hostname <store 节点 IP>:50071 \
-  --protocol ub
+# t1_b1（延迟基线）
+./build/mooncake-store/benchmarks/stress_cluster_bench \
+    --scenario=segment_read --role=reader --protocol=tcp \
+    --local_hostname=141.61.84.247:50372 \
+    --metadata_server=http://141.61.84.151:8080/metadata --master_server=141.61.84.151:50051 \
+    --nof_segments='traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd trtype:URMA adrfam:IPv4 ns:1' \
+    --num_keys=256 --value_size=4194304 --replica_num=0 --global_segment_size=0 --nof_replica_num=1 \
+    --num_threads=1 --batch_size=1 --duration=20 --warmup_keys=5 --verify=false \
+    --key_include_value_size=true --nof_qpairs_per_segment=4 --nof_whole_pool_register=true --local_buffer_size=1073741824
+
+# t16_b16（吞吐基线）
+./build/mooncake-store/benchmarks/stress_cluster_bench \
+    --scenario=segment_read --role=reader --protocol=tcp \
+    --local_hostname=141.61.84.247:50373 \
+    --metadata_server=http://141.61.84.151:8080/metadata --master_server=141.61.84.151:50051 \
+    --nof_segments='traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd trtype:URMA adrfam:IPv4 ns:1' \
+    --num_keys=256 --value_size=4194304 --replica_num=0 --global_segment_size=0 --nof_replica_num=1 \
+    --num_threads=16 --batch_size=16 --duration=20 --warmup_keys=5 --verify=false \
+    --key_include_value_size=true --nof_qpairs_per_segment=4 --nof_whole_pool_register=true --local_buffer_size=1073741824
 ```
 
-判读：
-
-- 读写校验 100% 且数据**落 NoF**：master 日志/metrics 看副本 placement，client 侧
-  `direct_ops`/`nof_ops` 计数（real_client summary）。若 100% 但 `nof_ops=0`
-  （全走内存），说明 env 没到达进程——核对 export 的 shell/venv 与
-  `/proc/<pid>/environ`。
-- **阴性对照**：`MC_NOF_REPLICA_NUM=-1` 或 `=1abc` → 日志 ERROR（非法值）且
-  **不覆盖**（回落脚本默认 mem=1），不回绕成超大数——收紧后的 parser 行为。
-- **失败路径**：NoF segment 未注册时纯 NoF put **显式失败、不回落内存**（设计，
-  见 §5.2）；若看到静默写进内存副本反而是 bug。
-
-### 4.4 JD bench 冒烟
-
-完成 §5 的 cluster.json / global.json / env.mooncake.sh 配置后，跑 demo 冒烟打通
-端到端（命令见 §6 开头）：`python benchmark.py -f configs/basic/demo/simple_put.json
---protocol ub` → `outputs/<ts>/` 出 CSV。demo 仅 1×1 组合，客户端在 store1
-（local 拓扑）；过了再上 simple_get / 正式目录。
+实测参考（node2→node4 单 SSD 4MB value）：
+- t1_b1：4.03 GiB/s，1032 qps，failed=0，P50=950µs，P99=1.26ms
+- t16_b16：13.90 GiB/s，3559 keys/s，failed=0，P50=72ms，P99=79.7ms
 
 ---
 
-## 5. JD bench 配置（编排机 `~/nof/upstream/Mooncake-Performance`）
+## 5. 1-1 Get Sweep 脚本（round11_930_branch）
 
-### 5.1 工作副本与关键字段
+### 5.1 脚本位置与文件
 
-```bash
-cd ~/nof/upstream/Mooncake-Performance
-cp configs/cluster.example.json configs/cluster.json    # 不入库
-cp configs/global.example.json configs/global.json      # 不入库
+脚本在 **Windows 本机**：
+```
+D:\0_Projects\5_Mooncake\doc\3.Final_Performance_sorted\round11_930_branch\
+├── run.py                        # 主执行器（适配 round10 11ssd_test/run.py）
+├── remote.py                     # SSH 子进程/磁盘/RPC 助手（复用 round10 原文件）
+├── analyze.py                    # 解析 bench 输出、写 summary.csv（复用 round10 原文件）
+├── config_n2_to_n4.json          # 阶段1配置：t1_b1 × 5 reps × 60s
+├── config_n2_to_n4_phase2.json   # 阶段2配置：t1_b16/t16_b1/t16_b16 × 5 reps × 60s
+├── design.md                     # 实验设计 + 完整实测结果 + 判读
+└── results_table.md              # 结果汇总表（用户格式）
 ```
 
-**cluster.json**：`venvs`（节点上 venv python 路径，如
-`{"mooncake-benchmark": "~/venvs/mooncake-bench/bin/python"}`）、`exclude_cpus`、
-`nodes`。每个节点 `ip`（ssh 管理网，141.61.84.x）与 **`fabric_ip` 必填**（高性能网卡
-IP，注入 `MC_FABRIC_IP`/`MC_TCP_BIND_ADDRESS`——缺省/选错会绑定到 Docker veth，
-client 初始化挂死）。节点命名约定：`store1`（store 节点）、`node1`（非 store
-client）、`writer_nodeX`/`reader_nodeX`（pipeline）。`ssh_key` 可填
-`~/.ssh/urma_diag_key`。
+### 5.2 脚本架构
 
-**global.json**：
+`run.py` 从 Windows 本机通过 SSH 驱动远端节点：
+1. `scp remote.py` 到每个节点 `/tmp/r11_remote.py`
+2. 通过 `ssh ... python3 -u /tmp/r11_remote.py` 与远端交互（JSON 行协议）
+3. 远端 `remote.py` 负责：磁盘枚举、vfio 绑定、SPDK RPC、进程启动/监控
+4. `analyze.py` 解析 `stress_cluster_bench` 控制台输出，提取吞吐/延迟分位
 
-| 字段 | 本环境取值 |
-|---|---|
-| `master_type` | `"http"` |
-| `master_addr` | `<store 节点 fabric IP>:50051` |
-| `metadata_server` | `http://<store 节点 fabric IP>:8080/metadata` |
-| `mooncake_store_nodes` | `["store1"]`（决定 local/remote 拓扑标注） |
-| `venv` | `"mooncake-benchmark"`（cluster.json venvs 的键名） |
-| `protocol.ub.device` | `"udmac0d1e2"`（example 里的 bonding_dev_0 本环境不可用） |
-| `local_buffer_size` | ≥ num_threads × data_size（默认 1GiB；8MB×多线程时核对） |
-| `numa_bind` | `true`（默认） |
+### 5.3 config 参数说明
 
-### 5.2 NoF 副本注入（兼容层，本分支核心）
+`config_n2_to_n4.json` 默认参数：
 
-JD bench 的场景配置**没有** `nof_replica_num` 字段；本分支在
-`Client::AttachHostId`（commit `83c710f5`）加了 env 覆盖点，所有写入口
-（Put/Upsert/BatchPut/BatchUpsert）统一生效。在
-`scripts/env.mooncake.sh`（git 跟踪的手工调优面板，随 env.sh 自动推送到所有节点、
-runner 在 env.sh 之后 source）里加：
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `device` | `udmac0d1e2` | URMA 设备名（c0 平面） |
+| `reader` | `node2` | reader 节点（跑 stress_cluster_bench） |
+| `source_order` | `["node4"]` | target 节点（跑 nvmf_tgt + SSD） |
+| `scenarios` | `[1]` | 1-1 Get（单 source） |
+| `modes` | `["B"]` | Mode B = NoF SSD 读写 |
+| `combos` | `[[1,1]]` | (threads, batch) 组合；阶段2为 `[[1,16],[16,1],[16,16]]` |
+| `reps` | `5` | 每个组合重复次数 |
+| `duration` | `60` | 每次 run 持续秒数 |
+| `smoke_duration` | `8` | smoke 模式持续时间 |
+| `value_size` | `8388608` | 8 MiB |
+| `strip_kib` | `256` | RAID0 条带大小 |
+| `disks_per_target` | `11` | target 节点 SSD 数 |
+| `target_cpus` | `2-7` | nvmf_tgt CPU 亲和（避开 CPU 0/1） |
+| `spdk_root` | `/home/yin/nof/spdk` | SPDK 源码树（nvmf_tgt 路径） |
+| `library_path` | `/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib` | 930 运行期 LD_LIBRARY_PATH（3 段） |
+| `build_dir` | `/home/yin/nof/mooncake-930/build` | 930 build 目录 |
+| `segment_size` | `17179869184` | 16 GiB（256 key × 8 MiB = 2 GiB 工作集，留余量） |
+| `nof_inflight_bytes` | `50331648` | 48 MiB（segment 总预算） |
+| `nof_workers` | `4` | NoF worker 线程数 |
+| `nof_qpairs_per_segment` | `4` | 每 segment qpair lane 数 |
+| `nof_submit_chunk_bytes` | `131072` | 128 KiB chunk |
+| `memory_eid` / `target_eid` / `nof_reader_eid` | `0 / 0 / 0` | 全 EID0（单 source 不需要分流） |
+| `ports` | `53000-54005` | RPC/metadata/admin/target/writer/reader 端口段 |
+
+### 5.4 使用方法
+
+#### 上传脚本到 reader 节点（node2）
 
 ```bash
-# --- NoF placement（83c710f5 兼容层）---
-export MC_NOF_REPLICA_NUM=1     # 每个 object 的 NoF SSD 副本数
-export MC_MEM_REPLICA_NUM=0     # 内存副本数；0+1 = 纯 NoF（SINGLE strict）
+# 从 Windows 本机上传到 node2
+SSH="/c/Program Files (x86)/Git/bin/ssh.exe"
+KEY=/c/Users/y00988740/.ssh/urma_diag_key
+
+# 先创建目录
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 "mkdir -p /home/yin/round11_930"
+
+# 上传 4 个文件
+for f in run.py remote.py analyze.py config_n2_to_n4.json; do
+  "$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+      "cat > /home/yin/round11_930/$f" \
+      < "D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch/$f"
+done
 ```
 
-语义与纪律：
-
-- **覆盖而非默认**：设了就覆盖调用方 config，JD bench 无感生效；不设 = 原行为。
-- **纯 NoF 推荐 mem=0 + nof=1**：刻意不用 1+1 FLEXIBLE_DUAL_REPLICA（会静默退化到
-  内存，掩盖问题）。NoF segment 未注册时 put **显式失败**，不回落——这是设计。
-- 取值校验：仅非负十进制整数（`-1`/`1abc` 会报 ERROR 并拒绝，不会回绕）。
-- ⚠️ vsegment 启用的部署对 nof≠0 直接 INVALID_PARAMS 不回落（rpc_service.cpp:542）。
-- 读路径无需设置——副本 placement 在写时定档，get 跟随。
-- 只测内存对照时把两行注释掉即可，无需重编。
-
-### 5.3 NoF 传输旋钮（同一面板，按需）
+#### 执行流程
 
 ```bash
-export MC_NOF_WORKERS=4                    # ≥ qpairs
-export MC_NOF_QPAIRS_PER_SEGMENT=4         # 4qp 突破到 ~43 GB/s 的关键
-export MC_NOF_INFLIGHT_BYTES_LIMIT=25165824  # 4qp 用 24M（segment 总预算，自动÷lane）；1qp 用 32M
-export MC_NOF_SUBMIT_CHUNK_BYTES=131072
-export MC_NVME_IO_QUEUE_SIZE=256 MC_NVME_IO_QUEUE_REQUESTS=512
-export MC_HIFREQ_LOG_SAMPLE_RATE=0         # 面板默认 0.01，性能跑改 0（面板在此文件改）
-# 慢 I/O 归因（诊断时才开）：SPDK_URMA_STAGE_TRACE_US=10000 + MC_NOF_SLOW_TRACE_THRESHOLD_US=20000
-# 两端 SPDK 必须 e12b7cb21（wire v4）才能配对
+# 在 node2 上执行（run.py 通过 SSH 驱动 node4 target）
+
+cd /home/yin/round11_930
+
+# 1. 只读盘点（确认 11 块 SSD 可枚举、端口空闲、设备 ACTIVE）
+python3 run.py --discover --config config_n2_to_n4.json --out results/discover_n2_to_n4
+
+# 2. smoke（8s、1 rep、开 verify，确认链路通+数据校验）
+python3 run.py --execute --smoke --config config_n2_to_n4.json --out results/smoke_n2_to_n4
+
+# 3. 阶段1 正式：t1_b1 × 5 reps × 60s
+python3 run.py --execute --config config_n2_to_n4.json --out results/formal_n2_to_n4_t1b1
+
+# 4. 阶段2 正式：t1_b16 / t16_b1 / t16_b16 × 5 reps × 60s（共 15 runs）
+#    先上传 config_n2_to_n4_phase2.json
+python3 run.py --execute --config config_n2_to_n4_phase2.json --out results/formal_n2_to_n4_phase2
+
+# 5. 分析（run.py 结束时自动调用 analyze，也可手动）
+python3 -c "from analyze import analyze; analyze('results/formal_n2_to_n4_t1b1')"
+python3 -c "from analyze import analyze; analyze('results/formal_n2_to_n4_phase2')"
+```
+
+#### 脚本自动化行为
+
+`run.py --execute` 会自动完成以下全部步骤，**无需手动部署**：
+
+1. **盘点**：枚举两节点磁盘、端口、URMA 设备、二进制 SHA
+2. **vfio 绑定**：将 target 节点 11 块 SSD 绑到 `vfio-pci`（记录原始驱动用于恢复）
+3. **启动 nvmf_tgt**：`-m 0xfc`（CPU 2-7），`--wait-for-rpc`
+4. **SPDK RPC 序列**：iobuf → framework_start_init → attach 11 块 NVMe →
+   bdev_raid_create RAID0 strip=256 → nvmf_create_transport URMA →
+   create_subsystem → add_ns → add_listener（精确 IP + IPv4）
+5. **启动 master**：`--rpc_port=53000 --enable_http_metadata_server ...`
+6. **NoF 注册**：`nof_register` 注册 NoF segment（16 GiB）
+7. **Prefill**：`stress_cluster_bench --scenario=segment_write`（256 keys × 8 MiB）
+8. **Measure**：每个 combo × rep 跑一次 `segment_read`，记录吞吐+延迟分位
+9. **Teardown**：杀所有进程、恢复 vfio 绑定到 nvme 驱动
+10. **Analyze**：写 `summary.csv` / `runs.csv` / `rejected.json`
+
+⚠️ **端口冲突**：脚本默认用 53000-54005 端口段。如有其他进程占用会报
+`port in use`，需先清理（kill 占用进程或改 config 的 ports 段）。
+
+#### 产物结构
+
+```
+results/<phase>/
+├── config.json                 # 实验配置快照
+├── plan.json                   # 执行计划（所有 runs 列表）
+├── reader_commands.json        # 每个 run 的完整 argv + env
+├── inventory.json              # 两节点二进制 SHA/磁盘/设备/NUMA 拓扑
+├── disk_candidates.json        # 自动选盘结果（11 块 BDF）
+├── resolved_config.json        # 填入 BDF 后的配置
+├── bindings.json               # vfio 绑定/恢复记录
+├── r{0-4}_B/                   # 每个 rep 的目录
+│   ├── node4_target.json       # SPDK target 状态（bdev/transport/reactors）
+│   ├── node4_register.json     # NoF 注册结果
+│   ├── node4_target.log        # nvmf_tgt 日志
+│   ├── node4_writer.log        # prefill 日志
+│   ├── node2_master.log        # master 日志
+│   ├── r{N}_B_1-1_t{T}_b{B}.log  # bench 日志（含吞吐+延迟分位）
+│   └── r{N}_B_1-1_t{T}_b{B}.json  # bench 结果元数据（argv/rc/result）
+├── restore.json                # vfio 恢复结果
+├── runs.csv                    # 所有 runs 的吞吐+延迟（CSV）
+├── summary.csv                 # 按 combo 聚合的中位数/min/max
+└── rejected.json               # 失败的 runs（空=全部有效）
+```
+
+#### 拉取结果到 Windows
+
+```bash
+SSH="/c/Program Files (x86)/Git/bin/ssh.exe"
+KEY=/c/Users/y00988740/.ssh/urma_diag_key
+WINBASE="D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch"
+
+for phase in formal_n2_to_n4_t1b1 formal_n2_to_n4_phase2; do
+  mkdir -p "$WINBASE/results/$phase"
+  for f in config.json plan.json summary.csv runs.csv rejected.json \
+           disk_candidates.json restore.json bindings.json inventory.json \
+           resolved_config.json reader_commands.json; do
+    "$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+        "cat /home/yin/round11_930/results/$phase/$f 2>/dev/null" \
+        > "$WINBASE/results/$phase/$f" 2>/dev/null
+  done
+done
+```
+
+### 5.5 实测结果（2026-11-03/04，930 分支，node2→node4，11 SSD）
+
+| combo | 中位数 GiB/s | min-max % | P50 (µs) | P99 (µs) | P99.9 (µs) | valid |
+|-------|-------------|-----------|----------|----------|------------|-------|
+| t1_b1 | 23.37 | 6.2% | 279 | 754 | 860 | 5/5 |
+| t1_b16 | 40.78 | 1.5% | 3,080 | 3,211 | 3,506 | 5/5 |
+| t16_b1 | 46.85 | 0.002% | 2,458 | 5,636 | 6,291 | 5/5 |
+| t16_b16 | 46.86 | 0.003% | 42,992 | 44,564 | 45,613 | 5/5 |
+
+20 runs 全部 failed=0，restore 0 errors。t16_b1/t16_b16 撞 c0+EID0 链路容量墙
+~47 GiB/s（skill 记录 46.6 GiB/s）。
+
+---
+
+## 6. 真实命令记录（本机 Windows Git bash → ssh.exe → 远程节点）
+
+> 本节记录本次实验中**实际执行过的命令**，可作为复现的精确参考。
+> 所有命令从 Windows Git bash 发起，通过 `ssh.exe` 到远程节点执行。
+> 远程节点上的命令也可以直接在节点终端上跑（去掉外层 ssh 包装）。
+
+### 6.1 本机 SSH 调用模板
+
+```bash
+# 本机唯一的 ssh.exe 路径（Git bash PATH 里没有 ssh）
+SSH="/c/Program Files (x86)/Git/bin/ssh.exe"
+KEY=/c/Users/y00988740/.ssh/urma_diag_key
+
+# 标准调用（read-only 命令直接跑，写操作需授权）
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+    root@141.61.84.151 "<远程命令>"
+```
+
+⚠️ **引号规则**：外层双引号（本地 bash），内层单引号（远程 bash 正则/变量）。
+本地 bash 会在双引号内展开 `$`，远程变量用单引号隔离或 `\$` 转义。
+❌ 反例：`"...ssh.exe" ... "grep -nE "a|b" file"` —— 内层双引号被本地 bash 吃掉。
+
+⚠️ **本机没有 scp.exe**：文件传输用 `ssh + cat` 管道（§6.7）。
+
+### 6.2 编译阶段命令（node4 示例，node2 类似）
+
+```bash
+# === 克隆 930 分支 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof && \
+     git clone --branch nof-gdr-supercache-snapshot-930 --recurse-submodules \
+               https://github.com/LeeJace993/Mooncake.git mooncake-930 && \
+     cd mooncake-930 && git log --oneline -1"
+
+# === node2 克隆（需要代理覆盖）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 && \
+     export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0=http://127.0.0.1:3128 \
+            GIT_CONFIG_KEY_1=https.proxy GIT_CONFIG_VALUE_1=http://127.0.0.1:3128 && \
+     cd /home/yin/nof && \
+     git clone --branch nof-gdr-supercache-snapshot-930 --recurse-submodules \
+               https://github.com/LeeJace993/Mooncake.git mooncake-930 && \
+     cd mooncake-930 && git log --oneline -1"
+
+# === venv + 依赖 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/mooncake-930 && \
+     python3 -m venv ~/venvs/mooncake-bench && \
+     source ~/venvs/mooncake-bench/bin/activate && \
+     pip install -U pip && pip install aiohttp paramiko"
+
+# === 修复源码 bug ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/mooncake-930 && \
+     cp mooncake-store/src/client_service.cpp mooncake-store/src/client_service.cpp.bak_706551a8 && \
+     sed -i '3046s/start_result.value().size()/start_result.value().replicas.size()/' \
+         mooncake-store/src/client_service.cpp && \
+     sed -n '3046p' mooncake-store/src/client_service.cpp"
+
+# === cmake + make（node4）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/mooncake-930 && source ~/venvs/mooncake-bench/bin/activate && \
+     mkdir -p build && cd build && \
+     cmake .. -DUSE_NOF=ON -DUSE_NOF_URMA=ON -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Release \
+              -DUMDK_ROOT=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk \
+              -DURMA_LIBRARY=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so && \
+     make -j\$(nproc) && make install"
+
+# === cmake + make（node2，URMA_ROOT 不同 + 代理）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 && \
+     export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0=http://127.0.0.1:3128 \
+            GIT_CONFIG_KEY_1=https.proxy GIT_CONFIG_VALUE_1=http://127.0.0.1:3128 && \
+     cd /home/yin/nof/mooncake-930 && source ~/venvs/mooncake-bench/bin/activate && \
+     mkdir -p build && cd build && \
+     cmake .. -DUSE_NOF=ON -DUSE_NOF_URMA=ON -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Release \
+              -DURMA_ROOT=/usr/include/ub/umdk/urma \
+              -DURMA_LIBRARY=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so && \
+     make -j\$(nproc) && make install"
+```
+
+⚠️ **make 耗时**：`make -j$(nproc)` 在 308 核节点上约 3-5 分钟。如果通过 ssh 后台跑：
+```bash
+# 后台 make（避免 ssh 超时断开）
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/mooncake-930/build && \
+     setsid nohup bash -c 'source ~/venvs/mooncake-bench/bin/activate && make -j\$(nproc) && make install' \
+     > /tmp/r11_make.log 2>&1 < /dev/null & disown"
+# 轮询完成：
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "tail -5 /tmp/r11_make.log; ls -la /usr/local/bin/mooncake_master"
+```
+
+### 6.3 部署阶段命令（node4 单节点 target+store）
+
+```bash
+# === vfio 绑定 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "modprobe vfio-pci && \
+     echo vfio-pci > /sys/bus/pci/devices/0000:a4:00.0/driver_override && \
+     echo 0000:a4:00.0 > /sys/bus/pci/drivers/nvme/unbind && \
+     echo 0000:a4:00.0 > /sys/bus/pci/drivers_probe && \
+     readlink /sys/bus/pci/devices/0000:a4:00.0/driver | xargs basename"
+
+# === 启动 nvmf_tgt ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     export SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma && \
+     setsid nohup nvmf_tgt -m 0xfc --wait-for-rpc -r /var/tmp/spdk.sock \
+         > /tmp/nvmf_tgt.log 2>&1 < /dev/null & disown"
+
+# === SPDK RPC 序列 ===
+# 注意：scripts/rpc.py 在 SPDK 源码树下
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/spdk && python3 scripts/rpc.py -s /var/tmp/spdk.sock rpc_get_methods"
+
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/spdk && python3 scripts/rpc.py -s /var/tmp/spdk.sock iobuf_set_options \
+        small_pool_count=12288 small_bufsize=8192 large_pool_count=512 large_bufsize=4194304 && \
+     python3 scripts/rpc.py -s /var/tmp/spdk.sock framework_start_init"
+
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/spdk && python3 scripts/rpc.py -s /var/tmp/spdk.sock \
+        bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:a4:00.0"
+
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/spdk && python3 scripts/rpc.py -s /var/tmp/spdk.sock \
+        nvmf_create_transport -t URMA -c urma --max-io-size 4194304 \
+        --iobuf-large-cache-size 32 --iobuf-small-cache-size 1024 \
+        --dev-name udmac0d1e2 --eid-index 0"
+
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "cd /home/yin/nof/spdk && \
+     python3 scripts/rpc.py -s /var/tmp/spdk.sock nvmf_create_subsystem nqn.2026-01.io.spdk:mooncake-jd -a -s JD0001 && \
+     python3 scripts/rpc.py -s /var/tmp/spdk.sock nvmf_subsystem_add_ns nqn.2026-01.io.spdk:mooncake-jd Nvme0n1 && \
+     python3 scripts/rpc.py -s /var/tmp/spdk.sock nvmf_subsystem_add_listener nqn.2026-01.io.spdk:mooncake-jd \
+         -t URMA -a 141.61.84.151 -s 4420 -f IPv4"
+
+# === 启动 metadata + master + client ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "source ~/venvs/mooncake-bench/bin/activate && \
+     export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     setsid nohup python -m mooncake.http_metadata_server --port 8080 > /tmp/metadata.log 2>&1 < /dev/null & disown && \
+     sleep 1 && \
+     setsid nohup mooncake_master --rpc_port=50051 --metrics_port=9003 \
+         --enable_http_metadata_server --http_metadata_server_port=8080 \
+         --rpc_address=141.61.84.151 --rpc_thread_num=32 \
+         --eviction_high_watermark_ratio=0.9 --default_kv_lease_ttl=3600000 \
+         --nof_heartbeat_failures_threshold=999999 --nof_heartbeat_interval_sec=3600 \
+         > /tmp/master.log 2>&1 < /dev/null & disown && \
+     sleep 2 && \
+     setsid nohup mooncake_client --host 141.61.84.151 \
+         --metadata_server http://141.61.84.151:8080/metadata \
+         --master_server_address 141.61.84.151:50051 \
+         --protocol ub --device_names udmac0d1e2 \
+         --global_segment_size 4GB --threads 4 \
+         > /tmp/client.log 2>&1 < /dev/null & disown"
+
+# === NoF 注册 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     /home/yin/nof/mooncake-930/build/mooncake-store/src/nof_register \
+         nqn.2026-01.io.spdk:mooncake-jd 1 141.61.84.151 4420 URMA 141.61.84.151:50051 10737418240"
+```
+
+### 6.4 冒烟测试命令
+
+```bash
+# === 通路级冒烟（在 target 节点 node4 上）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "export LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     export SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma && \
+     cd /home/yin/nof/mooncake-930 && \
+     ./build/mooncake-store/tests/nof_buffer_alignment_test && \
+     echo '---worker_pool_bench---' && \
+     ./build/mooncake-store/benchmarks/nof_worker_pool_bench \
+         --endpoints 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd ns:1' \
+         --op=read --io_size=128K --iodepth=64 --duration_sec=20 --range_bytes=1G"
+
+# === 跨节点 1-1 Get 冒烟（在 reader 节点 node2 上）===
+# Prefill
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "export SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma \
+            MC_HIFREQ_LOG_SAMPLE_RATE=0 MC_SLICE_SIZE=1048576 \
+            MC_STORE_MEMCPY=1 MC_STORE_MEMCPY_INLINE=1 \
+            LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     cd /home/yin/nof/mooncake-930 && \
+     ./build/mooncake-store/benchmarks/stress_cluster_bench \
+         --scenario=segment_write --protocol=tcp \
+         --local_hostname=141.61.84.247:50370 \
+         --metadata_server=http://141.61.84.151:8080/metadata \
+         --master_server=141.61.84.151:50051 \
+         --nof_segments='traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd trtype:URMA adrfam:IPv4 ns:1' \
+         --num_keys=256 --value_size=4194304 --replica_num=0 --global_segment_size=0 --nof_replica_num=1 \
+         --num_threads=16 --batch_size=16 --key_include_value_size=true \
+         --nof_qpairs_per_segment=4 --nof_whole_pool_register=true --local_buffer_size=1073741824"
+
+# Read t1_b1
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "export SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma \
+            MC_HIFREQ_LOG_SAMPLE_RATE=0 MC_SLICE_SIZE=1048576 \
+            MC_STORE_MEMCPY=1 MC_STORE_MEMCPY_INLINE=1 \
+            LD_LIBRARY_PATH=/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib && \
+     cd /home/yin/nof/mooncake-930 && \
+     ./build/mooncake-store/benchmarks/stress_cluster_bench \
+         --scenario=segment_read --role=reader --protocol=tcp \
+         --local_hostname=141.61.84.247:50372 \
+         --metadata_server=http://141.61.84.151:8080/metadata --master_server=141.61.84.151:50051 \
+         --nof_segments='traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:mooncake-jd trtype:URMA adrfam:IPv4 ns:1' \
+         --num_keys=256 --value_size=4194304 --replica_num=0 --global_segment_size=0 --nof_replica_num=1 \
+         --num_threads=1 --batch_size=1 --duration=20 --warmup_keys=5 --verify=false \
+         --key_include_value_size=true --nof_qpairs_per_segment=4 --nof_whole_pool_register=true --local_buffer_size=1073741824"
+```
+
+### 6.5 验证与诊断命令
+
+```bash
+# === 检查进程存活 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "ps aux | grep -E 'nvmf_tgt|mooncake_master|mooncake_client|http_metadata' | grep -v grep"
+
+# === 检查端口监听 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "ss -tlnp | grep -E ':50051|:8080|:9003|:4420'"
+
+# === 检查磁盘驱动状态 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "for d in /sys/bus/pci/devices/*; do cls=\$(cat \$d/class 2>/dev/null); \
+     if [ \"\$cls\" = \"0x010802\" ]; then bdf=\$(basename \$d); \
+     drv=\$(readlink \$d/driver 2>/dev/null | xargs basename 2>/dev/null); \
+     echo \"\$bdf \$drv\"; fi; done"
+
+# === 检查 URMA 设备 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "urma_admin show --all 2>/dev/null | grep -E 'udmac|eid|ACTIVE' | head -20"
+
+# === 检查 NoF segment capacity（master metrics）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "curl -s http://141.61.84.151:9003/ 2>/dev/null | python3 -m json.tool | head -30"
+
+# === 检查 liburma 符号 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "nm -D /home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so | grep urma_register_seg_dmabuf && \
+     echo '--- system lib (should be empty) ---' && \
+     nm -D /usr/lib64/liburma.so 2>/dev/null | grep -c urma_register_seg_dmabuf"
+
+# === 检查 cmake cache 关键 flag ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "grep -E 'USE_NOF|USE_NOF_URMA|USE_UB|CMAKE_BUILD_TYPE|URMA_ROOT|URMA_LIBRARY|UMDK_ROOT' \
+     /home/yin/nof/mooncake-930/build/CMakeCache.txt"
+
+# === 检查 nvmf_tgt 日志（listener 是否被拒）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "tail -20 /tmp/nvmf_tgt.log | grep -i 'does not allow\|error\|adrfam'"
+
+# === 检查 mooncake_client 日志（RNIC 是否找到）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "grep -E 'HCA|RNIC|UbTransport|mock_urma|device_names' /tmp/client.log | head -10"
+```
+
+### 6.6 进程清理命令
+
+⚠️ **清理前必须确认是自己的进程**，不要 kill 其他用户的进程（如 l00955908、z00926396）。
+
+```bash
+# === 查看自己的 mooncake 进程（排除其他用户）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "ps aux | grep -E 'mooncake|nvmf_tgt|http_metadata' | grep -v grep | \
+     grep -v l00955908 | grep -v z00926396 | \
+     grep -v '50056\|50058\|8086\|9006\|9008'"
+
+# === Kill 自己的进程（先 SIGTERM，sleep 2，再 SIGKILL）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "kill <PID1> <PID2> <PID3> 2>/dev/null; sleep 2; kill -9 <PID1> <PID2> 2>/dev/null; \
+     ps -p <PID1>,<PID2>,<PID3> -o pid 2>/dev/null; echo done"
+
+# === 验证端口已释放 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "ss -tlnp | grep -E ':50051|:8080|:9003|:4420'"
+
+# === 恢复 vfio 绑定到 nvme（如需手动恢复）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "echo nvme > /sys/bus/pci/devices/0000:a4:00.0/driver_override && \
+     echo 0000:a4:00.0 > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null; \
+     echo 0000:a4:00.0 > /sys/bus/pci/drivers_probe && \
+     readlink /sys/bus/pci/devices/0000:a4:00.0/driver | xargs basename"
+```
+
+### 6.7 文件传输命令（ssh + cat 管道）
+
+本机没有 scp.exe，用 `ssh + cat` 替代：
+
+```bash
+SSH="/c/Program Files (x86)/Git/bin/ssh.exe"
+KEY=/c/Users/y00988740/.ssh/urma_diag_key
+
+# === 上传文件到远程节点 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "cat > /home/yin/round11_930/run.py" \
+    < "D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch/run.py"
+
+# 批量上传
+for f in run.py remote.py analyze.py config_n2_to_n4.json; do
+  "$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+      "cat > /home/yin/round11_930/$f" \
+      < "D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch/$f"
+  echo "uploaded $f"
+done
+
+# === 从远程拉取文件到本机 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "cat /home/yin/round11_930/results/formal_n2_to_n4_t1b1/summary.csv" \
+    > "D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch/results/formal_n2_to_n4_t1b1/summary.csv"
+
+# 批量拉取
+WINBASE="D:/0_Projects/5_Mooncake/doc/3.Final_Performance_sorted/round11_930_branch"
+for phase in formal_n2_to_n4_t1b1 formal_n2_to_n4_phase2; do
+  mkdir -p "$WINBASE/results/$phase"
+  for f in config.json plan.json summary.csv runs.csv rejected.json \
+           disk_candidates.json restore.json bindings.json inventory.json; do
+    "$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+        "cat /home/yin/round11_930/results/$phase/$f 2>/dev/null" \
+        > "$WINBASE/results/$phase/$f" 2>/dev/null
+  done
+done
+
+# 拉取 bench 日志尾部（延迟分位摘要）
+for rep in r0 r1 r2 r3 r4; do
+  "$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+      "tail -40 /home/yin/round11_930/results/formal_n2_to_n4_t1b1/${rep}_B/${rep}_B_1-1_t1_b1.log 2>/dev/null" \
+      > "$WINBASE/results/formal_n2_to_n4_t1b1/${rep}_B/${rep}_B_1-1_t1_b1_log_tail.txt" 2>/dev/null
+done
+```
+
+### 6.8 Sweep 脚本执行命令
+
+```bash
+# === 在 node2 上执行 sweep 脚本 ===
+# discover
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@141.61.84.247 \
+    "cd /home/yin/round11_930 && python3 run.py --discover --config config_n2_to_n4.json \
+        --out results/discover_n2_to_n4 2>&1"
+
+# smoke（8s，1 rep，开 verify）
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -o ServerAliveInterval=10 -o ServerAliveCountMax=6 root@141.61.84.247 \
+    "cd /home/yin/round11_930 && python3 run.py --execute --smoke \
+        --config config_n2_to_n4.json --out results/smoke_n2_to_n4 2>&1"
+
+# 阶段1 formal（t1_b1 × 5 reps × 60s，约 5-8 分钟）
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=8 root@141.61.84.247 \
+    "cd /home/yin/round11_930 && python3 run.py --execute \
+        --config config_n2_to_n4.json --out results/formal_n2_to_n4_t1b1 2>&1"
+
+# 阶段2 formal（3 combos × 5 reps × 60s，共 15 runs，约 20-25 分钟）
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=12 root@141.61.84.247 \
+    "cd /home/yin/round11_930 && python3 run.py --execute \
+        --config config_n2_to_n4_phase2.json --out results/formal_n2_to_n4_phase2 2>&1"
+
+# === 查看结果 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "cd /home/yin/round11_930 && cat results/formal_n2_to_n4_t1b1/summary.csv && \
+     echo '=== runs.csv ===' && cat results/formal_n2_to_n4_t1b1/runs.csv"
+
+# === 查看 log 尾部（延迟分位）===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "grep -E 'Total time:|Total queries:|Throughput \(avg\):|Queries/sec:|Min:|Avg:|P50:|P90:|P99:|P999:|P9999:|Max:' \
+     /home/yin/round11_930/results/formal_n2_to_n4_phase2/r0_B/r0_B_1-1_t16_b1.log"
+```
+
+### 6.9 实验后清理与恢复验证
+
+```bash
+# === 检查 vfio 恢复结果 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.247 \
+    "cat /home/yin/round11_930/results/formal_n2_to_n4_phase2/restore.json | \
+     python3 -c 'import json,sys; r=json.load(sys.stdin); print(\"errors:\",[k for k,v in r.items() if v.get(\"errors\")])'"
+
+# === 检查 node4 磁盘驱动已恢复 nvme ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "for d in /sys/bus/pci/devices/*; do cls=\$(cat \$d/class 2>/dev/null); \
+     if [ \"\$cls\" = \"0x010802\" ]; then bdf=\$(basename \$d); \
+     drv=\$(readlink \$d/driver 2>/dev/null | xargs basename 2>/dev/null); \
+     echo \"\$bdf \$drv\"; fi; done"
+
+# === 检查无残留 r11 进程 ===
+"$SSH" -i "$KEY" -o StrictHostKeyChecking=no root@141.61.84.151 \
+    "ps aux | grep -E 'r11|R11|nvmf_tgt.*0xfc|mooncake_master.*53000' | grep -v grep"
 ```
 
 ---
 
-## 6. 运行
-
-```bash
-cd ~/nof/upstream/Mooncake-Performance
-
-# 冒烟（JD demo，阶梯最后一关，见 §4.4；ub 协议 CLI 覆盖优先级最高）
-python benchmark.py -f configs/basic/demo/simple_put.json --protocol ub
-python benchmark.py -f configs/basic/demo/simple_get.json --protocol ub
-
-# basic 正式（9 场景 × 22 并发组合 × 4 尺寸，较久；--no-plot 可跳过绘图）
-python benchmark.py --config-dir configs/basic --protocol ub
-
-# pipeline（精排/召排；demo 先行）
-python benchmark.py --config-dir configs/pipeline/demo
-python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_1w2r_1x_n2.json
-
-# 其他常用：--dry-run 只打印命令；--no-warmup 关预热；--clean-up 清远程目录
-```
-
-阶段流：`put/put_batch/mixed` = generate-data → remove-keys → warmup → benchmark；
-`get` 家族 = generate-data → prepare-store（预填）→ warmup → benchmark。
-`put` 是 create-only，套件已保证先 remove-keys，不要手动绕过。
-
-产物：`outputs/<ts>/<配置名>.csv`、`benchmark_detail.csv`、
-`logs/<配置名>/*.log`（含 profiling/spdiag 树）、PNG 时延图。判读：
-
-- `throughput_gb_s`（1024 进制）、`p99/p999/p9999_ms` 为核心列；
-- 慢请求诊断：`python scripts/plot_latency.py --log outputs/<ts>/logs/<cfg>/<log>`；
-- spdiag 打点树在 `logs/<cfg>/profiling/<节点>/spdiag_tree.<接口>.txt`；
-- 与 skill 历史基线对照（NoF 4qp ~43 GB/s、host-to-host UB 最优 14.21 GiB/s 等，
-  见 `mooncake-nof-bench` 各子文档 §9/§34）；记录实验按
-  `experiment-report-template.md` 出 `docs/round<N>_….md`。
-
----
-
-## 7. 陷阱速查（合并 skill + 两份部署文档的高频坑）
+## 7. 陷阱速查
 
 | # | 坑 | 处置 |
 |---|---|---|
-| 1 | SPDK 两端 commit 不一致（wire v3/v4 混用） | 两端都 `e12b7cb21`，`git log` 自检 |
-| 2 | nvmf listener 绑 `0.0.0.0` | 必须精确 target IP，否则 sct=1 sc=132 |
-| 3 | cluster.json 缺 `fabric_ip` | client 绑到 Docker veth，初始化挂死；必填业务网卡 IP |
-| 4 | 注册时漏 `--transport-type URMA` | 默认 RDMA 会过滤掉 URMA listener，master 看不到 SSD |
-| 5 | master / target 重启 | master 重启→重跑 P3 注册；target 重启→P0 全套重来 |
-| 6 | `MC_HIFREQ_LOG_SAMPLE_RATE` 默认全采样 | master 和 bench 都显式 `=0`（static const，运行期改不了） |
-| 7 | `MC_NOF_INFLIGHT_BYTES_LIMIT` 是 segment 总预算 | 代码自动 ÷ lane_count；4qp 误设 8M → 2M/lane，吞吐掉到 ~21 GiB/s |
-| 8 | 端口冲突 `Duplicate rpc_meta key` | 每 bench 进程唯一端口；先 `ss -tlnp`，不 kill 现役端口 |
-| 9 | 大页不足 | initiator 侧 client 也初始化 SPDK env，两端都 2048 |
-| 10 | venv 不一致（make install 的 python ≠ 运行 python） | 全程同一 venv；wheel 路线注意目标节点 python 版本匹配 |
-| 11 | NoF 要求连续 slice | MC_SLICE_SIZE=1MB；bench local_buffer 天然连续，勿拆散 |
-| 12 | store 内存 ~12GB 限制 | 正式测量 key_count=1000；纯 NoF（mem=0）后数据落 SSD 无此压力 |
-| 13 | vsegment 部署 + nof≠0 | 直接 INVALID_PARAMS 不回落，属预期 |
-| 14 | `liburma.so.0` 指到 `/usr/lib64` 旧版 | 运行期 `LD_LIBRARY_PATH` 指向 SPDK configure 同款 UMDK lib |
-| 15 | UB 设备名 | 本环境 `bonding_dev_0` 不可用（urma_create_device 失败），统一 `udmac0d1e2` |
-| 16 | 多设备聚合 `udmac0d1e2,udmac1d1e2` | 触发跨卡读暴跌，禁止；单卡调参 `MC_WORKERS_PER_CTX/MC_MAX_WR` |
-| 17 | store_kv_bench 两个 replica 参数同时 0 | 脚本参数校验直接报错（§4.2）；冒烟纯 NoF 必须 `--nof-replica-num 1` |
+| 1 | `client_service.cpp:3046 .size()` 编译错误 | `sed -i '3046s/.size()/.replicas.size()/'`（§1.4） |
+| 2 | 系统 `/usr/lib64/liburma.so` 缺 `urma_register_seg_dmabuf` | `-DURMA_LIBRARY=/home/yin/gdr/UMDK_tool_netlab-sp4_umdk/lib/liburma.so` |
+| 3 | node2 `UMDK_tool/include/` 为空 | 用 `-DURMA_ROOT=/usr/include/ub/umdk/urma` 指向系统头 |
+| 4 | node2 git 坏代理 `141.1.139.187:8989` | `http_proxy=http://127.0.0.1:3128` + `GIT_CONFIG_COUNT` 覆盖（§1.2） |
+| 5 | node2 cmake FetchContent 坏代理 | 同 #4，cmake 前设好代理环境变量 |
+| 6 | nvmf listener adrfam=unknown | `nvmf_subsystem_add_listener` 必须加 `-f IPv4` |
+| 7 | `nof_register` size=0 被拒 | 第 7 个参数 `size_bytes` 必须 > 0（如 `10737418240`） |
+| 8 | `mooncake_client` `No available RNIC` | 加 `--device_names udmac0d1e2`（默认 `bonding_dev_0` 不可用） |
+| 9 | `MC_HIFREQ_LOG_SAMPLE_RATE` 默认 1.0 全采样 | 所有进程显式 `=0` |
+| 10 | `MC_NOF_INFLIGHT_BYTES_LIMIT` 是 segment 总预算 | 代码自动 ÷ lane_count；4qp 误设 8M → 2M/lane，吞吐掉到 ~21 GiB/s |
+| 11 | SPDK 两端 commit 不一致（wire v3/v4 混用） | 两端都 `e12b7cb21`，`git log` 自检 |
+| 12 | `mooncake_master --port` vs `--rpc_port` | 930 分支用 `--rpc_port`（`--port` 已 deprecated） |
+| 13 | 端口冲突 `Duplicate rpc_meta key` | 每 bench 进程唯一端口；先 `ss -tlnp` 检查 |
+| 14 | `LD_LIBRARY_PATH` 三段缺一 | `/home/yin/gdr/UMDK_netlab/lib:/usr/local/lib64:/usr/local/lib` |
+| 15 | SPDK `make install` 报 `hatchling`/`uv` Error 2 | 不影响，以 `/usr/local/lib/libspdk_nvme.a` 存在为准 |
+| 16 | SPDK `e12b7cb21+` `spdk_get_ticks` 链接回归 | `./configure` 加 `--disable-unit-tests` |
 
 ---
 
@@ -439,18 +1007,18 @@ python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_1w2r_1x_n2
 
 ```
 [ ] 两节点 SPDK e12b7cb21 安装并自检（nvme_urma.h + libspdk_nvme.a）
-[ ] store 节点 cmake（USE_NOF/USE_NOF_URMA/USE_UB + UMDK_ROOT）+ make install + store.so OK
-[ ] wheel 分发到 client 节点（或同 venv）
-[ ] 两端大页 2048、UB 模块、/dev/uburma/udmac0d1e2
-[ ] P0 nvmf_tgt + RPC（精确 IP listener）→ ss 4420
-[ ] P1 metadata + P2 master + P4 store client 存活
-[ ] P3 ssd_register --transport-type URMA 成功
+[ ] git clone 930 分支（node2 注意代理覆盖）→ HEAD 706551a8
+[ ] venv 创建 + pip install aiohttp paramiko
+[ ] 修复 client_service.cpp:3046（.size() → .replicas.size()）
+[ ] cmake（node4: UMDK_ROOT / node2: URMA_ROOT + URMA_LIBRARY）→ make -j → make install
+[ ] 验收：4 个二进制 + store.so + liburma 符号
+[ ] vfio 绑定 SSD + nvmf_tgt -m 0xfc + RPC（-f IPv4 listener）
+[ ] metadata + master（--rpc_port）+ client（--device_names udmac0d1e2）
+[ ] nof_register（size_bytes > 0）
 [ ] 冒烟①：nof_buffer_alignment_test 全 PASS
-[ ] 冒烟②：nof_worker_pool_bench --op=read errors=0（GDR 节点加 --op=verify --memory=cuda）
-[ ] 冒烟③：store_kv_bench verify_write --memory-replica-num 0 --nof-replica-num 1 → 100%
-[ ] 冒烟④：同命令去掉 replica 参数 + env 覆盖（MC_NOF_REPLICA_NUM=1/MC_MEM_REPLICA_NUM=0）→ 100% 且 nof_ops>0
-[ ] cluster.json（fabric_ip!）/global.json（master_type/protocol.ub.device=udmac0d1e2）
-[ ] env.mooncake.sh：MC_NOF_REPLICA_NUM=1 + MC_MEM_REPLICA_NUM=0 + NoF 旋钮
-[ ] 冒烟⑤：benchmark.py -f configs/basic/demo/simple_put.json --protocol ub → CSV 出数
-[ ] 正式：--config-dir configs/basic --protocol ub；结果对照 skill 基线并按模板归档
+[ ] 冒烟②：nof_worker_pool_bench --op=read errors=0
+[ ] 冒烟③：跨节点 prefill（segment_write）failed=0
+[ ] 冒烟④：跨节点 read t1_b1 / t16_b16 failed=0
+[ ] 正式：run.py --discover → --smoke → --execute（阶段1 t1_b1 + 阶段2 三 combos）
+[ ] 拉取 results/ 到 Windows，对照 design.md 基线
 ```
