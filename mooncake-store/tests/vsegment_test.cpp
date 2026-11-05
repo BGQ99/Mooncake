@@ -21,6 +21,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -37,6 +38,25 @@ uint64_t MetricValue(const std::string& name) {
     const auto end = text.find('\n', begin);
     return std::stoull(text.substr(begin, end - begin));
 }
+
+class ScopedEnv {
+   public:
+    explicit ScopedEnv(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name)) old_value_ = value;
+    }
+
+    ~ScopedEnv() {
+        if (old_value_) {
+            setenv(name_, old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
 
 struct LegacySlotMetadataExport {
     uint16_t slot{0};
@@ -1789,6 +1809,36 @@ TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {
     }
     ASSERT_TRUE(started) << started.detail;
     // Zero interval disables throttling: the reservation is visible.
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
+}
+
+TEST(VSegmentServiceTest, ReadsMetricsRefreshIntervalFromEnvironment) {
+    constexpr char kIntervalEnv[] =
+        "MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS";
+    ScopedEnv interval_env(kIntervalEnv);
+    ASSERT_EQ(setenv(kIntervalEnv, "0", 1), 0);
+
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
 }
 
