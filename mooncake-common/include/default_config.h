@@ -210,7 +210,7 @@ inline void init_ylt_log_level() {
         const size_t max_files =
             get_size_env("MC_YLT_LOG_MAX_FILES", kDefaultMaxFiles);
 
-        easylog::init_log(severity, log_path, false, true, max_file_size,
+        easylog::init_log(severity, log_path, true, false, max_file_size,
                           max_files, false);
     });
 }
