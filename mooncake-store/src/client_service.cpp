@@ -2911,6 +2911,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     pt_start.Start();
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     pt_start.End(start_result ? 0 : -1);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -5860,8 +5861,9 @@ ErrorCode Client::TransferData(
                                      : PerfKey::PUT_SINGLE_TRANSFER_WAIT,
                               SpDiag::PerfLevel::MODULE);
     SpDiag::PerfPoint pt_vsegment_wait(
-        PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
-    if (is_read) pt_full.Start();
+        is_read ? PerfKey::VSEGMENT_READ_WAIT : PerfKey::VSEGMENT_WRITE_WAIT,
+        SpDiag::PerfLevel::MODULE);
+    pt_full.Start();
 
     // merge(nof): 保留 nof 侧逐笔 breakdown 日志（replica/strategy 维度，
     // hi-freq 采样，未采样时零开销），与上游 pt_* 埋点并存。
@@ -5965,12 +5967,10 @@ ErrorCode Client::TransferData(
             failed_endpoints->insert(endpoint);
         }
     }
-    if (is_read) {
-        const int pt_status = (result == ErrorCode::OK) ? 0 : -1;
-        if (is_vsegment_read) pt_vsegment_wait.End(pt_status);
-        pt_wait.End(pt_status);
-        pt_full.End(pt_status);
-    }
+    const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+    if (is_vsegment) pt_vsegment_wait.End(pt_status);
+    pt_wait.End(pt_status);
+    pt_full.End(pt_status);
     if (breakdown_log) {
         const auto wait_end = std::chrono::steady_clock::now();
         size_t bytes = 0;
@@ -5993,10 +5993,10 @@ ErrorCode Client::TransferData(
                      << " submit_us=" << elapsed_us(transfer_start, submit_end)
                      << " wait_us=" << elapsed_us(submit_end, wait_end)
                      << " total_us=" << elapsed_us(transfer_start, wait_end)
-                     << " status=" << static_cast<int>(result);
+                     << " status=" << static_cast<int>(transfer_result);
     }
 
-    return result;
+    return transfer_result;
 }
 
 ErrorCode Client::TransferReadInternal(
