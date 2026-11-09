@@ -303,6 +303,26 @@ urma_status_t urma_unregister_seg(urma_target_seg_t *seg) {
     return URMA_SUCCESS;
 }
 
+// Mock the delegated segment export with a small opaque driver extension.
+// Importers must preserve the complete blob even though this mock only reads
+// the leading urma_seg_t.
+extern "C" urma_status_t urma_get_seg_ctx(urma_target_seg_t *tseg,
+                                          urma_seg_t **seg, uint32_t *length) {
+    if (!tseg || !seg || !length || seg_map.find(tseg) == seg_map.end()) {
+        return URMA_EINVAL;
+    }
+    constexpr uint32_t kMockExtensionSize = 8;
+    const uint32_t blob_size = sizeof(urma_seg_t) + kMockExtensionSize;
+    auto *out = static_cast<urma_seg_t *>(calloc(1, blob_size));
+    if (!out) return URMA_EINVAL;
+    memcpy(out, &tseg->seg, sizeof(urma_seg_t));
+    *seg = out;
+    *length = blob_size;
+    return URMA_SUCCESS;
+}
+
+extern "C" void urma_put_seg_ctx(urma_seg_t *seg) { free(seg); }
+
 urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
                                    urma_token_t *token_value, uint64_t addr,
                                    urma_import_seg_flag_t flag) {

@@ -22,26 +22,37 @@
 
 namespace mooncake {
 
-// Runtime compatibility layer for urma_get_rjetty/urma_put_rjetty, which are
-// only present in newer UMDK releases. Production symbols are resolved via
-// dlsym once per process; mock builds bind their in-process implementation
-// directly. When the production symbols are absent, the handshake falls back
-// to hand-filled urma_rjetty_t and behavior is identical to the legacy path.
+// Runtime compatibility layer for delegated rjetty and segment contexts,
+// which are only present in newer UMDK releases. Production symbols are
+// resolved via dlsym once per process; mock builds bind their in-process
+// implementation directly. When the production symbols are absent, the
+// legacy fixed-size structures are used.
 //
-// NOTE: do not call urma_get_rjetty/urma_put_rjetty directly anywhere else.
-// A direct reference would break linking against older liburma builds.
-using urma_get_rjetty_fn_t =
-    urma_status_t (*)(urma_jetty_t*, urma_rjetty_t**, uint32_t*);
+// NOTE: do not call these optional APIs directly anywhere else. A direct
+// reference would break linking against older liburma builds.
+using urma_get_rjetty_fn_t = urma_status_t (*)(urma_jetty_t*, urma_rjetty_t**,
+                                               uint32_t*);
 using urma_put_rjetty_fn_t = void (*)(urma_rjetty_t*);
+using urma_get_seg_ctx_fn_t = urma_status_t (*)(urma_target_seg_t*,
+                                                urma_seg_t**, uint32_t*);
+using urma_put_seg_ctx_fn_t = void (*)(urma_seg_t*);
 
 extern urma_get_rjetty_fn_t g_urma_get_rjetty;
 extern urma_put_rjetty_fn_t g_urma_put_rjetty;
+extern urma_get_seg_ctx_fn_t g_urma_get_seg_ctx;
+extern urma_put_seg_ctx_fn_t g_urma_put_seg_ctx;
 
+void initUrmaCompat();
+// Kept for source compatibility with the first rjetty-only compatibility
+// layer. New code should use initUrmaCompat().
 void initUrmaRjettyCompat();
 
 bool decodeUrmaRjettyBlob(const std::string& encoded,
                           std::vector<unsigned char>& buffer,
                           std::string& error);
+
+bool decodeUrmaSegBlob(const std::string& encoded,
+                       std::vector<unsigned char>& buffer, std::string& error);
 
 }  // namespace mooncake
 

@@ -30,9 +30,12 @@
 
 #ifdef MOONCAKE_MOCK_URMA
 extern "C" urma_status_t urma_get_rjetty(urma_jetty_t* jetty,
-                                          urma_rjetty_t** rjetty,
-                                          uint32_t* length);
+                                         urma_rjetty_t** rjetty,
+                                         uint32_t* length);
 extern "C" void urma_put_rjetty(urma_rjetty_t* rjetty);
+extern "C" urma_status_t urma_get_seg_ctx(urma_target_seg_t* tseg,
+                                          urma_seg_t** seg, uint32_t* length);
+extern "C" void urma_put_seg_ctx(urma_seg_t* seg);
 #endif
 
 namespace mooncake {
@@ -44,12 +47,14 @@ std::atomic<int> g_urma_runtime_init_depth{0};
 std::atomic<bool> g_urma_runtime_owned{false};
 }  // namespace
 
-// Resolved once by initUrmaRjettyCompat() (see urma_compat.h). Nullptr means
-// older liburma without urma_get_rjetty: hand-fill fallback is used.
+// Resolved once by initUrmaCompat() (see urma_compat.h). Nullptr means an
+// older liburma: the corresponding fixed-size legacy structure is used.
 urma_get_rjetty_fn_t g_urma_get_rjetty = nullptr;
 urma_put_rjetty_fn_t g_urma_put_rjetty = nullptr;
+urma_get_seg_ctx_fn_t g_urma_get_seg_ctx = nullptr;
+urma_put_seg_ctx_fn_t g_urma_put_seg_ctx = nullptr;
 
-void initUrmaRjettyCompat() {
+void initUrmaCompat() {
     static std::once_flag resolve_once;
     std::call_once(resolve_once, [] {
 #ifdef MOONCAKE_MOCK_URMA
@@ -58,11 +63,17 @@ void initUrmaRjettyCompat() {
         // them directly so tests exercise the delegated-blob path.
         g_urma_get_rjetty = &::urma_get_rjetty;
         g_urma_put_rjetty = &::urma_put_rjetty;
+        g_urma_get_seg_ctx = &::urma_get_seg_ctx;
+        g_urma_put_seg_ctx = &::urma_put_seg_ctx;
 #else
         g_urma_get_rjetty = reinterpret_cast<urma_get_rjetty_fn_t>(
             dlsym(RTLD_DEFAULT, "urma_get_rjetty"));
         g_urma_put_rjetty = reinterpret_cast<urma_put_rjetty_fn_t>(
             dlsym(RTLD_DEFAULT, "urma_put_rjetty"));
+        g_urma_get_seg_ctx = reinterpret_cast<urma_get_seg_ctx_fn_t>(
+            dlsym(RTLD_DEFAULT, "urma_get_seg_ctx"));
+        g_urma_put_seg_ctx = reinterpret_cast<urma_put_seg_ctx_fn_t>(
+            dlsym(RTLD_DEFAULT, "urma_put_seg_ctx"));
 #endif
 
         if (g_urma_get_rjetty && g_urma_put_rjetty) {
@@ -77,8 +88,20 @@ void initUrmaRjettyCompat() {
                          << "falling back to hand-filled urma_rjetty_t for "
                          << "jetty import";
         }
+
+        if (g_urma_get_seg_ctx && g_urma_put_seg_ctx) {
+            LOG(INFO) << "urma_get_seg_ctx available, delegated segment "
+                      << "context enabled";
+        } else {
+            g_urma_get_seg_ctx = nullptr;
+            g_urma_put_seg_ctx = nullptr;
+            LOG(WARNING) << "urma_get_seg_ctx not available in liburma, "
+                         << "falling back to fixed-size urma_seg_t";
+        }
     });
 }
+
+void initUrmaRjettyCompat() { initUrmaCompat(); }
 
 bool decodeUrmaRjettyBlob(const std::string& encoded,
                           std::vector<unsigned char>& buffer,
@@ -91,6 +114,22 @@ bool decodeUrmaRjettyBlob(const std::string& encoded,
     }
     if (buffer.size() < sizeof(urma_rjetty_t)) {
         error = "decoded rjetty is shorter than urma_rjetty_t";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool decodeUrmaSegBlob(const std::string& encoded,
+                       std::vector<unsigned char>& buffer, std::string& error) {
+    try {
+        UbContext::deserializeBinaryData(encoded, buffer);
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+    if (buffer.size() < sizeof(urma_seg_t)) {
+        error = "decoded segment is shorter than urma_seg_t";
         return false;
     }
     error.clear();
@@ -379,7 +418,32 @@ urma_target_seg_t* UrmaContext::seg(uint64_t addr) {
 
 int UrmaContext::buildLocalBufferDesc(uint64_t addr,
                                       UbTransport::BufferDesc& buffer_desc) {
-    auto str = serializeBinaryData(&seg(addr)->seg, sizeof(urma_seg_t));
+    auto* target_seg = seg(addr);
+    if (!target_seg) return ERR_CONTEXT;
+
+    std::string str;
+    urma_seg_t* delegated_seg = nullptr;
+    uint32_t delegated_size = 0;
+    if (g_urma_get_seg_ctx && g_urma_put_seg_ctx) {
+        const urma_status_t status =
+            g_urma_get_seg_ctx(target_seg, &delegated_seg, &delegated_size);
+        if (status == URMA_SUCCESS && delegated_seg != nullptr &&
+            delegated_size >= sizeof(urma_seg_t)) {
+            str = serializeBinaryData(delegated_seg, delegated_size);
+            VLOG(1) << "Exported delegated segment context, va=" << addr
+                    << ", blob_len=" << delegated_size;
+        } else {
+            LOG(WARNING) << "urma_get_seg_ctx failed or returned a short "
+                            "context, va="
+                         << addr << ", status=" << status
+                         << ", blob_len=" << delegated_size
+                         << "; falling back to fixed-size urma_seg_t";
+        }
+        if (delegated_seg != nullptr) g_urma_put_seg_ctx(delegated_seg);
+    }
+    if (str.empty()) {
+        str = serializeBinaryData(&target_seg->seg, sizeof(urma_seg_t));
+    }
     auto index = local_tseg_list().size() - 1;
     buffer_desc.tseg.push_back(str);
     buffer_desc.l_seg_index.push_back(index);
@@ -523,18 +587,26 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
     if (ret != import_tseg_map.end()) return ret->second;
 
     std::vector<unsigned char> output_buffer;
-    deserializeBinaryData(remoteSegmentStr, output_buffer);
-    auto* handle = static_cast<urma_seg_t*>(malloc(sizeof(urma_seg_t)));
+    std::string decode_error;
+    if (!decodeUrmaSegBlob(remoteSegmentStr, output_buffer, decode_error)) {
+        LOG(ERROR) << "Invalid remote segment context: " << decode_error
+                   << ", encoded_len=" << remoteSegmentStr.size();
+        return nullptr;
+    }
+
+    auto* handle = static_cast<urma_seg_t*>(malloc(output_buffer.size()));
     if (!handle) {
         LOG(ERROR) << "Allocate remote segment handle failed";
         return nullptr;
     }
-    memcpy(handle, output_buffer.data(), sizeof(urma_seg_t));
+    memcpy(handle, output_buffer.data(), output_buffer.size());
 
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     if (import_tseg == NULL) {
-        LOG(ERROR) << "Import segment Failed With " << remoteSegmentStr;
+        PLOG(ERROR) << "Failed to import remote segment, va=" << handle->ubva.va
+                    << ", len=" << handle->len
+                    << ", blob_len=" << output_buffer.size();
         free(handle);
         return nullptr;
     }
@@ -863,7 +935,7 @@ bool UrmaContext::uninit() {
 }
 
 bool UrmaContext::init() {
-    initUrmaRjettyCompat();
+    initUrmaCompat();
     urma_init_attr_t init_attr = {};
     auto ret = urma_init(&init_attr);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
