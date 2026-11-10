@@ -2050,10 +2050,12 @@ MasterClient::UpsertStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertStart, PutStartResult>(
         /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+        client_id_, key, total_slice_length, config, tenant_id_.value(),
+        trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2166,11 +2168,12 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
         return tl::make_unexpected(switch_err);
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
                                             void>(
         /*timing=*/nullptr, tenant_id_.value(), object_meta.key,
         /*rpc_stat_key=*/0, client_id_, object_meta, replica_type,
-        tenant_id_.value(), operation_id);
+        tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -2270,10 +2273,12 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
         return tl::make_unexpected(switch_err);
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = InvokeRoutedWithSlotRetry<
         &WrappedMasterService::UpsertRevoke, void>(
         /*timing=*/nullptr, tenant_id_.value(), key, /*rpc_stat_key=*/0,
-        client_id_, key, replica_type, tenant_id_.value(), operation_id);
+        client_id_, key, replica_type, tenant_id_.value(), trace_id,
+        operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
