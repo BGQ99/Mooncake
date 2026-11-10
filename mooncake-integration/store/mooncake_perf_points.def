@@ -79,6 +79,10 @@ PERF_KEY_DEF(PUT_BATCH_INTERNAL_ALLOC_BUFFER,"real_client.cpp::put_batch_interna
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_MEM_COPY,    "real_client.cpp::put_batch_internal",        "MemCopy")
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_SPLIT_SLICES,"real_client.cpp::put_batch_internal",        "SplitSlices")
 
+// === RealClient::upsert_from (single key) ===
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL,           "real_client.cpp::upsert_from",                "UpsertFromInternal")
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL_QUERY,     "client_service.cpp::Upsert",                  "Query")
+
 // === Client::Put (单key) ===
 PERF_KEY_DEF(PUT_SINGLE_FULL,                "client_service.cpp::Put",                    "TransferPut")
 PERF_KEY_DEF(PUT_SINGLE_PUT_START,           "client_service.cpp::Put",                    "PutStart")
