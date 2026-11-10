@@ -1124,25 +1124,7 @@ MasterService::TryVSegmentPutStart(
     PutStartResult result{
         operation_ids.size() == 1 ? operation_ids.front() : std::string{},
         std::move(descriptors)};
-    {
-        std::vector<std::pair<std::string, std::string>> vsegments;
-        for (const auto& replica : result.replicas) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-        if (!vsegments.empty()) {
-            SpDiag::PerfPoint pt_layout(PerfKey::MASTER_VSEG_PUT_START_LAYOUT,
-                                        SpDiag::PerfLevel::MODULE);
-            pt_layout.Start();
-            auto layouts = BuildVSegmentLayoutTable(vsegments);
-            pt_layout.End(layouts.empty() ? -1 : 0);
-            if (!layouts.empty()) {
-                result.vsegment_layouts = std::move(layouts);
-            }
-        }
-    }
+    EnrichVSegmentLayouts(&result);
     return std::optional<PutStartResult>(std::move(result));
 }
 
@@ -7650,11 +7632,29 @@ void MasterService::EnrichVSegmentLayouts(GetReplicaListResponse* response) {
     for (const auto& replica : response->replicas) {
         if (!replica.is_vsegment_replica()) continue;
         const auto& descriptor = replica.get_vsegment_descriptor();
-        vsegments.emplace_back(descriptor.partition_id,
-                               descriptor.vsegment_id);
+        vsegments.emplace_back(descriptor.partition_id, descriptor.vsegment_id);
     }
     if (vsegments.empty()) return;
     SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto layouts = BuildVSegmentLayoutTable(vsegments);
+    pt.End(layouts.empty() ? -1 : 0);
+    if (!layouts.empty()) {
+        response->vsegment_layouts = std::move(layouts);
+    }
+}
+
+void MasterService::EnrichVSegmentLayouts(PutStartResult* response) {
+    if (response == nullptr) return;
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    for (const auto& replica : response->replicas) {
+        if (!replica.is_vsegment_replica()) continue;
+        const auto& descriptor = replica.get_vsegment_descriptor();
+        vsegments.emplace_back(descriptor.partition_id, descriptor.vsegment_id);
+    }
+    if (vsegments.empty()) return;
+    SpDiag::PerfPoint pt(PerfKey::MASTER_VSEG_PUT_START_LAYOUT,
                          SpDiag::PerfLevel::MODULE);
     pt.Start();
     auto layouts = BuildVSegmentLayoutTable(vsegments);
@@ -9065,8 +9065,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
     ErrorCode vsegment_abort_error = ErrorCode::OK;
     metadata.VisitReplicas(
-        &Replica::fn_is_vsegment_replica,
-        [&](const Replica& replica) {
+        &Replica::fn_is_vsegment_replica, [&](const Replica& replica) {
             if (vsegment_abort_error != ErrorCode::OK) return;
             const auto& descriptor = replica.get_vsegment_descriptor();
             const std::string effective_operation_id =
@@ -9079,6 +9078,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             vsegment_abort_error = vsegment_service_->AbortPutOwned(
                 descriptor.partition_id, descriptor.vsegment_id,
                 effective_operation_id);
+            // Same-size Upsert reuses a committed vsegment allocation and
+            // marks its replica PROCESSING without creating a new logical
+            // reservation. Abort therefore returns INVALID_WRITE. Let the
+            // normal replica-erasure path below release that committed
+            // allocation instead of leaving the key stuck in PROCESSING.
+            if (vsegment_abort_error == ErrorCode::INVALID_WRITE &&
+                replica.is_processing()) {
+                vsegment_abort_error = ErrorCode::OK;
+            }
         });
     if (vsegment_abort_error != ErrorCode::OK)
         return tl::make_unexpected(vsegment_abort_error);
