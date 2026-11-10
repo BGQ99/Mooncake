@@ -3080,7 +3080,22 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
-                                             const ReplicateConfig& config) {
+                                             const ReplicateConfig& config,
+                                             bool enable_upsert_from_diagnostics) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        enable_upsert_from_diagnostics &&
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto checksum_end = breakdown_start;
+    auto prepare_end = breakdown_start;
+    auto query_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto finalize_end = breakdown_start;
+    auto cache_invalidate_end = breakdown_start;
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -3090,6 +3105,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
+    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -3105,10 +3121,18 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
 
     // Start upsert operation
+    SpDiag::PerfPoint pt_query(PerfKey::UPSERT_FROM_INTERNAL_QUERY,
+                               SpDiag::PerfLevel::MODULE);
+    if (enable_upsert_from_diagnostics) pt_query.Start();
     auto start_result =
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
+    if (enable_upsert_from_diagnostics) {
+        pt_query.End(start_result ? 0 : -1);
+    }
+    if (breakdown_log) query_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -3174,11 +3198,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     // End upsert operation
     auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
                                                ReplicaType::MEMORY,
                                                upsert_start.operation_id);
+    if (breakdown_log) finalize_end = std::chrono::steady_clock::now();
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -3191,6 +3217,29 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // that the new value is committed so that stale fill cannot publish.
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
+    }
+    if (breakdown_log) {
+        cache_invalidate_end = std::chrono::steady_clock::now();
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "upsert_from_breakdown trace_id=" << trace_id
+                     << " key=" << key << " slices=" << slices.size()
+                     << " replicas=" << upsert_start.replicas.size()
+                     << " checksum_us="
+                     << elapsed_us(breakdown_start, checksum_end)
+                     << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                     << " query_us=" << elapsed_us(prepare_end, query_end)
+                     << " transfer_us=" << elapsed_us(query_end, transfer_end)
+                     << " finalize_us="
+                     << elapsed_us(transfer_end, finalize_end)
+                     << " cache_invalidate_us="
+                     << elapsed_us(finalize_end, cache_invalidate_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, cache_invalidate_end)
+                     << " status=ok";
     }
 
     return {};
