@@ -25,6 +25,7 @@
 #include "mooncake_logging.h"
 #include "mutex.h"
 #include "rpc_service.h"
+#include "store_diagnostics.h"
 #include "types.h"
 #include "etcd_helper.h"
 #include "cvm/etcd_view_store.h"
@@ -728,8 +729,7 @@ template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
     const auto total_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
