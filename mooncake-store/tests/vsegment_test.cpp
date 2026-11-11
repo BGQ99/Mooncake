@@ -7,6 +7,7 @@
 #include "vsegment/vsegment_service.h"
 #include "vsegment/vsegment_manager.h"
 #include "vsegment/vsegment_metrics.h"
+#include "vsegment/vsegment_oplog_mode.h"
 #include "vsegment/partition_quota_planner.h"
 #include "master_service.h"
 #include "rpc_types.h"
@@ -409,6 +410,36 @@ class TestStateCommitter : public VSegmentStateCommitter {
     std::string fail_mutation;
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
+
+    // aligned mode (default): the hot path writes two O(1) records instead of
+    // persisting the full state. Same mutation names keep assertions valid.
+    ErrorCode CommitReservation(const std::string& /*partition_id*/,
+                                const std::string& /*operation_id*/,
+                                const std::string& /*vsegment_id*/,
+                                const LogicalRange& /*range*/,
+                                uint64_t /*route_epoch*/) override {
+        mutations.push_back("logical_reserve");
+        if (fail_next || (!fail_mutation.empty() &&
+                          fail_mutation == "logical_reserve")) {
+            fail_next = false;
+            fail_mutation.clear();
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+        return ErrorCode::OK;
+    }
+
+    ErrorCode CommitRelease(const std::string& /*partition_id*/,
+                            const std::string& /*operation_id*/,
+                            uint64_t /*route_epoch*/) override {
+        mutations.push_back("logical_abort");
+        if (fail_next || (!fail_mutation.empty() &&
+                          fail_mutation == "logical_abort")) {
+            fail_next = false;
+            fail_mutation.clear();
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+        return ErrorCode::OK;
+    }
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -1659,6 +1690,10 @@ TEST(VSegmentManagerTest, InitialBatchDefersOnlyTheDurabilityBarrier) {
 }
 
 TEST(VSegmentManagerTest, IdempotentStartWaitsForOriginalSubmission) {
+    if (VSegmentOplogAlignedMode()) {
+        GTEST_SKIP() << "full-mode only: aligned writes no state record, so "
+                        "there is no durable fence to wait for";
+    }
     std::atomic<bool> allow_write{true};
     OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
         [&](const OpLogBatchRecord&, const DurablePrefix&) {

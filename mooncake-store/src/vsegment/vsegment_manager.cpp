@@ -178,6 +178,12 @@ VSegmentPutStartResult VSegmentManager::StartPut(
             (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
                 return {ErrorCode::STALE_ROUTE, operation_id, {},
                         "PutStart route epoch is stale"};
+            if (degraded_) {
+                // Reconcile failed for this partition: the in-memory allocator
+                // may overlap live objects, so refuse new reservations.
+                return {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, operation_id,
+                        {}, "vsegment partition degraded: reconcile failed"};
+            }
             auto existing_operation = operation_vsegments_.find(operation_id);
             if (existing_operation != operation_vsegments_.end()) {
                 // Reuse the reservation and propagate its latest accepted
@@ -1077,6 +1083,13 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
                     if (snapshot != before.end())
                         state.logical_allocator->Restore(snapshot->second);
                 }
+                // Rebuilt state cannot be trusted: refuse new allocations
+                // (fail-closed) until a later reconcile succeeds.
+                degraded_ = true;
+                LOG(ERROR) << "vsegment reconcile failed for partition "
+                           << partition_id_
+                           << " (overlapping or out-of-range reference); "
+                              "partition degraded, writes rejected";
                 return ErrorCode::INVALID_PARAMS;
             }
             if (range.offset > cursor)
@@ -1090,6 +1103,11 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
         if (result != ErrorCode::OK) {
             for (auto& [id, state] : vsegments_)
                 state.logical_allocator->Restore(before.at(id));
+            degraded_ = true;
+            LOG(ERROR) << "vsegment reconcile failed for partition "
+                       << partition_id_
+                       << " (allocator restore rejected); "
+                          "partition degraded, writes rejected";
             return result;
         }
     }
@@ -1099,6 +1117,16 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
         for (auto& [id, state] : vsegments_)
             state.logical_allocator->Restore(before.at(id));
         operation_vsegments_ = operations_before;
+        degraded_ = true;
+        LOG(ERROR) << "vsegment reconcile failed for partition " << partition_id_
+                   << " (checkpoint persist failed); "
+                      "partition degraded, writes rejected";
+        return result;
+    }
+    if (degraded_) {
+        LOG(INFO) << "vsegment partition " << partition_id_
+                  << " recovered: reconcile succeeded, leaving degraded state";
+        degraded_ = false;
     }
     return result;
 }
