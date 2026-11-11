@@ -4,5 +4,5 @@
 	branch = stable
 [submodule "extern/yalantinglibs"]
 	path = extern/yalantinglibs
-	url = https://github.com/BGQ99/yalantinglibs.git
-	branch = feat/rpc-trace-endpoints-rtt
+	url = https://github.com/Gzure/yalantinglibs.git
+	branch = urma_opt
