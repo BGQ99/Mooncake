@@ -69,8 +69,7 @@ void FlushAsyncLogs();
         .stream()
 
 #define MC_VLOG(level)                                                   \
-    for (bool _mc_log_enabled =                                          \
-             mooncake::logging::ShouldLog(google::severity);             \
+    for (bool _mc_log_enabled = mooncake::logging::ShouldVLog(level);    \
          _mc_log_enabled; _mc_log_enabled = false)                       \
     mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::INFO, \
                                        _mc_log_enabled)                  \
