@@ -60,13 +60,18 @@ void FlushAsyncLogs();
 
 }  // namespace mooncake::logging
 
-#define MC_LOG(severity)                                \
-    mooncake::logging::AsyncLogMessage(                 \
-        __FILE__, __LINE__, google::severity,           \
-        mooncake::logging::ShouldLog(google::severity)) \
+#define MC_LOG(severity)                                                     \
+    for (bool _mc_log_enabled =                                              \
+             mooncake::logging::ShouldLog(google::severity);                 \
+         _mc_log_enabled; _mc_log_enabled = false)                           \
+    mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::severity, \
+                                       _mc_log_enabled)                      \
         .stream()
 
-#define MC_VLOG(level)                                                       \
-    mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::INFO,     \
-                                       mooncake::logging::ShouldVLog(level)) \
+#define MC_VLOG(level)                                                   \
+    for (bool _mc_log_enabled =                                          \
+             mooncake::logging::ShouldLog(google::severity);             \
+         _mc_log_enabled; _mc_log_enabled = false)                       \
+    mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::INFO, \
+                                       _mc_log_enabled)                  \
         .stream()
