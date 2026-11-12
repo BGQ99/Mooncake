@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -214,7 +215,10 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 if (managed.lifecycle != Lifecycle::ACTIVE ||
                     managed.profile_name != profile_name)
                     continue;
-                const auto before = managed.logical_allocator->Snapshot();
+                // No full allocator Snapshot here: Reserve() touches only
+                // free_ranges_/reservations_, so CancelReservation() below is
+                // the exact inverse. A Snapshot per put costs O(completed
+                // operations) and grows with the number of objects.
                 auto reservation =
                     managed.logical_allocator->Reserve(operation_id, length);
                 if (!reservation) {
@@ -241,7 +245,14 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 }
                 if (persisted != ErrorCode::OK) {
                     operation_vsegments_.erase(operation_id);
-                    managed.logical_allocator->Restore(before);
+                    // Undo exactly the reservation we just made; restoring a
+                    // full snapshot is unnecessary and O(objects).
+                    if (managed.logical_allocator->CancelReservation(
+                            operation_id) != ErrorCode::OK) {
+                        LOG(WARNING) << "vsegment reservation rollback failed, "
+                                        "operation="
+                                     << operation_id;
+                    }
                     return {persisted, operation_id, {}, std::move(detail)};
                 }
                 allocated_result = {ErrorCode::OK,
