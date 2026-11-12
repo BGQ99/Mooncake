@@ -24,7 +24,7 @@ PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "real_client.cpp::batch_get_buffer_
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_buffer_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "real_client.cpp::batch_get_buffer_internal", "AllocBuffer")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "real_client.cpp::batch_get_buffer_internal", "SSDRead")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"real_client.cpp::batch_get_buffer_internal", "MemDiskRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_DATA_READ,   "real_client.cpp::batch_get_buffer_internal", "DataRead")
 
 // === get_into_internal steps ===
 PERF_KEY_DEF(GET_INTO_INTERNAL_QUERY,        "real_client.cpp::get_into_internal",         "Query")
@@ -38,7 +38,7 @@ PERF_KEY_DEF(GET_INTO_INTERNAL_DISK_READ,    "real_client.cpp::get_into_internal
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_QUERY,  "real_client.cpp::batch_get_into_internal",   "BatchQuery")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_into_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_ALLOC_BUFFER, "real_client.cpp::batch_get_into_internal", "AllocBuffer")
-PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_MEM_READ, "real_client.cpp::batch_get_into_internal", "MemRead")
+PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DIRECT_READ, "real_client.cpp::batch_get_into_internal", "DirectRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DISK_READ, "real_client.cpp::batch_get_into_internal", "DiskRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SSD_READ, "real_client.cpp::batch_get_into_internal", "SSDRead")
 
@@ -78,6 +78,10 @@ PERF_KEY_DEF(PUT_BATCH_INTERNAL_FULL,        "store_py.cpp::put_batch",         
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_ALLOC_BUFFER,"real_client.cpp::put_batch_internal",        "AllocBuffer")
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_MEM_COPY,    "real_client.cpp::put_batch_internal",        "MemCopy")
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_SPLIT_SLICES,"real_client.cpp::put_batch_internal",        "SplitSlices")
+
+// === RealClient::upsert_from (single key) ===
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL,           "real_client.cpp::upsert_from",                "UpsertFromInternal")
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL_QUERY,     "client_service.cpp::Upsert",                  "Query")
 
 // === Client::Put (单key) ===
 PERF_KEY_DEF(PUT_SINGLE_FULL,                "client_service.cpp::Put",                    "TransferPut")
@@ -125,6 +129,8 @@ PERF_KEY_DEF(GET_SSD_OWNER_RPC_RESUME,       "real_client.cpp::batch_get_offload
 PERF_KEY_DEF(GET_SSD_OWNER_RELEASE,          "file_storage.cpp::ReleaseBuffer",                          "OwnerReleaseBuffer")
 
 // === UB / URMA endpoint first connection path ===
+PERF_KEY_DEF(UB_WORKER_POST_SEND,            "ub_context.cpp::performPostSend",                          "PostSendCall")
+PERF_KEY_DEF(UB_WORKER_POLL,                 "ub_context.cpp::performPoll",                              "PollCall")
 PERF_KEY_DEF(UB_HANDSHAKE_ENCODE,            "transfer_metadata.cpp::TransferHandshakeUtil::encode",     "Encode")
 PERF_KEY_DEF(UB_HANDSHAKE_DECODE,            "transfer_metadata.cpp::TransferHandshakeUtil::decode",     "Decode")
 PERF_KEY_DEF(UB_ENDPOINT_CONSTRUCT,          "urma_endpoint.cpp::construct",                            "Construct")
@@ -135,6 +141,7 @@ PERF_KEY_DEF(UB_ENDPOINT_PASSIVE_SETUP,      "urma_endpoint.cpp::setupConnection
 PERF_KEY_DEF(UB_ENDPOINT_DO_SETUP_ALL,       "urma_endpoint.cpp::doSetupConnection",                    "DoSetupAll")
 PERF_KEY_DEF(UB_ENDPOINT_IMPORT_JETTY,       "urma_endpoint.cpp::doSetupConnection",                    "ImportJetty")
 PERF_KEY_DEF(UB_ENDPOINT_BIND_JETTY,         "urma_endpoint.cpp::doSetupConnection",                    "BindJetty")
+PERF_KEY_DEF(UB_ENDPOINT_GET_RJETTY,         "urma_endpoint.cpp::exportJettyInfos",                     "GetRjetty")
 
 // ============================================================
 // === Master 服务端打点（程序名 mooncake_master）           ===
@@ -288,9 +295,53 @@ PERF_KEY_DEF(CVM_ROUTE_BACKOFF,       "master_client.cpp::InvokeRoutedWithSlotRe
 PERF_KEY_DEF(GET_SSD_LEASE_EXPIRED,   "real_client.cpp::batch_get_into_offload_object_internal", "SsdLeaseExpired")
 // PromotionEnqueue: 读命中仅 LOCAL_DISK 副本时的 promotion 异步入队（master 侧）
 PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue", "PromotionEnqueue")
-// === vsegment 观测（master RPC + client 翻译层） ===
-PERF_KEY_DEF(MASTER_RPC_GET_VSEGMENT_VIEW,     "rpc_service.cpp::GetVSegmentView",     "GetVSegmentView")
-PERF_KEY_DEF(MASTER_RPC_GET_PSEGMENT_ENDPOINT, "rpc_service.cpp::GetPSegmentEndpoint", "GetPSegmentEndpoint")
-PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
-PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
-PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")
+// === vsegment 读链路（Hard C inline-layout 路径） ===
+// LayoutBuild: Master 在原 Query RPC 内从 cache/view 构造响应 layout 表。
+// LayoutCopy:  客户端复制或合并响应 layout 表并挂入 QueryResult。
+// Plan:   layout 查找/校验、逻辑地址条带拆分和 endpoint 映射。
+// Submit: openSegment、TransferRequest 构造和 Transfer Engine 批量提交。
+// Wait:   已提交传输的完成等待；覆盖单读、range read 和 BatchGet。
+PERF_KEY_DEF(VSEGMENT_READ_LAYOUT_BUILD, "master_service.cpp::vsegment_read", "VSegLayoutBuild")
+PERF_KEY_DEF(VSEGMENT_READ_LAYOUT_COPY,  "client_service.cpp::vsegment_read", "VSegLayoutCopy")
+PERF_KEY_DEF(VSEGMENT_READ_PLAN,   "client_service.cpp::vsegment_read", "VSegPlan")
+PERF_KEY_DEF(VSEGMENT_READ_SUBMIT, "client_service.cpp::vsegment_read", "VSegSubmit")
+PERF_KEY_DEF(VSEGMENT_READ_WAIT,   "client_service.cpp::vsegment_read", "VSegWait")
+// === Query 路径下钻（GET 路径核心通信段统计） ===
+PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
+PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")
+PERF_KEY_DEF(QUERY_RPC_TOTAL,     "master_client.cpp::Query",  "QueryRpcTotal")
+
+// === Replica-specific single-read points ===
+// Appended to preserve the numeric identity of all pre-existing PerfKeys.
+PERF_KEY_DEF(GET_INTERNAL_NOF_READ,       "real_client.cpp::get_buffer_internal", "NoFRead")
+PERF_KEY_DEF(GET_INTERNAL_VSEG_READ,      "real_client.cpp::get_buffer_internal", "VSegRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_NOF_READ,  "real_client.cpp::get_into_internal",   "NoFRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_VSEG_READ, "real_client.cpp::get_into_internal",   "VSegRead")
+
+// === VSegment write breakdown ===
+// Appended to preserve the numeric identity of all pre-existing PerfKeys.
+PERF_KEY_DEF(VSEGMENT_WRITE_PLAN,         "client_service.cpp::vsegment_write", "VSegWritePlan")
+PERF_KEY_DEF(VSEGMENT_WRITE_SUBMIT,       "client_service.cpp::vsegment_write", "VSegWriteSubmit")
+PERF_KEY_DEF(VSEGMENT_WRITE_WAIT,         "client_service.cpp::vsegment_write", "VSegWriteWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_RESERVE,  "master_service.cpp::TryVSegmentPutStart", "VSegReserve")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_METADATA, "master_service.cpp::TryVSegmentPutStart", "VSegStartMetadata")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_LAYOUT,   "master_service.cpp::TryVSegmentPutStart", "VSegStartLayout")
+PERF_KEY_DEF(MASTER_VSEG_PUT_END_COMMIT,     "master_service.cpp::PutEndInternal",       "VSegCommit")
+PERF_KEY_DEF(MASTER_PUT_END_SHARD_LOCK_WAIT, "master_service.cpp::PutEndInternal",       "PutEndShardLockWait")
+PERF_KEY_DEF(MASTER_PUT_END_SHARD_LOCK_HOLD, "master_service.cpp::PutEndInternal",       "PutEndShardLockHold")
+PERF_KEY_DEF(MASTER_PUT_END_METADATA,        "master_service.cpp::PutEndInternal",       "PutEndMetadata")
+PERF_KEY_DEF(MASTER_PUT_END_OBJECT_OPLOG,    "master_service.cpp::PutEndInternal",       "PutEndObjectOpLog")
+PERF_KEY_DEF(VSEGMENT_STATE_SNAPSHOT,        "vsegment_manager.cpp::PersistDeferredLocked", "VSegStateSnapshot")
+PERF_KEY_DEF(VSEGMENT_STATE_DELTA,           "vsegment_ha.cpp::CommitDeferred",              "VSegStateDelta")
+PERF_KEY_DEF(VSEGMENT_STATE_SERIALIZE,       "vsegment_ha.cpp::CommitDeferred",              "VSegStateSerialize")
+PERF_KEY_DEF(VSEGMENT_STATE_ENQUEUE,         "vsegment_ha.cpp::CommitDeferred",              "VSegStateEnqueue")
+PERF_KEY_DEF(VSEGMENT_STATE_DURABLE_WAIT,    "vsegment_ha.cpp::WaitDurable",                 "VSegStateDurableWait")
+
+// === VSegment PutStart metadata fine-grained breakdown ===
+// Keep these appended so every pre-existing PerfKey retains its numeric ID.
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_SNAPSHOT_LOCK_WAIT, "master_service.cpp::TryVSegmentPutStart", "VSegSnapshotLockWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_QUOTA_RESERVE,      "master_service.cpp::TryVSegmentPutStart", "VSegQuotaReserve")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_DESCRIPTOR_BUILD,   "master_service.cpp::TryVSegmentPutStart", "VSegDescriptorBuild")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_SHARD_LOCK_WAIT,    "master_service.cpp::TryVSegmentPutStart", "VSegShardLockWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_METADATA_MUTATION,  "master_service.cpp::TryVSegmentPutStart", "VSegMetadataMutation")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_ROLLBACK,           "master_service.cpp::TryVSegmentPutStart", "VSegRollback")

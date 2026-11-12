@@ -14,6 +14,7 @@
 #include <chrono>
 #include <set>
 #include <unordered_set>
+#include <utility>
 
 #include "client_metric.h"
 #include "client_buffer.h"
@@ -46,6 +47,11 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /**
+     * @brief Optional runtime layout table carried by the RPC response.
+     * Only populated for vsegment replicas; shared across a batch.
+     */
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
@@ -69,6 +75,15 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // Optional diagnostic guard. Configure before starting reads; the callable
+    // must support concurrent invocation. It sees the descriptor actually used
+    // for transfer, including a possible local hot-cache redirection.
+    using ReadReplicaValidator =
+        std::function<bool(const std::string&, const Replica::Descriptor&)>;
+    void SetReadReplicaValidator(ReadReplicaValidator validator) {
+        read_replica_validator_ = std::move(validator);
+    }
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -223,6 +238,8 @@ class Client {
      * @param key Object key
      * @param slices Vector of data slices to store
      * @param config Replication configuration
+     * @param enable_upsert_from_diagnostics Enable upsert_from-only SpDiag
+     *        points and sampled breakdown logging
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
@@ -250,7 +267,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
                                          std::vector<Slice>& slices,
-                                         const ReplicateConfig& config);
+                                         const ReplicateConfig& config,
+                                         bool enable_upsert_from_diagnostics =
+                                             false);
 
     /**
      * @brief Batch upsert data with replication
@@ -717,6 +736,10 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    // Inspect the actual remote transport; allocation descriptors carry a
+    // storage tag rather than the Transfer Engine segment's protocol.
+    [[nodiscard]] bool IsUbTransportSegment(const std::string& endpoint);
+
     /**
      * @brief Warmup transport-level connections to all segments
      * currently registered with the master.
@@ -750,9 +773,9 @@ class Client {
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
     [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
 
-    // Return the total number of NUMA nodes (counted from the local topology,
-    // which has one cpu:N entry per node regardless of NIC presence).
-    [[nodiscard]] int GetNumaNodeCount() const;
+    // Return sorted NUMA node IDs from the local topology. The topology has one
+    // cpu:N entry per node regardless of NIC presence.
+    [[nodiscard]] std::vector<int> GetNumaNodes() const;
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
@@ -840,6 +863,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    ReadReplicaValidator read_replica_validator_;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -849,25 +874,32 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code,
-                           std::set<std::string>* failed_endpoints = nullptr);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     // failed_endpoints：vsegment 传输失败归因用。vsegment 副本 Descriptor 仅含
     // 逻辑位置，物理端点在传输 plan 中解析；失败时 best-effort 上报 plan 中
     // 全部条带成员端点（无法定位具体失败成员，误报由 worker 重挂载时
     // MountSegment 的 erase 自愈兜底）。非 vsegment 副本不填充。
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices,
-                            std::set<std::string>* failed_endpoints = nullptr);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferReadRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -984,10 +1016,6 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
-    std::unique_ptr<vsegment::VSegmentViewProvider> vsegment_view_provider_;
-    std::unique_ptr<vsegment::SegmentEndpointResolver>
-        vsegment_endpoint_resolver_;
-    std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
     // Registered client memory used when Copy/Move reads a non-local source
@@ -1119,7 +1147,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const std::vector<VSegmentLayoutEntry>* layouts);
 
     /**
      * @brief Copy an object's replica to target segments

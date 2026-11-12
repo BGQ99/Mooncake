@@ -1860,7 +1860,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
                                  FindGroupIdOnDifferentShard(keys[2])};
 
-    auto results = service_.BatchPutStart(client_id, keys, sizes, config);
+    auto results =
+        service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
     for (const auto& result : results) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -5396,8 +5397,9 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     std::vector<std::string> tenant_keys = {tenant_key_a, tenant_key_b};
     std::vector<uint64_t> tenant_sizes = {1024, 2048};
-    auto tenant_put_start = service_.BatchPutStart(
-        client_id, tenant_keys, tenant_sizes, config, tenant_id.value());
+    auto tenant_put_start =
+        service_.BatchPutStart(client_id, tenant_keys, tenant_sizes, config,
+                               tenant_id.value());
     ASSERT_EQ(tenant_put_start.size(), tenant_keys.size());
     for (const auto& result : tenant_put_start) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());

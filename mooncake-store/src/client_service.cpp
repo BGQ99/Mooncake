@@ -4,6 +4,7 @@
 
 #include "allocator.h"
 #include "segment.h"
+#include "store_diagnostics.h"
 
 #include <csignal>
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #ifdef USE_NOF
 #include <numa.h>
@@ -61,6 +63,14 @@
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {
+
+bool Client::IsUbTransportSegment(const std::string& endpoint) {
+    if (!transfer_engine_) return false;
+    const auto metadata = transfer_engine_->getMetadata();
+    if (!metadata) return false;
+    const auto segment = metadata->getSegmentDescByName(endpoint);
+    return segment && segment->protocol == "ub";
+}
 
 namespace {
 
@@ -196,82 +206,6 @@ struct ReplicaTransferSummary {
             first_error = error;
         }
     }
-};
-
-// vsegment 翻译层分段计时的 thread_local 累加器：Plan() 同步执行于调用
-// 线程，调用方在 Plan 前清零、Plan 后读取（见 TransferData vsegment 分支）。
-struct VSegPlanTiming {
-    int view_loads = 0;
-    uint64_t view_load_ns = 0;
-    int endpoint_rpcs = 0;
-    uint64_t endpoint_resolve_ns = 0;
-};
-thread_local VSegPlanTiming tl_vseg_plan_timing{};
-
-class MasterClientVSegmentViewProvider final
-    : public vsegment::VSegmentViewProvider {
-   public:
-    explicit MasterClientVSegmentViewProvider(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode LoadView(const std::string& partition_id,
-                       const std::string& vsegment_id,
-                       vsegment::VSegmentView* view,
-                       std::string* detail) override {
-        if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
-        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_VIEW_LOAD,
-                             SpDiag::PerfLevel::MODULE);
-        pt.Start();
-        const auto t0 = std::chrono::steady_clock::now();
-        auto result =
-            master_client_->GetVSegmentView(partition_id, vsegment_id);
-        tl_vseg_plan_timing.view_load_ns +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        ++tl_vseg_plan_timing.view_loads;
-        pt.End(result ? 0 : -1);
-        if (!result) {
-            if (detail) *detail = "failed to load vsegment view from owner";
-            return result.error();
-        }
-        *view = std::move(result.value());
-        return ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
-};
-
-class MasterClientSegmentEndpointResolver final
-    : public vsegment::SegmentEndpointResolver {
-   public:
-    explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode ResolveLocation(
-        const std::string& segment_id,
-        vsegment::PSegmentLocation* location) override {
-        if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
-        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_ENDPOINT_RESOLVE,
-                             SpDiag::PerfLevel::MODULE);
-        pt.Start();
-        const auto t0 = std::chrono::steady_clock::now();
-        auto result = master_client_->GetPSegmentEndpoint(segment_id);
-        tl_vseg_plan_timing.endpoint_resolve_ns +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        ++tl_vseg_plan_timing.endpoint_rpcs;
-        pt.End(result ? 0 : -1);
-        if (!result) return result.error();
-        *location = std::move(result.value());
-        return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
-                                          : ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
 };
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
@@ -512,11 +446,111 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+static std::optional<size_t> parse_replica_count_env(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return std::nullopt;
+    }
+    // Strict non-negative decimal integer: reject sign, whitespace, and
+    // trailing characters before parsing. std::stoull alone would silently
+    // accept "-1" (wrapping to ULLONG_MAX) and "1abc" (prefix parse), turning
+    // a typo into an astronomic replica count with an unrelated allocation
+    // failure far from the misconfiguration.
+    for (const char* p = raw; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            LOG(ERROR) << "Invalid " << name << "='" << raw
+                       << "', expected a non-negative decimal integer "
+                          "without sign, whitespace, or trailing "
+                          "characters; the environment variable is ignored "
+                          "and the caller's ReplicateConfig wins";
+            return std::nullopt;
+        }
+    }
+    try {
+        return static_cast<size_t>(std::stoull(raw));
+    } catch (const std::exception&) {
+        // Only reachable on overflow now that the character set is checked.
+        LOG(ERROR) << "Invalid " << name << "='" << raw
+                   << "', value out of range for size_t; the environment "
+                      "variable is ignored and the caller's ReplicateConfig "
+                      "wins";
+        return std::nullopt;
+    }
+}
+
+// JD-Cases: 透明数据放置开关（上层应用不感知 NoF segment）。
+//
+// 部署侧通过环境变量选择写路径，应用侧 ReplicateConfig 无需任何改动：
+//   MC_NOF_REPLICA_NUM -> 覆盖 nof_replica_num（NoF SSD segment，
+//                         SPDK NoF 注册通道）
+//   MC_MEM_REPLICA_NUM -> 覆盖 replica_num（transfer engine 默认内存
+//                         segment）
+//
+// 未设置的环境变量不干预（保留调用方传入值；默认 replica_num=1/nof=0
+// 即纯内存语义）。常用组合：
+//   纯内存压测：MC_MEM_REPLICA_NUM=1（或两个都不设）
+//   纯 NoF 压测：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=0
+//     （mem=0 且 nof=1 为 strict 模式：NoF 段未注册时 put 显式失败
+//      NO_AVAILABLE_HANDLE，避免 1+1 FLEXIBLE 模式下的静默内存退化）
+//   1+1 双副本：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=1
+//
+// 两者解析结果均为 0 属配置错误：master 分配阶段会以 INVALID_PARAMS
+// 拒绝 PutStart（put 失败），客户端在此打一次 ERROR 便于定位。
+struct EnvReplicaPlacement {
+    std::optional<size_t> nof_replica_num;
+    std::optional<size_t> mem_replica_num;
+
+    EnvReplicaPlacement() {
+        nof_replica_num = parse_replica_count_env("MC_NOF_REPLICA_NUM");
+        mem_replica_num = parse_replica_count_env("MC_MEM_REPLICA_NUM");
+    }
+
+    bool active() const { return nof_replica_num || mem_replica_num; }
+};
+
+static void ApplyEnvReplicaPlacement(ReplicateConfig& config) {
+    static const EnvReplicaPlacement env_placement;
+    if (!env_placement.active()) {
+        return;
+    }
+    if (env_placement.nof_replica_num) {
+        config.nof_replica_num = *env_placement.nof_replica_num;
+    }
+    if (env_placement.mem_replica_num) {
+        config.replica_num = *env_placement.mem_replica_num;
+    }
+    static std::once_flag info_once;
+    // env_placement 具有静态存储期，lambda 无需捕获即可直接使用
+    std::call_once(info_once, [] {
+        LOG(INFO) << "Env replica placement override active:"
+                  << (env_placement.mem_replica_num
+                          ? " MC_MEM_REPLICA_NUM=" +
+                                std::to_string(*env_placement.mem_replica_num)
+                          : "")
+                  << (env_placement.nof_replica_num
+                          ? " MC_NOF_REPLICA_NUM=" +
+                                std::to_string(*env_placement.nof_replica_num)
+                          : "")
+                  << " (caller ReplicateConfig values are overridden on "
+                     "every write path)";
+    });
+    if (config.replica_num == 0 && config.nof_replica_num == 0) {
+        static std::once_flag zero_once;
+        std::call_once(zero_once, [] {
+            LOG(ERROR) << "Env replica placement resolved to 0 memory and 0 "
+                          "NoF replicas; master will reject every put with "
+                          "INVALID_PARAMS. Fix MC_MEM_REPLICA_NUM / "
+                          "MC_NOF_REPLICA_NUM";
+        });
+    }
+}
+
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
+    ApplyEnvReplicaPlacement(client_cfg);
     return client_cfg;
 }
 
@@ -1283,15 +1317,8 @@ void Client::InitTransferSubmitter() {
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
-    vsegment_view_provider_ =
-        std::make_unique<MasterClientVSegmentViewProvider>(&master_client_);
-    vsegment_endpoint_resolver_ =
-        std::make_unique<MasterClientSegmentEndpointResolver>(&master_client_);
-    vsegment_view_cache_ = std::make_unique<vsegment::VSegmentViewCache>();
     vsegment_transfer_planner_ =
-        std::make_shared<vsegment::VSegmentTransferPlanner>(
-            vsegment_view_provider_.get(), vsegment_endpoint_resolver_.get(),
-            vsegment_view_cache_.get());
+        std::make_shared<vsegment::VSegmentTransferPlanner>();
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -1480,9 +1507,22 @@ Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 Client::QueryByRegex(const std::string& str) {
-    auto result = master_client_.GetReplicaListByRegex(str);
-    return result;
+    return master_client_.GetReplicaListByRegex(str);
 }
+
+namespace {
+std::shared_ptr<const std::vector<VSegmentLayoutEntry>> MakeVSegmentLayouts(
+    const GetReplicaListResponse& response) {
+    if (!response.vsegment_layouts.has_value()) return nullptr;
+    SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_COPY,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+        *response.vsegment_layouts);
+    pt.End(0);
+    return layouts;
+}
+}  // namespace
 
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
@@ -1505,10 +1545,12 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
+    QueryResult query(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
         result.value().object_checksum);
+    query.vsegment_layouts = MakeVSegmentLayouts(result.value());
+    return query;
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1523,7 +1565,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     pt.Start();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    auto response =
+        master_client_.BatchGetReplicaList(object_keys, tenant_id);
 
     // 松耦合重路由：任一项返回 SLOT_NOT_OWNED 说明视图过期，刷新一次后
     // 整体重试；读操作幂等，重复查询已成功项无害。
@@ -1565,20 +1608,43 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         pt.End(-1);
         return results;
     }
+    // 批量级别的去重表挂在第一个成功响应上（wire 类型不变，天然兼容）；
+    // 整个批次共享同一个 shared_ptr。Hard C 不提供旧 RPC 回退，缺表会在
+    // planner 中按 SEGMENT_NOT_FOUND 失败。
+    const bool has_vsegment_layout =
+        std::any_of(response.begin(), response.end(), [](const auto& result) {
+            return result && result->vsegment_layouts.has_value();
+        });
+    SpDiag::PerfPoint pt_vsegment_layout_copy(
+        PerfKey::VSEGMENT_READ_LAYOUT_COPY, SpDiag::PerfLevel::MODULE);
+    if (has_vsegment_layout) pt_vsegment_layout_copy.Start();
+    std::vector<VSegmentLayoutEntry> batch_layout_entries;
+    MergeVSegmentLayoutTablesFromResults(response, batch_layout_entries);
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (!batch_layout_entries.empty()) {
+        batch_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                std::move(batch_layout_entries));
+    }
+    if (has_vsegment_layout) pt_vsegment_layout_copy.End(0);
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(QueryResult(
+            QueryResult query(
                 std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum));
+                response[i].value().object_checksum);
+            query.vsegment_layouts = batch_layouts;
+            results.emplace_back(std::move(query));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
-    pt.End(0);
+    pt.End(std::all_of(results.begin(), results.end(),
+                       [](const auto& result) { return result.has_value(); })
+               ? 0 : -1);
     return results;
 }
 
@@ -1707,8 +1773,14 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         pt_cache.End(cache_used ? 0 : -1);
     }
 
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
+        if (cache_used) hot_cache_->ReleaseHotKey(object_key);
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    err = TransferRead(replica, slices, query_result.vsegment_layouts.get());
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1788,8 +1860,14 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
+    err = TransferReadRange(replica, slices, src_offset,
+                            query_result.vsegment_layouts.get());
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -1852,6 +1930,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
+        }
+
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -2004,6 +2088,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return pref_results;
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
+#ifdef USE_NOF
+    const int64_t nof_slow_trace_threshold_us =
+        GetSpdkNofSlowTraceThresholdUs();
+#else
+    const int64_t nof_slow_trace_threshold_us = 0;
+#endif
+    const auto batch_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto elapsed_us = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+            .count();
+    };
+
     // Collect all transfer operations for parallel execution
     // Tuple: (index, key, future, replica, cache_used)
     std::vector<std::tuple<size_t, std::string, TransferFuture,
@@ -2015,11 +2115,73 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
+    size_t submitted_bytes = 0;
+    int64_t wait_blocked_us = 0;
+    int64_t checksum_us = 0;
+    size_t ready_before_wait = 0;
+    size_t blocked_futures = 0;
+    int64_t max_future_wait_us = 0;
+    size_t nof_timing_count = 0;
+    uint64_t nof_sub_io_count = 0;
+    uint32_t slowest_lane = 0;
+    size_t slowest_task_index = 0;
+    int64_t slowest_task_us = 0;
+    int64_t nof_dispatch_queue_sum_us = 0;
+    int64_t nof_dispatch_queue_max_us = 0;
+    int64_t nof_worker_setup_sum_us = 0;
+    int64_t nof_worker_setup_max_us = 0;
+    uint64_t nof_qos_tasks_ahead_sum = 0;
+    uint32_t nof_qos_tasks_ahead_max = 0;
+    int64_t nof_qos_fifo_wait_sum_us = 0;
+    int64_t nof_qos_fifo_wait_max_us = 0;
+    int64_t nof_qos_fifo_full_wait_sum_us = 0;
+    int64_t nof_qos_fifo_full_wait_max_us = 0;
+    int64_t nof_qos_fifo_partial_wait_sum_us = 0;
+    int64_t nof_qos_fifo_partial_wait_max_us = 0;
+    int64_t nof_qos_fifo_zero_wait_sum_us = 0;
+    int64_t nof_qos_fifo_zero_wait_max_us = 0;
+    int64_t nof_qos_fifo_unattributed_sum_us = 0;
+    int64_t nof_qos_fifo_unattributed_max_us = 0;
+    int64_t nof_head_to_submit_sum_us = 0;
+    int64_t nof_head_to_submit_max_us = 0;
+    int64_t nof_credit_wait_sum_us = 0;
+    int64_t nof_credit_wait_max_us = 0;
+    int64_t nof_first_credit_wait_sum_us = 0;
+    int64_t nof_first_credit_wait_max_us = 0;
+    int64_t nof_submit_credit_wait_sum_us = 0;
+    int64_t nof_submit_credit_wait_max_us = 0;
+    int64_t nof_qos_queue_sum_us = 0;
+    int64_t nof_qos_queue_max_us = 0;
+    int64_t nof_queue_to_submit_sum_us = 0;
+    int64_t nof_queue_to_submit_max_us = 0;
+    int64_t nof_submit_span_sum_us = 0;
+    int64_t nof_submit_span_max_us = 0;
+    int64_t nof_drain_sum_us = 0;
+    int64_t nof_drain_max_us = 0;
+    int64_t nof_first_completion_sum_us = 0;
+    int64_t nof_first_completion_max_us = 0;
+    int64_t nof_completion_submit_gap_sum_us = 0;
+    int64_t nof_completion_submit_gap_min_us =
+        std::numeric_limits<int64_t>::max();
+    int64_t nof_completion_submit_gap_max_us =
+        std::numeric_limits<int64_t>::min();
+    size_t nof_completion_before_last_submit = 0;
+    int64_t nof_completion_span_sum_us = 0;
+    int64_t nof_completion_span_max_us = 0;
+    int64_t nof_task_total_sum_us = 0;
+    int64_t nof_task_total_max_us = 0;
+    int64_t nof_observe_delay_sum_us = 0;
+    int64_t nof_observe_delay_max_us = 0;
+    NofTransferTiming slowest_task_timing;
 
+    // One submit sample per batch; wait samples below are per future.
+    SpDiag::PerfPoint submit_point(PerfKey::GET_BATCH_SUBMIT,
+                                   SpDiag::PerfLevel::MODULE);
+    submit_point.Start();
     // Submit all transfers in parallel
-    SpDiag::PerfPoint pt_submit(PerfKey::GET_BATCH_SUBMIT,
-                                SpDiag::PerfLevel::MODULE);
-    pt_submit.Start();
+    const auto submit_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
@@ -2062,6 +2224,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
 
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
         if (replica.is_vsegment_replica()) {
@@ -2075,14 +2243,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 client_slices.push_back(
                     {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
             }
+            SpDiag::PerfPoint pt_vsegment_plan(
+                PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
+            pt_vsegment_plan.Start();
             auto plan = vsegment_transfer_planner_->Plan(
-                replica.get_vsegment_descriptor(), client_slices);
+                replica.get_vsegment_descriptor(), client_slices,
+                query_result.vsegment_layouts.get());
+            pt_vsegment_plan.End(plan ? 0 : -1);
             if (!plan) {
                 results[i] = tl::unexpected(plan.error);
                 continue;
             }
+            SpDiag::PerfPoint pt_vsegment_submit(
+                PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
+            pt_vsegment_submit.Start();
             future = transfer_submitter_->submitVSegment(
                 plan, TransferRequest::READ);
+            pt_vsegment_submit.End(future ? 0 : -1);
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
@@ -2117,16 +2294,226 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+        if (breakdown_log) {
+            for (const auto& slice : slices_it->second) {
+                submitted_bytes += slice.size;
+            }
+        }
     }
-    pt_submit.End(0);
+    submit_point.End(pending_transfers.size() == object_keys.size() ? 0 : -1);
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // Wait for all transfers to complete
-    SpDiag::PerfPoint pt_wait(PerfKey::GET_BATCH_WAIT,
-                              SpDiag::PerfLevel::MODULE);
-    pt_wait.Start();
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        const bool is_vsegment = stored_replica.is_vsegment_replica();
+        SpDiag::PerfPoint pt_vsegment_wait(
+            PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
+        if (is_vsegment) pt_vsegment_wait.Start();
+        const bool was_ready = breakdown_log && future.isReady();
+        if (was_ready) {
+            ++ready_before_wait;
+        } else if (breakdown_log) {
+            ++blocked_futures;
+        }
+        const auto wait_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        SpDiag::PerfPoint wait_point(PerfKey::GET_BATCH_WAIT,
+                                     SpDiag::PerfLevel::MODULE);
+        wait_point.Start();
         ErrorCode result = future.get();
+        wait_point.End(result == ErrorCode::OK ? 0 : -1);
+        if (is_vsegment) {
+            pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
+        }
+        if (breakdown_log) {
+            const int64_t future_wait_us =
+                elapsed_us(wait_start, std::chrono::steady_clock::now());
+            wait_blocked_us += future_wait_us;
+            max_future_wait_us =
+                std::max(max_future_wait_us, future_wait_us);
+            if (auto timing = future.nofTiming(); timing.has_value()) {
+                ++nof_timing_count;
+                nof_sub_io_count += timing->sub_io_count;
+                nof_dispatch_queue_sum_us += timing->dispatch_queue_us;
+                nof_dispatch_queue_max_us = std::max(
+                    nof_dispatch_queue_max_us, timing->dispatch_queue_us);
+                nof_worker_setup_sum_us += timing->worker_setup_us;
+                nof_worker_setup_max_us = std::max(
+                    nof_worker_setup_max_us, timing->worker_setup_us);
+                nof_qos_tasks_ahead_sum +=
+                    timing->qos_tasks_ahead_at_enqueue;
+                nof_qos_tasks_ahead_max = std::max(
+                    nof_qos_tasks_ahead_max,
+                    timing->qos_tasks_ahead_at_enqueue);
+                nof_qos_fifo_wait_sum_us += timing->qos_fifo_wait_us;
+                nof_qos_fifo_wait_max_us = std::max(
+                    nof_qos_fifo_wait_max_us, timing->qos_fifo_wait_us);
+                nof_qos_fifo_full_wait_sum_us +=
+                    timing->qos_fifo_full_wait_us;
+                nof_qos_fifo_full_wait_max_us = std::max(
+                    nof_qos_fifo_full_wait_max_us,
+                    timing->qos_fifo_full_wait_us);
+                nof_qos_fifo_partial_wait_sum_us +=
+                    timing->qos_fifo_partial_wait_us;
+                nof_qos_fifo_partial_wait_max_us = std::max(
+                    nof_qos_fifo_partial_wait_max_us,
+                    timing->qos_fifo_partial_wait_us);
+                nof_qos_fifo_zero_wait_sum_us +=
+                    timing->qos_fifo_zero_wait_us;
+                nof_qos_fifo_zero_wait_max_us = std::max(
+                    nof_qos_fifo_zero_wait_max_us,
+                    timing->qos_fifo_zero_wait_us);
+                const int64_t qos_fifo_attributed_us =
+                    timing->qos_fifo_full_wait_us +
+                    timing->qos_fifo_partial_wait_us +
+                    timing->qos_fifo_zero_wait_us;
+                const int64_t qos_fifo_unattributed_us = std::max<int64_t>(
+                    0, timing->qos_fifo_wait_us - qos_fifo_attributed_us);
+                nof_qos_fifo_unattributed_sum_us +=
+                    qos_fifo_unattributed_us;
+                nof_qos_fifo_unattributed_max_us = std::max(
+                    nof_qos_fifo_unattributed_max_us,
+                    qos_fifo_unattributed_us);
+                nof_head_to_submit_sum_us +=
+                    timing->head_to_first_submit_us;
+                nof_head_to_submit_max_us = std::max(
+                    nof_head_to_submit_max_us,
+                    timing->head_to_first_submit_us);
+                nof_credit_wait_sum_us += timing->credit_wait_us;
+                nof_credit_wait_max_us =
+                    std::max(nof_credit_wait_max_us, timing->credit_wait_us);
+                nof_first_credit_wait_sum_us +=
+                    timing->first_credit_wait_us;
+                nof_first_credit_wait_max_us =
+                    std::max(nof_first_credit_wait_max_us,
+                             timing->first_credit_wait_us);
+                const int64_t submit_credit_wait_us =
+                    timing->credit_wait_us - timing->first_credit_wait_us;
+                nof_submit_credit_wait_sum_us += submit_credit_wait_us;
+                nof_submit_credit_wait_max_us = std::max(
+                    nof_submit_credit_wait_max_us, submit_credit_wait_us);
+                nof_qos_queue_sum_us += timing->qos_queue_us;
+                nof_qos_queue_max_us =
+                    std::max(nof_qos_queue_max_us, timing->qos_queue_us);
+                nof_queue_to_submit_sum_us +=
+                    timing->queue_to_first_submit_us;
+                nof_queue_to_submit_max_us = std::max(
+                    nof_queue_to_submit_max_us,
+                    timing->queue_to_first_submit_us);
+                nof_submit_span_sum_us += timing->first_to_last_submit_us;
+                nof_submit_span_max_us = std::max(
+                    nof_submit_span_max_us, timing->first_to_last_submit_us);
+                nof_drain_sum_us += timing->last_submit_to_complete_us;
+                nof_drain_max_us = std::max(
+                    nof_drain_max_us, timing->last_submit_to_complete_us);
+                nof_first_completion_sum_us +=
+                    timing->first_submit_to_first_completion_us;
+                nof_first_completion_max_us = std::max(
+                    nof_first_completion_max_us,
+                    timing->first_submit_to_first_completion_us);
+                nof_completion_submit_gap_sum_us +=
+                    timing->first_completion_minus_last_submit_us;
+                nof_completion_submit_gap_min_us = std::min(
+                    nof_completion_submit_gap_min_us,
+                    timing->first_completion_minus_last_submit_us);
+                nof_completion_submit_gap_max_us = std::max(
+                    nof_completion_submit_gap_max_us,
+                    timing->first_completion_minus_last_submit_us);
+                if (timing->first_completion_minus_last_submit_us < 0) {
+                    ++nof_completion_before_last_submit;
+                }
+                nof_completion_span_sum_us +=
+                    timing->first_completion_to_complete_us;
+                nof_completion_span_max_us = std::max(
+                    nof_completion_span_max_us,
+                    timing->first_completion_to_complete_us);
+                nof_task_total_sum_us += timing->total_us;
+                nof_task_total_max_us =
+                    std::max(nof_task_total_max_us, timing->total_us);
+                nof_observe_delay_sum_us += timing->complete_to_observe_us;
+                nof_observe_delay_max_us = std::max(
+                    nof_observe_delay_max_us,
+                    timing->complete_to_observe_us);
+                MC_LOG(INFO)
+                    << "batch_get_nof_task_breakdown trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " sub_io_count=" << timing->sub_io_count
+                    << " tasks_ahead_at_enqueue="
+                    << timing->qos_tasks_ahead_at_enqueue
+                    << " dispatch_queue_us=" << timing->dispatch_queue_us
+                    << " worker_setup_us=" << timing->worker_setup_us
+                    << " qos_fifo_wait_us=" << timing->qos_fifo_wait_us
+                    << " qos_fifo_full_wait_us="
+                    << timing->qos_fifo_full_wait_us
+                    << " qos_fifo_partial_wait_us="
+                    << timing->qos_fifo_partial_wait_us
+                    << " qos_fifo_zero_wait_us="
+                    << timing->qos_fifo_zero_wait_us
+                    << " qos_fifo_unattributed_us="
+                    << qos_fifo_unattributed_us
+                    << " head_to_submit_us="
+                    << timing->head_to_first_submit_us
+                    << " first_credit_wait_us="
+                    << timing->first_credit_wait_us
+                    << " submit_credit_wait_us="
+                    << (timing->credit_wait_us -
+                        timing->first_credit_wait_us)
+                    << " submit_span_us="
+                    << timing->first_to_last_submit_us
+                    << " drain_us=" << timing->last_submit_to_complete_us
+                    << " first_completion_us="
+                    << timing->first_submit_to_first_completion_us
+                    << " completion_submit_gap_us="
+                    << timing->first_completion_minus_last_submit_us
+                    << " completion_span_us="
+                    << timing->first_completion_to_complete_us
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us
+                    << " worker_idx=" << timing->worker_index
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " lane_completion_seq="
+                    << timing->lane_completion_sequence
+                    << " max_subio_us=" << timing->max_sub_io_latency_us
+                    << " max_subio_idx=" << timing->max_sub_io_index
+                    << " max_subio_cid=" << timing->max_sub_io_cid
+                    << " max_completion_gap_us="
+                    << timing->max_completion_gap_us
+                    << " max_poll_return_gap_us="
+                    << timing->max_poll_return_gap_us
+                    << " poll_calls=" << timing->poll_calls_during_task
+                    << " empty_polls=" << timing->empty_polls_during_task
+                    << " polled_completions="
+                    << timing->polled_completions_during_task;
+                if (timing->total_us > slowest_task_us) {
+                    slowest_task_us = timing->total_us;
+                    slowest_lane = timing->lane;
+                    slowest_task_index = index;
+                    slowest_task_timing = *timing;
+                }
+            }
+        }
+#ifdef USE_NOF
+        if (!breakdown_log && nof_slow_trace_threshold_us > 0) {
+            if (auto timing = future.nofTiming();
+                timing.has_value() &&
+                timing->total_us >= nof_slow_trace_threshold_us) {
+                MC_LOG(INFO)
+                    << "batch_get_slow_task_observed trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us;
+            }
+        }
+#endif
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -2148,9 +2535,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            const auto checksum_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
+            if (breakdown_log) {
+                checksum_us += elapsed_us(checksum_start,
+                                          std::chrono::steady_clock::now());
+            }
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
@@ -2173,10 +2567,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
     }
-    pt_wait.End(0);
+    const auto wait_loop_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
+    const auto lease_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -2186,12 +2585,200 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
+    const auto batch_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
+    const auto t1_batch_get = std::chrono::steady_clock::now();
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - t0_batch_get)
+                            t1_batch_get - t0_batch_get)
                             .count();
     if (metrics_) {
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
+    }
+
+    if (nof_slow_trace_threshold_us > 0 &&
+        us_batch_get >= nof_slow_trace_threshold_us) {
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        const auto mono_ns = [](auto value) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       value.time_since_epoch())
+                .count();
+        };
+        MC_LOG(INFO) << "batch_get_slow_trace trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " start_mono_ns=" << mono_ns(t0_batch_get)
+                     << " end_mono_ns=" << mono_ns(t1_batch_get)
+                     << " total_us=" << us_batch_get
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
+    }
+
+    if (breakdown_log) {
+        const int64_t setup_us = elapsed_us(batch_start, submit_start);
+        const int64_t submit_us = elapsed_us(submit_start, submit_end);
+        const int64_t wait_loop_us = elapsed_us(submit_end, wait_loop_end);
+        const int64_t result_us =
+            std::max<int64_t>(0, wait_loop_us - wait_blocked_us - checksum_us);
+        const int64_t lease_us = elapsed_us(lease_start, batch_end);
+        const int64_t total_us = elapsed_us(batch_start, batch_end);
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        MC_LOG(INFO) << "batch_get_data_breakdown trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " bytes=" << submitted_bytes
+                     << " setup_us=" << setup_us
+                     << " submit_us=" << submit_us
+                     << " wait_blocked_us=" << wait_blocked_us
+                     << " checksum_us=" << checksum_us
+                     << " result_us=" << result_us
+                     << " lease_us=" << lease_us
+                     << " total_us=" << total_us
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
+        if (nof_timing_count > 0) {
+            auto average = [nof_timing_count](int64_t sum) {
+                return sum / static_cast<int64_t>(nof_timing_count);
+            };
+            MC_LOG(INFO)
+                << "batch_get_nof_wait_breakdown trace_id=" << trace_id
+                << " nof_tasks=" << nof_timing_count
+                << " sub_ios=" << nof_sub_io_count
+                << " ready_before_wait=" << ready_before_wait
+                << " blocked_futures=" << blocked_futures
+                << " future_wait_sum_us=" << wait_blocked_us
+                << " future_wait_max_us=" << max_future_wait_us
+                << " dispatch_queue_avg_us="
+                << average(nof_dispatch_queue_sum_us)
+                << " dispatch_queue_max_us=" << nof_dispatch_queue_max_us
+                << " worker_setup_avg_us="
+                << average(nof_worker_setup_sum_us)
+                << " worker_setup_max_us=" << nof_worker_setup_max_us
+                << " tasks_ahead_avg="
+                << average(static_cast<int64_t>(nof_qos_tasks_ahead_sum))
+                << " tasks_ahead_max=" << nof_qos_tasks_ahead_max
+                << " qos_fifo_wait_avg_us="
+                << average(nof_qos_fifo_wait_sum_us)
+                << " qos_fifo_wait_max_us=" << nof_qos_fifo_wait_max_us
+                << " qos_fifo_full_wait_avg_us="
+                << average(nof_qos_fifo_full_wait_sum_us)
+                << " qos_fifo_full_wait_max_us="
+                << nof_qos_fifo_full_wait_max_us
+                << " qos_fifo_partial_wait_avg_us="
+                << average(nof_qos_fifo_partial_wait_sum_us)
+                << " qos_fifo_partial_wait_max_us="
+                << nof_qos_fifo_partial_wait_max_us
+                << " qos_fifo_zero_wait_avg_us="
+                << average(nof_qos_fifo_zero_wait_sum_us)
+                << " qos_fifo_zero_wait_max_us="
+                << nof_qos_fifo_zero_wait_max_us
+                << " qos_fifo_unattributed_avg_us="
+                << average(nof_qos_fifo_unattributed_sum_us)
+                << " qos_fifo_unattributed_max_us="
+                << nof_qos_fifo_unattributed_max_us
+                << " head_to_submit_avg_us="
+                << average(nof_head_to_submit_sum_us)
+                << " head_to_submit_max_us=" << nof_head_to_submit_max_us
+                << " credit_wait_avg_us=" << average(nof_credit_wait_sum_us)
+                << " credit_wait_max_us=" << nof_credit_wait_max_us
+                << " first_credit_wait_avg_us="
+                << average(nof_first_credit_wait_sum_us)
+                << " first_credit_wait_max_us="
+                << nof_first_credit_wait_max_us
+                << " submit_credit_wait_avg_us="
+                << average(nof_submit_credit_wait_sum_us)
+                << " submit_credit_wait_max_us="
+                << nof_submit_credit_wait_max_us
+                << " qos_queue_avg_us=" << average(nof_qos_queue_sum_us)
+                << " qos_queue_max_us=" << nof_qos_queue_max_us
+                << " queue_to_submit_avg_us="
+                << average(nof_queue_to_submit_sum_us)
+                << " queue_to_submit_max_us="
+                << nof_queue_to_submit_max_us
+                << " submit_span_avg_us="
+                << average(nof_submit_span_sum_us)
+                << " submit_span_max_us=" << nof_submit_span_max_us
+                << " drain_avg_us=" << average(nof_drain_sum_us)
+                << " drain_max_us=" << nof_drain_max_us
+                << " first_completion_avg_us="
+                << average(nof_first_completion_sum_us)
+                << " first_completion_max_us="
+                << nof_first_completion_max_us
+                << " completion_submit_gap_avg_us="
+                << average(nof_completion_submit_gap_sum_us)
+                << " completion_submit_gap_min_us="
+                << nof_completion_submit_gap_min_us
+                << " completion_submit_gap_max_us="
+                << nof_completion_submit_gap_max_us
+                << " completion_before_last_submit_tasks="
+                << nof_completion_before_last_submit
+                << " completion_span_avg_us="
+                << average(nof_completion_span_sum_us)
+                << " completion_span_max_us="
+                << nof_completion_span_max_us
+                << " task_total_avg_us=" << average(nof_task_total_sum_us)
+                << " task_total_max_us=" << nof_task_total_max_us
+                << " observe_delay_avg_us="
+                << average(nof_observe_delay_sum_us)
+                << " observe_delay_max_us=" << nof_observe_delay_max_us
+                << " slowest_lane=" << slowest_lane
+                << " slowest_task_index=" << slowest_task_index
+                << " slowest_task_us=" << slowest_task_us
+                << " slowest_qos_queue_us="
+                << slowest_task_timing.qos_queue_us
+                << " slowest_dispatch_queue_us="
+                << slowest_task_timing.dispatch_queue_us
+                << " slowest_worker_setup_us="
+                << slowest_task_timing.worker_setup_us
+                << " slowest_qos_fifo_wait_us="
+                << slowest_task_timing.qos_fifo_wait_us
+                << " slowest_tasks_ahead_at_enqueue="
+                << slowest_task_timing.qos_tasks_ahead_at_enqueue
+                << " slowest_qos_fifo_full_wait_us="
+                << slowest_task_timing.qos_fifo_full_wait_us
+                << " slowest_qos_fifo_partial_wait_us="
+                << slowest_task_timing.qos_fifo_partial_wait_us
+                << " slowest_qos_fifo_zero_wait_us="
+                << slowest_task_timing.qos_fifo_zero_wait_us
+                << " slowest_qos_fifo_unattributed_us="
+                << std::max<int64_t>(
+                       0, slowest_task_timing.qos_fifo_wait_us -
+                              slowest_task_timing.qos_fifo_full_wait_us -
+                              slowest_task_timing.qos_fifo_partial_wait_us -
+                              slowest_task_timing.qos_fifo_zero_wait_us)
+                << " slowest_head_to_submit_us="
+                << slowest_task_timing.head_to_first_submit_us
+                << " slowest_credit_wait_us="
+                << slowest_task_timing.credit_wait_us
+                << " slowest_first_credit_wait_us="
+                << slowest_task_timing.first_credit_wait_us
+                << " slowest_submit_credit_wait_us="
+                << (slowest_task_timing.credit_wait_us -
+                    slowest_task_timing.first_credit_wait_us)
+                << " slowest_submit_span_us="
+                << slowest_task_timing.first_to_last_submit_us
+                << " slowest_drain_us="
+                << slowest_task_timing.last_submit_to_complete_us
+                << " slowest_first_completion_us="
+                << slowest_task_timing.first_submit_to_first_completion_us
+                << " slowest_completion_submit_gap_us="
+                << slowest_task_timing.first_completion_minus_last_submit_us
+                << " slowest_completion_span_us="
+                << slowest_task_timing.first_completion_to_complete_us
+                << " slowest_observe_delay_us="
+                << slowest_task_timing.complete_to_observe_us;
+        }
     }
 
     // Log overall cache hit statistics for the entire batch
@@ -2274,6 +2861,18 @@ void Client::ReportFailedEndpointsToMasters(
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto checksum_end = breakdown_start;
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+    auto revoke_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -2287,6 +2886,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
+    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -2302,9 +2902,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
 
     // Start put operation
+    SpDiag::PerfPoint pt_start(PerfKey::PUT_SINGLE_PUT_START,
+                               SpDiag::PerfLevel::MODULE);
+    pt_start.Start();
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    pt_start.End(start_result ? 0 : -1);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -2341,7 +2947,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
+                SpDiag::PerfPoint pt_disk(PerfKey::PUT_SINGLE_DISK_WRITE,
+                                          SpDiag::PerfLevel::MODULE);
+                pt_disk.Start();
                 PutToLocalFile(key, slices, disk_descriptor);
+                pt_disk.End(0);
                 break;  // Only one disk replica is needed
             }
         }
@@ -2353,6 +2963,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // vsegment 副本 Descriptor 仅含逻辑位置，其物理端点经 TransferWrite
     // 内部解析传输 plan 后回填到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
+    const auto* put_layouts = put_start.vsegment_layouts.has_value()
+                                  ? &*put_start.vsegment_layouts
+                                  : nullptr;
+    SpDiag::PerfPoint pt_transfer(PerfKey::PUT_SINGLE_TRANSFER_WRITE,
+                                  SpDiag::PerfLevel::MODULE);
+    pt_transfer.Start();
     for (const auto& replica : put_start.replicas) {
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
             replica.is_vsegment_replica()) {
@@ -2362,8 +2978,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                       : replica.is_vsegment_replica()
                                           ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints, put_layouts);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
                 if (replica.is_memory_replica()) {
@@ -2380,6 +2996,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             transfer_summary.RecordSuccess(replica_type);
         }
     }
+    pt_transfer.End(transfer_summary.first_error == ErrorCode::OK ? 0 : -1);
 
     auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_put)
@@ -2387,13 +3004,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     // 方案二被动层：上报坏端点（不改变写语义——FLEXIBLE 部分成功仍成功）。
     // 放在 put_latency 指标采集之后，避免上报 RPC 耗时污染写延迟统计。
     ReportFailedEndpointsToMasters(failed_endpoints);
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         SpDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
@@ -2410,20 +3028,49 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(err);
         }
     }
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
 
     if (finalize_decision.revoke_type.has_value()) {
+        SpDiag::PerfPoint pt_revoke(PerfKey::PUT_SINGLE_PUT_REVOKE,
+                                    SpDiag::PerfLevel::MODULE);
+        pt_revoke.Start();
         auto revoke_result = master_client_.PutRevoke(
             key, *finalize_decision.revoke_type, put_start.operation_id);
+        pt_revoke.End(revoke_result ? 0 : -1);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             pt_full.End(-1);
             return tl::unexpected(revoke_result.error());
         }
     }
+    if (breakdown_log) revoke_end = std::chrono::steady_clock::now();
 
     if (!finalize_decision.success) {
         pt_full.End(-1);
         return tl::unexpected(finalize_decision.error);
+    }
+
+    if (breakdown_log) {
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_put_breakdown trace_id=" << trace_id
+                     << " key=" << key << " slices=" << slices.size()
+                     << " replicas=" << start_result.value().replicas.size()
+                     << " checksum_us="
+                     << elapsed_us(breakdown_start, checksum_end)
+                     << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us=" << elapsed_us(transfer_end, put_end_end)
+                     << " revoke_us=" << elapsed_us(put_end_end, revoke_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, revoke_end)
+                     << " status=ok";
     }
 
     pt_full.End(0);
@@ -2432,7 +3079,22 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
-                                             const ReplicateConfig& config) {
+                                             const ReplicateConfig& config,
+                                             bool enable_upsert_from_diagnostics) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        enable_upsert_from_diagnostics &&
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto checksum_end = breakdown_start;
+    auto prepare_end = breakdown_start;
+    auto query_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto finalize_end = breakdown_start;
+    auto cache_invalidate_end = breakdown_start;
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2442,6 +3104,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
+    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -2457,10 +3120,18 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
 
     // Start upsert operation
+    SpDiag::PerfPoint pt_query(PerfKey::UPSERT_FROM_INTERNAL_QUERY,
+                               SpDiag::PerfLevel::MODULE);
+    if (enable_upsert_from_diagnostics) pt_query.Start();
     auto start_result =
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
+    if (enable_upsert_from_diagnostics) {
+        pt_query.End(start_result ? 0 : -1);
+    }
+    if (breakdown_log) query_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -2494,11 +3165,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // 仅含逻辑位置，其物理端点经 TransferWrite 内部解析传输 plan 后回填
     // 到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
+    const auto* upsert_layouts = upsert_start.vsegment_layouts.has_value()
+                                     ? &*upsert_start.vsegment_layouts
+                                     : nullptr;
     // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints, upsert_layouts);
             if (transfer_err != ErrorCode::OK) {
                 if (replica.is_memory_replica()) {
                     failed_endpoints.insert(replica.get_memory_descriptor()
@@ -2523,11 +3197,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     // End upsert operation
     auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
                                                ReplicaType::MEMORY,
                                                upsert_start.operation_id);
+    if (breakdown_log) finalize_end = std::chrono::steady_clock::now();
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -2540,6 +3216,29 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // that the new value is committed so that stale fill cannot publish.
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
+    }
+    if (breakdown_log) {
+        cache_invalidate_end = std::chrono::steady_clock::now();
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "upsert_from_breakdown trace_id=" << trace_id
+                     << " key=" << key << " slices=" << slices.size()
+                     << " replicas=" << upsert_start.replicas.size()
+                     << " checksum_us="
+                     << elapsed_us(breakdown_start, checksum_end)
+                     << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                     << " query_us=" << elapsed_us(prepare_end, query_end)
+                     << " transfer_us=" << elapsed_us(query_end, transfer_end)
+                     << " finalize_us="
+                     << elapsed_us(transfer_end, finalize_end)
+                     << " cache_invalidate_us="
+                     << elapsed_us(finalize_end, cache_invalidate_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, cache_invalidate_end)
+                     << " status=ok";
     }
 
     return {};
@@ -2603,6 +3302,7 @@ class PutOperation {
    public:
     struct PendingTransferRecord {
         ReplicaType replica_type;
+        bool is_vsegment;
         TransferFuture future;
         // 方案二被动层：传输失败归因用，目标 worker 的 transport endpoint。
         // memory/nof 副本单端点；vsegment 副本记录传输 plan 解析出的全部
@@ -2611,9 +3311,10 @@ class PutOperation {
         std::vector<std::string> transport_endpoints;
 
         PendingTransferRecord(
-            ReplicaType type, TransferFuture&& transfer_future,
+            ReplicaType type, bool vsegment, TransferFuture&& transfer_future,
             std::vector<std::string> endpoints = {})
             : replica_type(type),
+              is_vsegment(vsegment),
               future(std::move(transfer_future)),
               transport_endpoints(std::move(endpoints)) {}
     };
@@ -2633,6 +3334,9 @@ class PutOperation {
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
+    // 方案 C：批次响应带回的去重 vsegment layout 表；同批次的所有 op 共享
+    // 同一个 shared_ptr（只在 StartBatchPut/StartBatchUpsert 里构造一次）。
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
     std::vector<PendingTransferRecord> pending_transfers;
 
     size_t requested_memory_replicas = 0;
@@ -2732,11 +3436,15 @@ void AggregateBatchFailedEndpoints(const std::vector<PutOperation>& ops,
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices) {
+    SpDiag::PerfPoint pt_create(PerfKey::PUT_BATCH_CREATE_OPS,
+                                SpDiag::PerfLevel::MODULE);
+    pt_create.Start();
     std::vector<PutOperation> ops;
     ops.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ops.emplace_back(keys[i], batched_slices[i]);
     }
+    pt_create.End(0);
     return ops;
 }
 
@@ -2819,6 +3527,20 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                     [](const auto& response) { return response.has_value(); });
     pt_batch_start.End(any_start_succeeded ? 0 : -1);
 
+    std::vector<VSegmentLayoutEntry> merged_layouts;
+    for (const auto& response : start_responses) {
+        if (response && response->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(merged_layouts,
+                                     *response->vsegment_layouts);
+        }
+    }
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (!merged_layouts.empty()) {
+        batch_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                std::move(merged_layouts));
+    }
+
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
@@ -2828,7 +3550,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i]->replicas);
+            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2898,6 +3621,20 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
+    std::vector<VSegmentLayoutEntry> merged_layouts;
+    for (const auto& response : start_responses) {
+        if (response && response->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(merged_layouts,
+                                     *response->vsegment_layouts);
+        }
+    }
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (!merged_layouts.empty()) {
+        batch_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                std::move(merged_layouts));
+    }
+
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
@@ -2906,7 +3643,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             op.SetError(start_responses[i].error(),
                         "Master failed to start upsert operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i]->replicas);
+            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2922,8 +3660,12 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    SpDiag::PerfPoint pt_submit_batch(PerfKey::PUT_BATCH_SUBMIT,
+                                     SpDiag::PerfLevel::MODULE);
+    pt_submit_batch.Start();
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
+        pt_submit_batch.End(0);
         return;
     }
     if (!transfer_submitter_) {
@@ -2936,6 +3678,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                                 PutOperationState::TRANSFER_FAILED,
                                 "TransferSubmitter not initialized");
         }
+        pt_submit_batch.End(-1);
         return;
     }
 
@@ -2961,7 +3704,11 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
                     auto disk_descriptor = replica.get_disk_descriptor();
+                    SpDiag::PerfPoint pt_disk(PerfKey::PUT_BATCH_DISK_WRITE,
+                                              SpDiag::PerfLevel::MODULE);
+                    pt_disk.Start();
                     PutToLocalFile(op.key, op.slices, disk_descriptor);
+                    pt_disk.End(0);
                     break;  // Only one disk replica is needed
                 }
             }
@@ -3004,8 +3751,14 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                             {reinterpret_cast<uint64_t>(slice.ptr),
                              slice.size});
                     }
+                    SpDiag::PerfPoint pt_plan(
+                        PerfKey::VSEGMENT_WRITE_PLAN,
+                        SpDiag::PerfLevel::MODULE);
+                    pt_plan.Start();
                     auto plan = vsegment_transfer_planner_->Plan(
-                        replica.get_vsegment_descriptor(), client_slices);
+                        replica.get_vsegment_descriptor(), client_slices,
+                        op.vsegment_layouts.get());
+                    pt_plan.End(plan ? 0 : -1);
                     if (!plan) {
                         op.transfer_summary.RecordFailure(replica_type,
                                                           plan.error);
@@ -3016,8 +3769,13 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     for (const auto& subrequest : plan.requests) {
                         transport_endpoints.push_back(subrequest.endpoint);
                     }
+                    SpDiag::PerfPoint pt_vsegment_submit(
+                        PerfKey::VSEGMENT_WRITE_SUBMIT,
+                        SpDiag::PerfLevel::MODULE);
+                    pt_vsegment_submit.Start();
                     submit_result = transfer_submitter_->submitVSegment(
                         plan, TransferRequest::WRITE);
+                    pt_vsegment_submit.End(submit_result ? 0 : -1);
                 } else if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
                     if (!contiguous_range.has_value()) {
@@ -3052,7 +3810,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 }
 
                 op.pending_transfers.emplace_back(
-                    replica_type, std::move(submit_result.value()),
+                    replica_type, replica.is_vsegment_replica(),
+                    std::move(submit_result.value()),
                     std::move(transport_endpoints));
             }
         }
@@ -3060,9 +3819,17 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         VLOG(1) << "Submitted " << op.pending_transfers.size()
                 << " transfers for key " << op.key;
     }
+    const bool any_error = std::any_of(
+        ops.begin(), ops.end(), [](const PutOperation& op) {
+            return op.transfer_summary.first_error != ErrorCode::OK;
+        });
+    pt_submit_batch.End(any_error ? -1 : 0);
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    SpDiag::PerfPoint pt_wait_batch(PerfKey::PUT_BATCH_WAIT,
+                                   SpDiag::PerfLevel::MODULE);
+    pt_wait_batch.Start();
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -3071,7 +3838,14 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
             auto& pending_transfer = op.pending_transfers[i];
+            SpDiag::PerfPoint pt_vsegment_wait(
+                PerfKey::VSEGMENT_WRITE_WAIT, SpDiag::PerfLevel::MODULE);
+            if (pending_transfer.is_vsegment) pt_vsegment_wait.Start();
             ErrorCode transfer_result = pending_transfer.future.get();
+            if (pending_transfer.is_vsegment) {
+                pt_vsegment_wait.End(transfer_result == ErrorCode::OK ? 0
+                                                                      : -1);
+            }
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
@@ -3096,6 +3870,11 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
     }
+    const bool any_error = std::any_of(
+        ops.begin(), ops.end(), [](const PutOperation& op) {
+            return op.transfer_summary.first_error != ErrorCode::OK;
+        });
+    pt_wait_batch.End(any_error ? -1 : 0);
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
@@ -3244,12 +4023,30 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
     };
 
+    SpDiag::PerfPoint pt_end(PerfKey::PUT_BATCH_PUT_END,
+                             SpDiag::PerfLevel::MODULE);
+    pt_end.Start();
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    const bool end_error = std::any_of(
+        finalize_rpc_errors.begin(), finalize_rpc_errors.end(),
+        [](const auto& error) { return error.has_value(); });
+    pt_end.End(end_error ? -1 : 0);
+
+    const size_t errors_before_revoke = static_cast<size_t>(std::count_if(
+        finalize_rpc_errors.begin(), finalize_rpc_errors.end(),
+        [](const auto& error) { return error.has_value(); }));
+    SpDiag::PerfPoint pt_revoke(PerfKey::PUT_BATCH_PUT_REVOKE,
+                                SpDiag::PerfLevel::MODULE);
+    pt_revoke.Start();
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    const size_t errors_after_revoke = static_cast<size_t>(std::count_if(
+        finalize_rpc_errors.begin(), finalize_rpc_errors.end(),
+        [](const auto& error) { return error.has_value(); }));
+    pt_revoke.End(errors_after_revoke > errors_before_revoke ? -1 : 0);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -3423,6 +4220,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
+    SpDiag::PerfPoint pt_collect(PerfKey::PUT_BATCH_COLLECT_RESULTS,
+                                SpDiag::PerfLevel::MODULE);
+    pt_collect.Start();
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
 
@@ -3477,6 +4277,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                   << " (client writes are flowing again)";
     }
 
+    pt_collect.End(failed_count == 0 ? 0 : -1);
     return results;
 }
 
@@ -3533,7 +4334,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             merged_op.failed_endpoints.insert(seg);
         } else {
             merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()),
+                ReplicaType::MEMORY, false,
+                std::move(submit_result.value()),
                 std::vector<std::string>{seg});
         }
         if (!all_transfers_submitted) {
@@ -3600,6 +4402,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -3609,6 +4421,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -3625,6 +4438,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
+        if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
         const bool contains_vsegment = std::any_of(
             ops.begin(), ops.end(), [](const PutOperation& op) {
                 return !op.IsResolved() &&
@@ -3653,6 +4467,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             return results;
         }
         auto results = BatchPutWhenPreferSameNode(ops);
+        if (breakdown_log) {
+            transfer_end = std::chrono::steady_clock::now();
+            put_end_end = transfer_end;
+        }
         const bool any_succeeded =
             std::any_of(results.begin(), results.end(),
                         [](const auto& result) { return result.has_value(); });
@@ -3660,6 +4478,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return results;
     }
     StartBatchPut(ops, client_cfg);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -3670,12 +4489,46 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     FinalizeBatchPut(ops);
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
     auto results = CollectResults(ops);
     const bool any_succeeded =
         std::any_of(results.begin(), results.end(),
                     [](const auto& result) { return result.has_value(); });
+    if (breakdown_log) {
+        size_t total_bytes = 0;
+        size_t success_count = 0;
+        for (const auto& slices : batched_slices) {
+            for (const auto& slice : slices) total_bytes += slice.size;
+        }
+        for (const auto& result : results) {
+            if (result.has_value()) ++success_count;
+        }
+        const char* status = success_count == results.size() ? "ok"
+                             : success_count == 0            ? "err"
+                                                             : "partial";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_batch_put_breakdown trace_id=" << trace_id
+                     << " keys=" << keys.size() << " bytes=" << total_bytes
+                     << " prepare_us="
+                     << elapsed_us(breakdown_start, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us="
+                     << elapsed_us(transfer_end, put_end_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, put_end_end)
+                     << " success=" << success_count
+                     << " status=" << status;
+    }
     pt_full.End(any_succeeded ? 0 : -1);
     // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
     // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
@@ -3915,18 +4768,23 @@ tl::expected<void, ErrorCode> Client::warmup(
     return {};
 }
 
-int Client::GetNumaNodeCount() const {
-    if (!transfer_engine_) return 0;
+std::vector<int> Client::GetNumaNodes() const {
+    if (!transfer_engine_) return {};
     auto topo = transfer_engine_->getLocalTopology();
-    if (!topo) return 0;
-    // discoverCpuTopology emits one "cpu:N" entry per NUMA node (regardless of
-    // whether it hosts a NIC), so counting them gives the NUMA node count.
-    int count = 0;
+    if (!topo) return {};
+
+    std::set<int> nodes;
     for (auto& [name, entry] : topo->getMatrix()) {
         (void)entry;
-        if (name.rfind("cpu:", 0) == 0) ++count;
+        if (name.rfind("cpu:", 0) != 0) continue;
+        try {
+            nodes.insert(std::stoi(name.substr(4)));
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Ignore invalid NUMA topology entry '" << name
+                         << "': " << e.what();
+        }
     }
-    return count;
+    return {nodes.begin(), nodes.end()};
 }
 
 tl::expected<void, ErrorCode> Client::MountSegment(
@@ -4713,7 +5571,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -4764,7 +5623,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
             return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         slices = split_into_slices(*staging);
-        if (TransferRead(source, slices) != ErrorCode::OK) {
+        if (TransferRead(source, slices, layouts) != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4772,7 +5631,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, nullptr, layouts) !=
+            ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4829,7 +5689,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     auto result = ExecuteReplicaTransfer(
         key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
         [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+        response.source, response.targets,
+        response.vsegment_layouts.has_value() ? &*response.vsegment_layouts
+                                              : nullptr);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4884,7 +5746,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+        response.source, targets,
+        response.vsegment_layouts.has_value() ? &*response.vsegment_layouts
+                                              : nullptr);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -5039,25 +5903,41 @@ void Client::PutToLocalFile(const std::string& key,
     });
 }
 
-ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code,
-                               std::set<std::string>* failed_endpoints) {
-    // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
-    // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
-    // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
+ErrorCode Client::TransferData(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+    std::set<std::string>* failed_endpoints,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
+    // TransferData 读写共函数：读写分别记入 GET_SINGLE_/PUT_SINGLE_
+    // TRANSFER_* 键，避免流量互相污染。SUBMIT/WAIT 拆分用于区分
+    // RDMA 提交阻塞与传输等待。
     const bool is_read = (op_code == TransferRequest::READ);
-    SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_TRANSFER_FULL,
+    const bool is_vsegment = replica_descriptor.is_vsegment_replica();
+    SpDiag::PerfPoint pt_full(is_read ? PerfKey::GET_SINGLE_TRANSFER_FULL
+                                     : PerfKey::PUT_SINGLE_TRANSFER_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
-    SpDiag::PerfPoint pt_submit(PerfKey::GET_SINGLE_TRANSFER_SUBMIT,
+    SpDiag::PerfPoint pt_submit(is_read ? PerfKey::GET_SINGLE_TRANSFER_SUBMIT
+                                       : PerfKey::PUT_SINGLE_TRANSFER_SUBMIT,
                                 SpDiag::PerfLevel::MODULE);
-    SpDiag::PerfPoint pt_wait(PerfKey::GET_SINGLE_TRANSFER_WAIT,
+    SpDiag::PerfPoint pt_wait(is_read ? PerfKey::GET_SINGLE_TRANSFER_WAIT
+                                     : PerfKey::PUT_SINGLE_TRANSFER_WAIT,
                               SpDiag::PerfLevel::MODULE);
-    if (is_read) pt_full.Start();
+    SpDiag::PerfPoint pt_vsegment_wait(
+        is_read ? PerfKey::VSEGMENT_READ_WAIT : PerfKey::VSEGMENT_WRITE_WAIT,
+        SpDiag::PerfLevel::MODULE);
+    pt_full.Start();
+
+    // NoF per-transfer breakdown is opt-in because emitting it before this
+    // function returns directly inflates caller-observed read latency.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
+    const auto transfer_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        if (is_read) pt_full.End(-1);
+        pt_full.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -5068,7 +5948,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     if (replica_descriptor.is_vsegment_replica()) {
         if (!vsegment_transfer_planner_) {
             LOG(ERROR) << "VSegmentTransferPlanner not initialized";
-            if (is_read) pt_full.End(-1);
+            pt_full.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
         std::vector<vsegment::ClientSlice> client_slices;
@@ -5077,57 +5957,51 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
             client_slices.push_back(
                 {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
         }
-        // 翻译层分解计时：provider/resolver 在本线程内的 RPC 次数与耗时由
-        // thread_local 累加器收集（Plan 前清零、Plan 后读取，见 provider/
-        // resolver 定义处），配 SpDiag 直方图与采样 breakdown 日志。
-        tl_vseg_plan_timing = {};
-        SpDiag::PerfPoint pt_plan(PerfKey::VSEGMENT_READ_PLAN,
-                                  SpDiag::PerfLevel::MODULE);
-        if (is_read) pt_plan.Start();
+        // Hard C 的读路径只依赖响应内联 layout；这里统计 layout 查找/校验、
+        // 条带拆分和 endpoint 映射，不再统计已删除的 view/endpoint RPC。
+        SpDiag::PerfPoint pt_vsegment_plan(
+            is_read ? PerfKey::VSEGMENT_READ_PLAN
+                    : PerfKey::VSEGMENT_WRITE_PLAN,
+            SpDiag::PerfLevel::MODULE);
+        pt_vsegment_plan.Start();
         auto plan = vsegment_transfer_planner_->Plan(
-            replica_descriptor.get_vsegment_descriptor(), client_slices);
-        if (is_read) {
-            pt_plan.End(plan ? 0 : -1);
-            if (mooncake::logging::ShouldSampleHiFreqLog()) {
-                MC_LOG(INFO)
-                    << "vsegment_read_breakdown view_loads="
-                    << tl_vseg_plan_timing.view_loads << " view_load_us="
-                    << tl_vseg_plan_timing.view_load_ns / 1000
-                    << " endpoint_rpcs=" << tl_vseg_plan_timing.endpoint_rpcs
-                    << " endpoint_resolve_us="
-                    << tl_vseg_plan_timing.endpoint_resolve_ns / 1000
-                    << " subrequests="
-                    << (plan ? plan.requests.size() : 0);
-            }
-        }
+            replica_descriptor.get_vsegment_descriptor(), client_slices,
+            layouts);
+        pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
-            if (is_read) pt_full.End(-1);
+            pt_full.End(-1);
             return plan.error;
         }
         for (const auto& subrequest : plan.requests) {
             vsegment_plan_endpoints.push_back(subrequest.endpoint);
         }
-        if (is_read) pt_submit.Start();
+        SpDiag::PerfPoint pt_vsegment_submit(
+            is_read ? PerfKey::VSEGMENT_READ_SUBMIT
+                    : PerfKey::VSEGMENT_WRITE_SUBMIT,
+            SpDiag::PerfLevel::MODULE);
+        pt_submit.Start();
+        pt_vsegment_submit.Start();
         future = transfer_submitter_->submitVSegment(plan, op_code);
-        if (is_read) pt_submit.End(future ? 0 : -1);
+        pt_vsegment_submit.End(future ? 0 : -1);
+        pt_submit.End(future ? 0 : -1);
     } else if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
-            if (is_read) pt_full.End(-1);
+            pt_full.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
-        if (is_read) pt_submit.Start();
+        pt_submit.Start();
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
                                              contiguous_range->size);
-        if (is_read) pt_submit.End(future ? 0 : -1);
+        pt_submit.End(future ? 0 : -1);
     } else {
-        if (is_read) pt_submit.Start();
+        pt_submit.Start();
         future =
             transfer_submitter_->submit(replica_descriptor, slices, op_code);
-        if (is_read) pt_submit.End(future ? 0 : -1);
+        pt_submit.End(future ? 0 : -1);
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
@@ -5136,30 +6010,60 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                 failed_endpoints->insert(endpoint);
             }
         }
-        if (is_read) pt_full.End(-1);
+        pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    const TransferStrategy strategy = future->strategy();
+    VLOG(1) << "Using transfer strategy: " << strategy;
 
-    if (is_read) pt_wait.Start();
+    pt_wait.Start();
+    if (is_vsegment) pt_vsegment_wait.Start();
     const ErrorCode transfer_result = future->get();
     if (transfer_result != ErrorCode::OK && failed_endpoints) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
             failed_endpoints->insert(endpoint);
         }
     }
-    if (is_read) {
-        const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
-        pt_wait.End(pt_status);
-        pt_full.End(pt_status);
+    const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+    if (is_vsegment) pt_vsegment_wait.End(pt_status);
+    pt_wait.End(pt_status);
+    pt_full.End(pt_status);
+    if (breakdown_log) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        size_t bytes = 0;
+        for (const auto& slice : slices) bytes += slice.size;
+        const char* replica_kind = replica_descriptor.is_memory_replica()
+                                       ? "memory"
+                                   : replica_descriptor.is_nof_replica()
+                                       ? "nof"
+                                       : "other";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "transfer_data_breakdown trace_id=" << trace_id
+                     << " op="
+                     << (op_code == TransferRequest::WRITE ? "write" : "read")
+                     << " replica=" << replica_kind << " strategy=" << strategy
+                     << " slices=" << slices.size() << " bytes=" << bytes
+                     << " submit_us=" << elapsed_us(transfer_start, submit_end)
+                     << " wait_us=" << elapsed_us(submit_end, wait_end)
+                     << " total_us=" << elapsed_us(transfer_start, wait_end)
+                     << " status=" << static_cast<int>(transfer_result);
     }
+
     return transfer_result;
 }
 
 ErrorCode Client::TransferReadInternal(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
@@ -5185,11 +6089,26 @@ ErrorCode Client::TransferReadInternal(
             return ErrorCode::INVALID_PARAMS;
         replica.logical_offset += src_offset;
         replica.length = length;
-        auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
+        SpDiag::PerfPoint pt_vsegment_plan(
+            PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_plan.Start();
+        auto plan =
+            vsegment_transfer_planner_->Plan(replica, client_slices, layouts);
+        pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) return plan.error;
+        SpDiag::PerfPoint pt_vsegment_submit(
+            PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_submit.Start();
         auto future = transfer_submitter_->submitVSegment(
             plan, TransferRequest::READ);
-        return future ? future->get() : ErrorCode::TRANSFER_FAIL;
+        pt_vsegment_submit.End(future ? 0 : -1);
+        if (!future) return ErrorCode::TRANSFER_FAIL;
+        SpDiag::PerfPoint pt_vsegment_wait(
+            PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
+        pt_vsegment_wait.Start();
+        const ErrorCode result = future->get();
+        pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
+        return result;
     }
 
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
@@ -5204,15 +6123,18 @@ ErrorCode Client::TransferReadInternal(
     return future->get();
 }
 
-ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                std::set<std::string>* failed_endpoints) {
+ErrorCode Client::TransferWrite(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices, std::set<std::string>* failed_endpoints,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
-                        failed_endpoints);
+                        failed_endpoints, layouts);
 }
 
-ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+ErrorCode Client::TransferRead(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     // 读传输整窗（size 校验 + TransferData 读分支）；内部 GET_SINGLE_
     // TRANSFER_FULL 为其子窗，差值即校验开销
     SpDiag::PerfPoint pt_read(PerfKey::GET_SINGLE_TRANSFER_READ,
@@ -5243,16 +6165,17 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const ErrorCode read_result =
-        TransferData(replica_descriptor, slices, TransferRequest::READ);
+    const ErrorCode read_result = TransferData(
+        replica_descriptor, slices, TransferRequest::READ, nullptr, layouts);
     pt_read.End(read_result == ErrorCode::OK ? 0 : -1);
     return read_result;
 }
 
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
-    return TransferReadInternal(replica_descriptor, slices, src_offset);
+    uint64_t src_offset, const std::vector<VSegmentLayoutEntry>* layouts) {
+    return TransferReadInternal(replica_descriptor, slices, src_offset,
+                                layouts);
 }
 
 void Client::PollAndDispatchTasks() {

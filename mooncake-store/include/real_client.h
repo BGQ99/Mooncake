@@ -116,6 +116,13 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+    // Install before concurrent I/O. No metadata lookup is added by this hook.
+    bool set_read_replica_validator(Client::ReadReplicaValidator validator) {
+        if (!client_) return false;
+        client_->SetReadReplicaValidator(std::move(validator));
+        return true;
+    }
+
     struct WritableBufferRegion {
         void *base{nullptr};
         size_t size{0};
@@ -524,7 +531,8 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         size_t offload_rpc_thread_num = 8,
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        const std::string &ub_numa_nodes = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -565,6 +573,9 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
+
+    bool can_read_ub_device_memory_direct(const Replica::Descriptor &replica,
+                                         void *dst, size_t size) const;
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,

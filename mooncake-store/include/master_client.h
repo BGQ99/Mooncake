@@ -162,7 +162,7 @@ class MasterClient {
     /**
      * @brief Connects to the master service
      * @param master_addr Master service address (IP:Port)
-     * @return ErrorCode indicating success/failure
+     * @return Per-key PutStartResult values or error codes
      */
     [[nodiscard]] ErrorCode Connect(
         const std::string& master_addr = kDefaultMasterAddress);
@@ -258,11 +258,6 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
-    [[nodiscard]] tl::expected<vsegment::VSegmentView, ErrorCode>
-    GetVSegmentView(const std::string& partition_id,
-                    const std::string& vsegment_id);
-    [[nodiscard]] tl::expected<vsegment::PSegmentLocation, ErrorCode>
-    GetPSegmentEndpoint(const std::string& segment_id);
     [[nodiscard]] vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -318,8 +313,7 @@ class MasterClient {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config);
@@ -373,8 +367,7 @@ class MasterClient {
         const std::string& key, const std::vector<size_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    [[nodiscard]] std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchUpsertStart(const std::vector<std::string>& keys,
                      const std::vector<std::vector<uint64_t>>& slice_lengths,
                      const ReplicateConfig& config);
@@ -1019,7 +1012,7 @@ class MasterClient {
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> InvokeRoutedWithSlotRetry(
         RoutedCallTiming* timing, const std::string& tenant_id,
-        const std::string& key, Args... args);
+        const std::string& key, uint32_t rpc_stat_key, Args... args);
 
     /**
      * @brief Batch 路由自愈（与 InvokeRoutedWithSlotRetry 的单 key 版互补）。
