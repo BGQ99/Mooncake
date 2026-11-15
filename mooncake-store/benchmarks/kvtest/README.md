@@ -72,13 +72,16 @@ Buffer lifecycle. Use `upsertFrom` for the zero-copy writer path.
 - `POST /notify`: enqueue `{keys, sender, size}` for `notify_pipeline`.
 - `GET /stats`: cumulative JSON counters.
 - `GET /health`: liveness response.
+- `POST /start`: reset metrics and release a `start_paused=true` workload;
+  repeated calls are idempotent.
 - `POST /summary`: write `summary.json` immediately.
 - `POST /stop`: stop accepting pipeline work and begin graceful shutdown.
 
 The output directory contains `latency_timeseries.csv` and `summary.json`.
 Interface latency surrounds only the corresponding Mooncake SDK call. Data
 verification is performed after the timed call. `notify_queue_wait` is reported
-separately.
+separately. Summary JSON includes `elapsed_seconds` measured from the last
+metric reset; orchestrators should use this value for QPS and throughput.
 
 ## Configuration
 

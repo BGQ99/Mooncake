@@ -139,6 +139,8 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
                 .asUInt64());
         cfg.enable_jitter =
             root.get("enable_jitter", cfg.enable_jitter).asBool();
+        cfg.start_paused =
+            root.get("start_paused", cfg.start_paused).asBool();
         cfg.metrics_interval_ms =
             root.get("metrics_interval_ms", cfg.metrics_interval_ms).asInt();
         cfg.output_dir = root.get("output_dir", cfg.output_dir).asString();

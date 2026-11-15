@@ -42,6 +42,7 @@ struct Config {
     uint64_t key_pool_size{0};
     size_t notify_queue_max{65536};
     bool enable_jitter{true};
+    bool start_paused{false};
     std::vector<uint64_t> data_sizes{1024 * 1024};
     int metrics_interval_ms{3000};
     std::string output_dir{"mooncake_kvtest_output"};

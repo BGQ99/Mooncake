@@ -27,6 +27,8 @@ class MetricsCollector {
     ~MetricsCollector();
 
     void Start();
+    void Reset();
+    void Freeze();
     void Stop();
     void Record(const std::string &operation, double latency_ms, bool success,
                 uint64_t bytes);
@@ -34,6 +36,7 @@ class MetricsCollector {
     std::vector<MetricSnapshot> SnapshotCounts() const;
     std::string StatsJson() const;
     void WriteSummary();
+    double ElapsedSeconds() const;
 
    private:
     struct OperationMetrics {
@@ -61,8 +64,10 @@ class MetricsCollector {
     std::map<std::string, std::shared_ptr<OperationMetrics>> operations_;
     std::atomic<uint64_t> verify_failures_{0};
     std::atomic<bool> running_{false};
+    std::atomic<bool> recording_{false};
     std::thread flush_thread_;
-    std::chrono::steady_clock::time_point start_time_;
+    std::atomic<int64_t> start_time_us_{0};
+    std::atomic<int64_t> end_time_us_{0};
     static constexpr size_t kGlobalLatencyCapacity = 100000;
 };
 

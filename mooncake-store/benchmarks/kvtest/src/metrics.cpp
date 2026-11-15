@@ -15,6 +15,12 @@
 namespace mooncake::kvtest {
 namespace {
 
+int64_t SteadyNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 double Percentile(const std::vector<double> &sorted, double percentile) {
     if (sorted.empty()) return 0;
     const double rank = percentile * static_cast<double>(sorted.size() - 1);
@@ -69,13 +75,59 @@ void MetricsCollector::Start() {
         output << "elapsed_ms,instance_id,operation,count,success,failure,bytes,"
                   "avg_ms,p50_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms\n";
     }
-    start_time_ = std::chrono::steady_clock::now();
+    start_time_us_.store(SteadyNowUs(), std::memory_order_release);
+    end_time_us_.store(0, std::memory_order_release);
+    recording_.store(true, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     flush_thread_ = std::thread([this] { FlushLoop(); });
 }
 
+void MetricsCollector::Reset() {
+    std::lock_guard<std::mutex> operations_lock(operations_mutex_);
+    for (const auto &[name, metric] : operations_) {
+        (void)name;
+        std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
+        metric->total.store(0, std::memory_order_relaxed);
+        metric->success.store(0, std::memory_order_relaxed);
+        metric->failure.store(0, std::memory_order_relaxed);
+        metric->bytes.store(0, std::memory_order_relaxed);
+        metric->window_latencies.clear();
+        metric->all_latencies.clear();
+        metric->ring_cursor = 0;
+        metric->flushed_success = 0;
+        metric->flushed_failure = 0;
+        metric->flushed_bytes = 0;
+    }
+    verify_failures_.store(0, std::memory_order_relaxed);
+    start_time_us_.store(SteadyNowUs(), std::memory_order_release);
+    end_time_us_.store(0, std::memory_order_release);
+    recording_.store(true, std::memory_order_release);
+}
+
+void MetricsCollector::Freeze() {
+    if (!recording_.exchange(false, std::memory_order_acq_rel)) return;
+    // Wait for records that passed the pre-lock recording check so the frozen
+    // elapsed time and counters describe the same completed interval.
+    std::lock_guard<std::mutex> operations_lock(operations_mutex_);
+    for (const auto &[name, metric] : operations_) {
+        (void)name;
+        std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
+    }
+    end_time_us_.store(SteadyNowUs(), std::memory_order_release);
+}
+
+double MetricsCollector::ElapsedSeconds() const {
+    const int64_t start = start_time_us_.load(std::memory_order_acquire);
+    const int64_t end = end_time_us_.load(std::memory_order_acquire);
+    const int64_t now = end == 0 ? SteadyNowUs() : end;
+    return start == 0
+               ? 0.0
+               : std::max<int64_t>(0, now - start) / 1000000.0;
+}
+
 void MetricsCollector::Stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    Freeze();
     if (flush_thread_.joinable()) flush_thread_.join();
     FlushWindow();
     WriteSummary();
@@ -99,8 +151,10 @@ MetricsCollector::GetOrCreate(const std::string &operation) {
 
 void MetricsCollector::Record(const std::string &operation, double latency_ms,
                               bool success, uint64_t bytes) {
+    if (!recording_.load(std::memory_order_acquire)) return;
     auto metric = GetOrCreate(operation);
     std::lock_guard<std::mutex> lock(metric->latency_mutex);
+    if (!recording_.load(std::memory_order_acquire)) return;
     metric->total.fetch_add(1, std::memory_order_relaxed);
     (success ? metric->success : metric->failure)
         .fetch_add(1, std::memory_order_relaxed);
@@ -116,6 +170,7 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
 }
 
 void MetricsCollector::RecordVerifyFailure() {
+    if (!recording_.load(std::memory_order_acquire)) return;
     verify_failures_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -174,9 +229,7 @@ void MetricsCollector::FlushWindow() {
         std::lock_guard<std::mutex> lock(operations_mutex_);
         for (const auto &entry : operations_) ops.push_back(entry);
     }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start_time_)
-                             .count();
+    const auto elapsed = static_cast<int64_t>(ElapsedSeconds() * 1000.0);
     std::ofstream output(std::filesystem::path(output_dir_) /
                              "latency_timeseries.csv",
                          std::ios::app);
@@ -219,6 +272,7 @@ void MetricsCollector::FlushWindow() {
 void MetricsCollector::WriteSummary() {
     Json::Value root(Json::objectValue);
     root["instance_id"] = instance_id_;
+    root["elapsed_seconds"] = ElapsedSeconds();
     root["verify_failures"] = static_cast<Json::UInt64>(
         verify_failures_.load(std::memory_order_relaxed));
     Json::Value operations(Json::objectValue);

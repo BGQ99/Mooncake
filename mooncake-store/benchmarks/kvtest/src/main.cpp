@@ -380,7 +380,8 @@ class Writer {
           metrics_(metrics),
           notify_pool_(config.notify_threads, config.notify_queue_max) {}
 
-    bool Start(std::string *error) {
+    bool Prepare(std::string *error) {
+        if (!buffers_.empty()) return true;
         const uint64_t max_size =
             *std::max_element(config_.data_sizes.begin(), config_.data_sizes.end());
         buffers_.reserve(config_.num_threads);
@@ -393,6 +394,15 @@ class Writer {
                 return false;
             }
             buffers_.push_back(std::move(buffer));
+        }
+        return true;
+    }
+
+    bool Start(std::string *error) {
+        if (running_.load(std::memory_order_acquire)) return true;
+        if (buffers_.size() != static_cast<size_t>(config_.num_threads)) {
+            *error = "writer buffers are not prepared";
+            return false;
         }
         running_.store(true, std::memory_order_release);
         for (int i = 0; i < config_.num_threads; ++i) {
@@ -577,7 +587,17 @@ int main(int argc, char **argv) {
     std::unique_ptr<Writer> writer;
     if (config.role == "writer" || config.role == "dual") {
         writer = std::make_unique<Writer>(config, client, executor, metrics);
+        if (!writer->Prepare(&error)) {
+            LOG(ERROR) << error;
+            metrics.Stop();
+            client->tearDownAll();
+            google::ShutdownGoogleLogging();
+            return 1;
+        }
     }
+
+    std::mutex workload_mutex;
+    bool workload_started = false;
 
     HttpServer server(
         config.listen_port, 4,
@@ -594,11 +614,27 @@ int main(int argc, char **argv) {
             if (method == "GET" && path == "/health") {
                 return {200, "text/plain", "ok"};
             }
+            if (method == "POST" && path == "/start") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!running.load(std::memory_order_acquire))
+                    return {409, "text/plain", "stopping"};
+                if (workload_started)
+                    return {200, "text/plain", "already started"};
+                metrics.Reset();
+                std::string start_error;
+                if (writer && !writer->Start(&start_error)) {
+                    return {500, "text/plain", start_error};
+                }
+                workload_started = true;
+                return {200, "text/plain", "started"};
+            }
             if (method == "POST" && path == "/summary") {
                 metrics.WriteSummary();
                 return {200, "text/plain", "ok"};
             }
             if (method == "POST" && path == "/stop") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                metrics.Freeze();
                 running.store(false, std::memory_order_release);
                 dispatcher.StopNow();
                 if (writer) writer->RequestStop();
@@ -612,18 +648,24 @@ int main(int argc, char **argv) {
         exit_code = 1;
         running.store(false, std::memory_order_release);
     }
-    if (running.load(std::memory_order_acquire) && writer &&
-        !writer->Start(&error)) {
-        LOG(ERROR) << error;
-        exit_code = 1;
-        running.store(false, std::memory_order_release);
+    if (running.load(std::memory_order_acquire) && !config.start_paused) {
+        std::lock_guard<std::mutex> lock(workload_mutex);
+        metrics.Reset();
+        if (writer && !writer->Start(&error)) {
+            LOG(ERROR) << error;
+            exit_code = 1;
+            running.store(false, std::memory_order_release);
+        } else {
+            workload_started = true;
+        }
     }
 
     LOG(INFO) << "mooncake_kvtest started role=" << config.role
               << " instance=" << config.instance_id
               << " write_threads=" << config.num_threads
               << " read_threads=" << config.NumReadThreads()
-              << " listen_port=" << config.listen_port;
+              << " listen_port=" << config.listen_port
+              << " start_paused=" << config.start_paused;
 
     std::vector<MetricSnapshot> previous;
     auto last_report = std::chrono::steady_clock::now();
@@ -656,6 +698,7 @@ int main(int argc, char **argv) {
                   << (writer ? writer->NotifyDroppedCount() : 0) << ']';
     }
 
+    metrics.Freeze();
     if (writer) writer->RequestStop();
     dispatcher.StopNow();
     server.Stop();
