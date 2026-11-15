@@ -14,6 +14,7 @@
 #include <istream>
 #include <ostream>
 #include <sstream>
+#include <thread>
 
 namespace mooncake::kvtest {
 namespace {
@@ -69,6 +70,12 @@ bool HttpServer::Start(std::string *error) {
         acceptor_->bind(
             asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port_));
         acceptor_->listen();
+        // AcceptLoop used to block in a synchronous accept().  On Linux,
+        // cancel()/close() from Stop() did not reliably wake that call, so
+        // shutdown could hang in accept_thread_.join() until another client
+        // happened to connect.  A non-blocking accept loop gives Stop() a
+        // bounded (10 ms) join latency without requiring a second /stop.
+        acceptor_->non_blocking(true);
         running_.store(true, std::memory_order_release);
         accept_thread_ = std::thread([this] { AcceptLoop(); });
         return true;
@@ -97,6 +104,20 @@ void HttpServer::AcceptLoop() {
         acceptor_->accept(*socket, ec);
         if (ec) {
             if (!running_.load(std::memory_order_acquire)) return;
+            if (ec == asio::error::would_block || ec == asio::error::try_again) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            continue;
+        }
+        // Stop may race with a successful accept.  Do not enqueue one last
+        // request after shutdown has begun.
+        if (!running_.load(std::memory_order_acquire)) {
+            socket->close(ec);
+            return;
+        }
+        socket->non_blocking(false, ec);
+        if (ec) {
+            socket->close(ec);
             continue;
         }
         socket->set_option(asio::ip::tcp::no_delay(true), ec);

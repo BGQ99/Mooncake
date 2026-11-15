@@ -698,13 +698,19 @@ int main(int argc, char **argv) {
                   << (writer ? writer->NotifyDroppedCount() : 0) << ']';
     }
 
+    LOG(INFO) << "mooncake_kvtest shutdown: draining workload";
     metrics.Freeze();
     if (writer) writer->RequestStop();
     dispatcher.StopNow();
-    server.Stop();
     if (writer) writer->Stop();
     dispatcher.Stop();
+    // Persist the final artifacts before stopping the HTTP listener.  Even if
+    // listener teardown regresses, the harness can still recover a complete
+    // summary instead of reporting a misleading pre-summary crash.
     metrics.Stop();
+    LOG(INFO) << "mooncake_kvtest shutdown: metrics persisted";
+    server.Stop();
+    LOG(INFO) << "mooncake_kvtest shutdown: HTTP server stopped";
     client->tearDownAll();
     g_running = nullptr;
     LOG(INFO) << "mooncake_kvtest stopped";
