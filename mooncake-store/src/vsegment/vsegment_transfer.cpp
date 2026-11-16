@@ -76,8 +76,11 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         return plan;
     }
 
+    // Plan already validated this exact view above (and owns the
+    // CHECKSUM_MISMATCH contract), so skip the duplicate validation.
     auto resolved = ResolveTransfer(view, replica.logical_offset,
-                                    replica.length, slices);
+                                    replica.length, slices,
+                                    /*prevalidated=*/true);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
 
     // Resolve each distinct psegment only once per Plan: the sub-request count

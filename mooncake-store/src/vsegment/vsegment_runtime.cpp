@@ -331,11 +331,14 @@ ErrorCode LogicalRangeAllocator::ForgetCompleted(
 
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
-                              const std::vector<ClientSlice>& slices) {
-    std::string validation_detail;
-    const auto validation = ValidateViewStructure(view, &validation_detail);
-    if (validation != ErrorCode::OK) {
-        return ResolveError(validation, std::move(validation_detail));
+                              const std::vector<ClientSlice>& slices,
+                              bool prevalidated) {
+    if (!prevalidated) {
+        std::string validation_detail;
+        const auto validation = ValidateViewStructure(view, &validation_detail);
+        if (validation != ErrorCode::OK) {
+            return ResolveError(validation, std::move(validation_detail));
+        }
     }
     if (length == 0 ||
         AddOverflows(logical_offset, length) ||
