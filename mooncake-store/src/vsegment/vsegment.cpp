@@ -11,6 +11,8 @@
 
 #if defined(__aarch64__) && defined(__GNUC__)
 #include <arm_acle.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
 #define MOONCAKE_VSEGMENT_ARM_CRC 1
 #endif
 
@@ -31,7 +33,13 @@ ErrorCode Invalid(std::string message, std::string* detail) {
 #ifdef MOONCAKE_VSEGMENT_ARM_CRC
 // CRC-32C via the ARMv8 CRC32C instructions. Same polynomial, same bit order and
 // same init/final XOR as mooncake::Crc32c, so the produced value is identical;
-// the instructions only make it faster.
+// the instructions only make it faster. The instruction is optional on ARMv8.0,
+// so it is only used when the CPU advertises it.
+bool ArmCrc32Available() {
+    static const bool available = (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+    return available;
+}
+
 __attribute__((target("arch=armv8-a+crc"))) uint32_t Crc32cArmUpdate(
     uint32_t crc, const uint8_t* data, size_t len) {
     while (len >= 8) {
@@ -57,10 +65,12 @@ class ViewChecksumStream {
    public:
     void Extend(const void* data, size_t len) {
 #ifdef MOONCAKE_VSEGMENT_ARM_CRC
-        state_ = Crc32cArmUpdate(state_, static_cast<const uint8_t*>(data), len);
-#else
-        table_.Extend(data, len);
+        if (use_hw_) {
+            state_ = Crc32cArmUpdate(state_, static_cast<const uint8_t*>(data), len);
+            return;
+        }
 #endif
+        table_.Extend(data, len);
     }
 
     void ExtendUint64(uint64_t value) {
@@ -78,17 +88,16 @@ class ViewChecksumStream {
 
     uint32_t Final() const {
 #ifdef MOONCAKE_VSEGMENT_ARM_CRC
-        return state_ ^ 0xFFFFFFFFu;
-#else
-        return table_.Final();
+        if (use_hw_) return state_ ^ 0xFFFFFFFFu;
 #endif
+        return table_.Final();
     }
 
    private:
-#ifdef MOONCAKE_VSEGMENT_ARM_CRC
-    uint32_t state_{0xFFFFFFFFu};
-#else
     mooncake::Crc32c table_;
+#ifdef MOONCAKE_VSEGMENT_ARM_CRC
+    bool use_hw_{ArmCrc32Available()};
+    uint32_t state_{0xFFFFFFFFu};
 #endif
 };
 
