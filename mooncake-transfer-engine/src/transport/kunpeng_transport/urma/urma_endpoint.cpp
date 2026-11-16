@@ -681,13 +681,9 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        static auto bondingModeSetEnabled = []() -> bool {
-            const char* env = std::getenv("MC_URMA_SET_BONDING_MODE");
-            return env && (std::string(env) == "1" || std::string(env) == "true" ||
-                           std::string(env) == "on");
-        };
-
-        if (bondingModeSetEnabled()) {
+        // Bonding opcodes are provider-specific: opcode 7 deletes a jetty on
+        // bare UDMA devices. Match the bonding-device guard used by YLT.
+        if (strncmp(devices[i]->name, "bonding", 7) == 0) {
             bondp_set_bonding_mode_in_t mode{
                 .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
                                            : BONDP_BONDING_MODE_STANDALONE,
@@ -712,13 +708,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         } else {
-            LOG(WARNING) << "Skipping urma_user_ctl SET_BONDING_MODE on " << device_name
-                         << " (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)";
-            if (multipath()) {
-                LOG(WARNING) << "Multipath requires a compatible bonding mode "
-                                "configured externally, or a fixed UMDK with "
-                                "MC_URMA_SET_BONDING_MODE=1";
-            }
+            LOG(INFO) << "skip bonding mode config on non-bonding device: "
+                      << devices[i]->name;
         }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
