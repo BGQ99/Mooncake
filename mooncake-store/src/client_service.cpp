@@ -4669,8 +4669,8 @@ tl::expected<void, ErrorCode> Client::warmup(
 
     // Allocate a buffer from the client's buffer allocator.  The allocator's
     // underlying memory is already registered with the transfer engine during
-    // setup_internal, so it can be used directly as the source (WRITE) and
-    // destination (READ) for warmup transfers.  BufferHandle is RAII: it
+    // setup_internal, so it can be used directly as the local destination
+    // for READ warmup transfers.  BufferHandle is RAII: it
     // deallocates the buffer back to the allocator on destruction, so no
     // explicit register/unregister is needed here.
     constexpr size_t kWarmupBufSize = 4096;
@@ -4708,7 +4708,7 @@ tl::expected<void, ErrorCode> Client::warmup(
         auto target_segment = target_meta_data->getSegmentDescByID(target_id);
         Transport::TransferRequest request;
         request.opcode = op;
-        request.source = buf_handle->ptr();  // registered buffer carries r/w data
+        request.source = buf_handle->ptr();  // local destination for READ
         request.target_id = target_id;
         request.target_offset = target_segment->buffers[0].addr;
         request.length = kWarmupBufSize;
@@ -4748,18 +4748,18 @@ tl::expected<void, ErrorCode> Client::warmup(
                          << segment_name << "'";
             continue;
         }
-        // Skip the local segment — no point self-connecting, and a WRITE
-        // would corrupt our own buffer.
+        // Skip the local segment — no remote connection to self is needed.
         if (target_id == LOCAL_SEGMENT_ID) {
             continue;
         }
 
-        // Issue a 1-byte WRITE then a 1-byte READ using the registered
-        // buffer to exercise both directions of the connection.
-        bool ok = submit_and_wait(Transport::TransferRequest::WRITE,
+        // READ-only probe. Exercising the read direction is sufficient to
+        // trigger the connection handshake (e.g. RDMA QP setup). A WRITE must
+        // NOT be issued here: target_offset is the remote segment's registered
+        // buffer base address, so writing would corrupt data owned by other
+        // clients.
+        bool ok = submit_and_wait(Transport::TransferRequest::READ,
                                   target_id, segment_name);
-        ok = submit_and_wait(Transport::TransferRequest::READ,
-                             target_id, segment_name) && ok;
         if (ok) ++success_count;
     }
 

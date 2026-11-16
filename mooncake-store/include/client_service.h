@@ -745,9 +745,11 @@ class Client {
      * currently registered with the master.
      *
      * Allocates a buffer via the given ClientBufferAllocator (whose base is
-     * already registered with the transfer engine) and issues a 1-byte WRITE
-     * then READ per segment to trigger eager connection setup (e.g. RDMA QP
-     * handshakes). This amortises the first-transfer handshake latency and
+     * already registered with the transfer engine) and issues a READ per
+     * remote segment to trigger eager connection setup (e.g. RDMA QP
+     * handshakes). Only READ is used: a WRITE would overwrite existing data
+     * at the remote segment's registered buffer base address.
+     * This amortises the first-transfer handshake latency and
      * mitigates TRANSFER_FAIL caused by handshake storms under
      * high-concurrency small-file workloads.
      *
