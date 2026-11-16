@@ -339,6 +339,10 @@ ResolveResult ResolveTransfer(const VSegmentView& view,
         if (validation != ErrorCode::OK) {
             return ResolveError(validation, std::move(validation_detail));
         }
+    } else if (view.stripe_size == 0 || view.members.empty()) {
+        // Cheap invariants the loop below divides/modulos by: callers that skip
+        // the full validation must still never divide by zero.
+        return ResolveError(ErrorCode::INVALID_PARAMS, "view layout is empty");
     }
     if (length == 0 ||
         AddOverflows(logical_offset, length) ||

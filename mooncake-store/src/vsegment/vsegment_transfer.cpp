@@ -76,8 +76,9 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         return plan;
     }
 
-    // Plan already validated this exact view above (and owns the
-    // CHECKSUM_MISMATCH contract), so skip the duplicate validation.
+    // Plan already validated this exact view above; it maps any invalid-view
+    // result to CHECKSUM_MISMATCH, so skipping the duplicate check keeps the
+    // observable error contract.
     auto resolved = ResolveTransfer(view, replica.logical_offset,
                                     replica.length, slices,
                                     /*prevalidated=*/true);
