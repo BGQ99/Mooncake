@@ -12,6 +12,8 @@
 #include "master_service.h"
 #include "rpc_types.h"
 
+#include "crc32c.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -23,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <thread>
 
@@ -112,6 +115,64 @@ TEST(VSegmentChecksumTest, FixedViewKeepsHistoricalValue) {
         view.members.push_back(member);
     }
     EXPECT_EQ(ComputeViewChecksum(view), 0xa635ec3cu);
+}
+
+namespace {
+
+// Independent re-implementation of the documented wire layout. On aarch64 the
+// production path feeds the same bytes through the ARM CRC32C instructions while
+// this reference uses the table-driven Crc32c, so the test cross-checks the two
+// implementations instead of only pinning one historical value.
+void RefAppendU64(std::string& out, uint64_t value) {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xff));
+    }
+}
+
+void RefAppendString(std::string& out, const std::string& value) {
+    RefAppendU64(out, value.size());
+    out.append(value);
+}
+
+std::string RefSerializeView(const VSegmentView& view) {
+    std::string out;
+    RefAppendString(out, view.vsegment_id);
+    RefAppendString(out, view.partition_id);
+    RefAppendU64(out, static_cast<uint8_t>(view.mapping_algorithm));
+    RefAppendU64(out, view.stripe_size);
+    RefAppendU64(out, view.logical_capacity);
+    RefAppendU64(out, view.members.size());
+    for (const auto& member : view.members) {
+        RefAppendString(out, member.segment_id);
+        RefAppendU64(out, member.base_offset);
+        RefAppendU64(out, member.length);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(VSegmentChecksumTest, MatchesReferenceSerialization) {
+    std::mt19937_64 rng(20261116);
+    for (int iter = 0; iter < 200; ++iter) {
+        VSegmentView view;
+        view.vsegment_id = "vs-" + std::to_string(rng() % 100000);
+        view.partition_id = "part-" + std::to_string(rng() % 1000);
+        view.mapping_algorithm = MappingAlgorithm::ROUND_ROBIN;
+        view.stripe_size = (rng() % 64 + 1) * 1024 * 1024;
+        view.logical_capacity = (rng() % 1024 + 1) * 1024 * 1024;
+        const size_t member_count = 1 + rng() % 8;
+        for (size_t i = 0; i < member_count; ++i) {
+            PSegmentExtent member;
+            member.segment_id = "ps-" + std::to_string(rng() % 10000) + "-" + std::to_string(i);
+            member.base_offset = rng() % (1ull << 32);
+            member.length = (rng() % 1024 + 1) * 1024 * 1024;
+            view.members.push_back(member);
+        }
+        const std::string bytes = RefSerializeView(view);
+        EXPECT_EQ(ComputeViewChecksum(view), Crc32cValue(bytes.data(), bytes.size()))
+            << "iteration=" << iter;
+    }
 }
 TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
     EXPECT_EQ(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),

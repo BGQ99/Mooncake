@@ -45,6 +45,15 @@ __attribute__((target("arch=armv8-a+crc"))) uint32_t Crc32cArmUpdate(
     while (len >= 8) {
         uint64_t chunk;
         std::memcpy(&chunk, data, sizeof(chunk));
+        // The instruction consumes the register as a little-endian byte
+        // sequence, while the checksum covers the bytes in memory order. A
+        // plain native load is therefore only correct on little-endian; on
+        // aarch64_be it would reverse every 8-byte window and change the wire
+        // value, so convert explicitly instead of relying on the host order.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+        chunk = __builtin_bswap64(chunk);
+#endif
         crc = __crc32cd(crc, chunk);
         data += 8;
         len -= 8;
