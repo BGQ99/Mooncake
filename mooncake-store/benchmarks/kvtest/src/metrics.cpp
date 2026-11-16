@@ -59,27 +59,19 @@ std::string JsonString(const Json::Value &value) {
 
 }  // namespace
 
-MetricsCollector::MetricsCollector(int instance_id, int interval_ms,
+MetricsCollector::MetricsCollector(int instance_id, int /*interval_ms*/,
                                    std::string output_dir)
     : instance_id_(instance_id),
-      interval_ms_(interval_ms),
       output_dir_(std::move(output_dir)) {}
 
 MetricsCollector::~MetricsCollector() { Stop(); }
 
 void MetricsCollector::Start() {
     std::filesystem::create_directories(output_dir_);
-    const auto csv = std::filesystem::path(output_dir_) / "latency_timeseries.csv";
-    if (!std::filesystem::exists(csv)) {
-        std::ofstream output(csv);
-        output << "elapsed_ms,instance_id,operation,count,success,failure,bytes,"
-                  "avg_ms,p50_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms\n";
-    }
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
     end_time_us_.store(0, std::memory_order_release);
     recording_.store(true, std::memory_order_release);
     running_.store(true, std::memory_order_release);
-    flush_thread_ = std::thread([this] { FlushLoop(); });
 }
 
 void MetricsCollector::Reset() {
@@ -91,11 +83,7 @@ void MetricsCollector::Reset() {
         metric->success.store(0, std::memory_order_relaxed);
         metric->failure.store(0, std::memory_order_relaxed);
         metric->bytes.store(0, std::memory_order_relaxed);
-        metric->window_latencies.clear();
         metric->samples.clear();
-        metric->flushed_success = 0;
-        metric->flushed_failure = 0;
-        metric->flushed_bytes = 0;
     }
     verify_failures_.store(0, std::memory_order_relaxed);
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
@@ -127,8 +115,6 @@ double MetricsCollector::ElapsedSeconds() const {
 void MetricsCollector::Stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
     Freeze();
-    if (flush_thread_.joinable()) flush_thread_.join();
-    FlushWindow();
     WriteSamples();
     WriteSummary();
 }
@@ -160,7 +146,6 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
     (success ? metric->success : metric->failure)
         .fetch_add(1, std::memory_order_relaxed);
     metric->bytes.fetch_add(bytes, std::memory_order_relaxed);
-    metric->window_latencies.push_back(latency_ms);
     const int64_t start = start_time_us_.load(std::memory_order_acquire);
     metric->samples.push_back({std::max<int64_t>(0, recorded_us - start),
                                latency_ms, success, bytes});
@@ -206,64 +191,6 @@ std::string MetricsCollector::StatsJson() const {
     }
     root["operations"] = std::move(operations);
     return JsonString(root);
-}
-
-void MetricsCollector::FlushLoop() {
-    while (running_.load(std::memory_order_acquire)) {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(interval_ms_);
-        while (running_.load(std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (running_.load(std::memory_order_acquire)) FlushWindow();
-    }
-}
-
-void MetricsCollector::FlushWindow() {
-    std::vector<std::pair<std::string, std::shared_ptr<OperationMetrics>>> ops;
-    {
-        std::lock_guard<std::mutex> lock(operations_mutex_);
-        for (const auto &entry : operations_) ops.push_back(entry);
-    }
-    const auto elapsed = static_cast<int64_t>(ElapsedSeconds() * 1000.0);
-    std::ofstream output(std::filesystem::path(output_dir_) /
-                             "latency_timeseries.csv",
-                         std::ios::app);
-    for (const auto &[name, metric] : ops) {
-        std::vector<double> latencies;
-        uint64_t success = 0;
-        uint64_t failure = 0;
-        uint64_t bytes = 0;
-        {
-            std::lock_guard<std::mutex> lock(metric->latency_mutex);
-            latencies.swap(metric->window_latencies);
-            const uint64_t total_success =
-                metric->success.load(std::memory_order_relaxed);
-            const uint64_t total_failure =
-                metric->failure.load(std::memory_order_relaxed);
-            const uint64_t total_bytes =
-                metric->bytes.load(std::memory_order_relaxed);
-            success = total_success - metric->flushed_success;
-            failure = total_failure - metric->flushed_failure;
-            bytes = total_bytes - metric->flushed_bytes;
-            metric->flushed_success = total_success;
-            metric->flushed_failure = total_failure;
-            metric->flushed_bytes = total_bytes;
-        }
-        if (latencies.empty()) continue;
-        const auto stats = LatencyJson(latencies);
-        output << elapsed << ',' << instance_id_ << ',' << name << ','
-               << latencies.size() << ',' << success << ',' << failure << ','
-               << bytes << ',' << std::fixed << std::setprecision(6)
-               << stats.get("avg_ms", 0).asDouble() << ','
-               << stats.get("p50_ms", 0).asDouble() << ','
-               << stats.get("p90_ms", 0).asDouble() << ','
-               << stats.get("p99_ms", 0).asDouble() << ','
-               << stats.get("p999_ms", 0).asDouble() << ','
-               << stats.get("p9999_ms", 0).asDouble() << ','
-               << stats.get("max_ms", 0).asDouble() << '\n';
-    }
 }
 
 void MetricsCollector::WriteSamples() {
