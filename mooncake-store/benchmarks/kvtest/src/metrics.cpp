@@ -92,8 +92,7 @@ void MetricsCollector::Reset() {
         metric->failure.store(0, std::memory_order_relaxed);
         metric->bytes.store(0, std::memory_order_relaxed);
         metric->window_latencies.clear();
-        metric->all_latencies.clear();
-        metric->ring_cursor = 0;
+        metric->samples.clear();
         metric->flushed_success = 0;
         metric->flushed_failure = 0;
         metric->flushed_bytes = 0;
@@ -130,6 +129,7 @@ void MetricsCollector::Stop() {
     Freeze();
     if (flush_thread_.joinable()) flush_thread_.join();
     FlushWindow();
+    WriteSamples();
     WriteSummary();
 }
 
@@ -152,6 +152,7 @@ MetricsCollector::GetOrCreate(const std::string &operation) {
 void MetricsCollector::Record(const std::string &operation, double latency_ms,
                               bool success, uint64_t bytes) {
     if (!recording_.load(std::memory_order_acquire)) return;
+    const int64_t recorded_us = SteadyNowUs();
     auto metric = GetOrCreate(operation);
     std::lock_guard<std::mutex> lock(metric->latency_mutex);
     if (!recording_.load(std::memory_order_acquire)) return;
@@ -160,13 +161,9 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
         .fetch_add(1, std::memory_order_relaxed);
     metric->bytes.fetch_add(bytes, std::memory_order_relaxed);
     metric->window_latencies.push_back(latency_ms);
-    if (metric->all_latencies.size() < kGlobalLatencyCapacity) {
-        metric->all_latencies.push_back(latency_ms);
-    } else {
-        metric->all_latencies[metric->ring_cursor] = latency_ms;
-        metric->ring_cursor =
-            (metric->ring_cursor + 1) % kGlobalLatencyCapacity;
-    }
+    const int64_t start = start_time_us_.load(std::memory_order_acquire);
+    metric->samples.push_back({std::max<int64_t>(0, recorded_us - start),
+                               latency_ms, success, bytes});
 }
 
 void MetricsCollector::RecordVerifyFailure() {
@@ -269,6 +266,37 @@ void MetricsCollector::FlushWindow() {
     }
 }
 
+void MetricsCollector::WriteSamples() {
+    std::vector<std::pair<std::string, std::shared_ptr<OperationMetrics>>> ops;
+    {
+        std::lock_guard<std::mutex> lock(operations_mutex_);
+        for (const auto &entry : operations_) ops.push_back(entry);
+    }
+    std::ofstream output(std::filesystem::path(output_dir_) /
+                         "latency_samples.csv");
+    output << "elapsed_us,instance_id,operation,request_index,latency_ms,"
+              "status,bytes\n";
+    for (const auto &[name, metric] : ops) {
+        std::vector<RequestSample> samples;
+        {
+            std::lock_guard<std::mutex> lock(metric->latency_mutex);
+            samples = metric->samples;
+        }
+        std::stable_sort(samples.begin(), samples.end(),
+                         [](const auto &a, const auto &b) {
+                             return a.elapsed_us < b.elapsed_us;
+                         });
+        for (size_t i = 0; i < samples.size(); ++i) {
+            const auto &sample = samples[i];
+            output << sample.elapsed_us << ',' << instance_id_ << ',' << name
+                   << ',' << i << ',' << std::fixed << std::setprecision(6)
+                   << sample.latency_ms << ','
+                   << (sample.success ? "OK" : "ERR") << ','
+                   << sample.bytes << '\n';
+        }
+    }
+}
+
 void MetricsCollector::WriteSummary() {
     Json::Value root(Json::objectValue);
     root["instance_id"] = instance_id_;
@@ -281,7 +309,9 @@ void MetricsCollector::WriteSummary() {
         std::vector<double> latencies;
         {
             std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
-            latencies = metric->all_latencies;
+            latencies.reserve(metric->samples.size());
+            for (const auto &sample : metric->samples)
+                latencies.push_back(sample.latency_ms);
         }
         auto op = LatencyJson(std::move(latencies));
         op["total"] = static_cast<Json::UInt64>(

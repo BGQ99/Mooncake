@@ -77,11 +77,14 @@ Buffer lifecycle. Use `upsertFrom` for the zero-copy writer path.
 - `POST /summary`: write `summary.json` immediately.
 - `POST /stop`: stop accepting pipeline work and begin graceful shutdown.
 
-The output directory contains `latency_timeseries.csv` and `summary.json`.
-Interface latency surrounds only the corresponding Mooncake SDK call. Data
-verification is performed after the timed call. `notify_queue_wait` is reported
-separately. Summary JSON includes `elapsed_seconds` measured from the last
-metric reset; orchestrators should use this value for QPS and throughput.
+The output directory contains `latency_samples.csv`, `latency_timeseries.csv`,
+and `summary.json`. `latency_samples.csv` has one row per measured operation;
+samples are retained in memory during the run and written in one batch during
+shutdown, so request-path file I/O does not contaminate latency. Interface
+latency surrounds only the corresponding Mooncake SDK call. Data verification
+is performed after the timed call. `notify_queue_wait` is reported separately.
+Summary JSON includes `elapsed_seconds` measured from the last metric reset;
+orchestrators should use this value for QPS and throughput.
 
 ## Configuration
 
