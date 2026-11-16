@@ -85,7 +85,9 @@ latency surrounds only the corresponding Mooncake SDK call. Data verification
 is performed after the timed call. `notify_queue_wait` is reported separately.
 Summary JSON includes `elapsed_seconds` measured from the last metric reset;
 orchestrators should use this value for QPS and throughput. The legacy
-window-aggregated `latency_timeseries.csv` is no longer produced.
+window-aggregated `latency_timeseries.csv` is no longer produced. Latency
+statistics in `summary.json` use successful requests only and use the same
+nearest-rank percentile rule as the Python benchmark/plotting path.
 
 ## Configuration
 

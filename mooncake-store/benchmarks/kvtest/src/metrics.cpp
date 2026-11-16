@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -23,11 +24,9 @@ int64_t SteadyNowUs() {
 
 double Percentile(const std::vector<double> &sorted, double percentile) {
     if (sorted.empty()) return 0;
-    const double rank = percentile * static_cast<double>(sorted.size() - 1);
-    const size_t lower = static_cast<size_t>(rank);
-    const size_t upper = std::min(lower + 1, sorted.size() - 1);
-    const double fraction = rank - lower;
-    return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+    const auto rank = static_cast<size_t>(std::llround(
+        percentile * static_cast<double>(sorted.size() - 1)));
+    return sorted[rank];
 }
 
 Json::Value LatencyJson(std::vector<double> values) {
@@ -238,7 +237,7 @@ void MetricsCollector::WriteSummary() {
             std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
             latencies.reserve(metric->samples.size());
             for (const auto &sample : metric->samples)
-                latencies.push_back(sample.latency_ms);
+                if (sample.success) latencies.push_back(sample.latency_ms);
         }
         auto op = LatencyJson(std::move(latencies));
         op["total"] = static_cast<Json::UInt64>(
