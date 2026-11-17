@@ -10,6 +10,7 @@ namespace mooncake::kvtest {
 struct NodeConfig {
     std::string host;
     int port{9000};
+    int notify_rpc_port{19000};
     int instance_id{0};
     std::string role;
 };
@@ -30,6 +31,8 @@ struct Config {
     std::string mode{"pipeline"};
     int instance_id{0};
     int listen_port{9000};
+    int notify_rpc_port{19000};
+    int notify_rpc_threads{4};
     std::string role{"writer"};
     std::vector<std::string> pipeline{"upsertFrom"};
     std::vector<std::string> notify_pipeline{"getBuffer"};
@@ -37,6 +40,9 @@ struct Config {
     int num_threads{4};
     int num_total_threads{16};
     int notify_threads{100};
+    size_t notify_rpc_connections_per_peer{4};
+    int notify_rpc_reuse_limit{4};
+    int notify_rpc_timeout_ms{3000};
     int notify_count{1};
     int batch_keys_count{1};
     uint64_t key_pool_size{0};

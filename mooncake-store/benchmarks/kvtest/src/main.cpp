@@ -1,17 +1,13 @@
 #include "config.h"
 #include "http_transport.h"
 #include "metrics.h"
+#include "notify_rpc_transport.h"
 #include "rate_gate.h"
 #include "thread_pool.h"
 
 #include "real_client.h"
 
 #include <glog/logging.h>
-#if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>
-#else
-#include <json/json.h>
-#endif
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -313,19 +309,6 @@ class PipelineExecutor {
     ReplicateConfig replicate_;
 };
 
-std::string EncodeNotify(const RequestContext &context) {
-    Json::Value root(Json::objectValue);
-    root["action"] = "";
-    root["sender"] = context.sender;
-    root["size"] = static_cast<Json::UInt64>(context.size);
-    Json::Value keys(Json::arrayValue);
-    for (const auto &key : context.keys) keys.append(key);
-    root["keys"] = std::move(keys);
-    Json::StreamWriterBuilder builder;
-    builder["indentation"] = "";
-    return Json::writeString(builder, root);
-}
-
 class NotifyDispatcher {
    public:
     NotifyDispatcher(const Config &config, PipelineExecutor &executor,
@@ -335,21 +318,11 @@ class NotifyDispatcher {
           metrics_(metrics),
           pool_(config.NumReadThreads(), config.notify_queue_max) {}
 
-    bool Dispatch(const std::string &body) {
-        Json::CharReaderBuilder reader;
-        Json::Value root;
-        std::string error;
-        std::istringstream input(body);
-        if (!Json::parseFromStream(reader, input, &root, &error)) return false;
+    bool Dispatch(NotifyRpcRequest request) {
         RequestContext context;
-        context.sender = root.get("sender", 0).asInt();
-        context.size = root.get("size", Json::UInt64(0)).asUInt64();
-        if (root.isMember("keys")) {
-            for (const auto &key : root["keys"])
-                context.keys.push_back(key.asString());
-        } else if (root.isMember("key")) {
-            context.keys.push_back(root["key"].asString());
-        }
+        context.sender = request.sender;
+        context.size = request.size;
+        context.keys = std::move(request.keys);
         if (context.keys.empty() || context.size == 0) return false;
         const auto arrival = std::chrono::steady_clock::now();
         return pool_.Submit([this, context = std::move(context), arrival]() mutable {
@@ -360,6 +333,9 @@ class NotifyDispatcher {
 
     size_t QueueSize() const { return pool_.QueueSize(); }
     uint64_t DroppedCount() const { return pool_.DroppedCount(); }
+    bool WaitIdle(std::chrono::milliseconds timeout) {
+        return pool_.WaitIdle(timeout);
+    }
     void StopNow() { pool_.StopNow(); }
     void Stop() { pool_.Stop(); }
 
@@ -378,6 +354,9 @@ class Writer {
           client_(std::move(client)),
           executor_(executor),
           metrics_(metrics),
+          notify_rpc_client_(config.notify_rpc_connections_per_peer,
+                             config.notify_rpc_reuse_limit,
+                             config.notify_rpc_timeout_ms),
           notify_pool_(config.notify_threads, config.notify_queue_max) {}
 
     bool Prepare(std::string *error) {
@@ -385,6 +364,7 @@ class Writer {
         const uint64_t max_size =
             *std::max_element(config_.data_sizes.begin(), config_.data_sizes.end());
         buffers_.reserve(config_.num_threads);
+        sequences_.assign(config_.num_threads, 0);
         for (int i = 0; i < config_.num_threads; ++i) {
             auto buffer = std::make_unique<RegisteredBuffer>(
                 client_, max_size, config_.batch_keys_count);
@@ -413,20 +393,31 @@ class Writer {
 
     void RequestStop() { running_.store(false, std::memory_order_release); }
 
+    bool PauseAndDrain(std::chrono::milliseconds timeout) {
+        RequestStop();
+        JoinWorkers();
+        return notify_pool_.WaitIdle(timeout);
+    }
+
     void Stop() {
         RequestStop();
-        for (auto &worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-        workers_.clear();
+        JoinWorkers();
         notify_pool_.Stop();
         buffers_.clear();
+        sequences_.clear();
     }
 
     size_t NotifyQueueSize() const { return notify_pool_.QueueSize(); }
     uint64_t NotifyDroppedCount() const { return notify_pool_.DroppedCount(); }
 
    private:
+    void JoinWorkers() {
+        for (auto &worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+        workers_.clear();
+    }
+
     void Run(int thread_id) {
         std::mt19937 rng(static_cast<uint32_t>(config_.instance_id * 1000 +
                                                thread_id));
@@ -436,7 +427,7 @@ class Writer {
         gate.Configure(config_.target_qps, thread_id, config_.num_threads,
                        config_.enable_jitter);
         gate.Reset(SteadyNowUs());
-        uint64_t sequence = 0;
+        uint64_t &sequence = sequences_[thread_id];
         while (running_.load(std::memory_order_acquire)) {
             if (gate.Active()) {
                 const int64_t fire = gate.Next(SteadyNowUs(), rng);
@@ -490,14 +481,31 @@ class Writer {
         std::vector<size_t> indexes(config_.peers.size());
         std::iota(indexes.begin(), indexes.end(), 0);
         std::shuffle(indexes.begin(), indexes.end(), rng);
-        const std::string body = EncodeNotify(context);
+        NotifyRpcRequest request;
+        request.keys = context.keys;
+        request.size = context.size;
+        request.sender = context.sender;
+        size_t request_bytes = sizeof(request.size) + sizeof(request.sender);
+        for (const auto &key : request.keys) request_bytes += key.size();
         for (int i = 0; i < config_.notify_count; ++i) {
             const std::string peer = config_.peers[indexes[i]];
-            notify_pool_.Submit([this, peer, body] {
+            notify_pool_.Submit([this, peer, request, request_bytes] {
                 std::string error;
+                NotifyRpcTiming timing;
                 const auto start = std::chrono::steady_clock::now();
-                const bool ok = HttpPost(peer, "/notify", body, &error);
-                metrics_.Record("notify_http", ElapsedMs(start), ok, body.size());
+                const bool ok = notify_rpc_client_.Notify(
+                    peer, request, &timing, &error);
+                metrics_.Record("notify_rpc_pool_lookup",
+                                timing.pool_lookup_ms,
+                                timing.pool_found, 0);
+                metrics_.Record("notify_rpc_pool_dispatch",
+                                timing.pool_dispatch_ms,
+                                timing.dispatched, 0);
+                metrics_.Record("notify_rpc_await_response",
+                                timing.await_response_ms,
+                                timing.responded, 0);
+                metrics_.Record("notify_rpc", ElapsedMs(start), ok,
+                                request_bytes);
                 if (!ok) {
                     const uint64_t failures = notify_failures_.fetch_add(
                                                   1, std::memory_order_relaxed) +
@@ -516,11 +524,13 @@ class Writer {
     std::shared_ptr<RealClient> client_;
     PipelineExecutor &executor_;
     MetricsCollector &metrics_;
+    NotifyRpcClient notify_rpc_client_;
     ThreadPool notify_pool_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> notify_failures_{0};
     std::vector<std::thread> workers_;
     std::vector<std::unique_ptr<RegisteredBuffer>> buffers_;
+    std::vector<uint64_t> sequences_;
 };
 
 }  // namespace
@@ -598,16 +608,19 @@ int main(int argc, char **argv) {
 
     std::mutex workload_mutex;
     bool workload_started = false;
+    bool workload_paused = false;
+    bool measurement_armed = false;
+
+    NotifyRpcServer notify_rpc_server(
+        config.notify_rpc_port, config.notify_rpc_threads,
+        [&](NotifyRpcRequest request) {
+            return dispatcher.Dispatch(std::move(request));
+        });
 
     HttpServer server(
         config.listen_port, 4,
         [&](const std::string &method, const std::string &path,
-            const std::string &body) -> HttpResponse {
-            if (method == "POST" && path == "/notify") {
-                return dispatcher.Dispatch(body)
-                           ? HttpResponse{200, "text/plain", "ok"}
-                           : HttpResponse{400, "text/plain", "invalid notify"};
-            }
+            const std::string & /*body*/) -> HttpResponse {
             if (method == "GET" && path == "/stats") {
                 return {200, "application/json", metrics.StatsJson()};
             }
@@ -626,7 +639,70 @@ int main(int argc, char **argv) {
                     return {500, "text/plain", start_error};
                 }
                 workload_started = true;
+                workload_paused = false;
+                measurement_armed = false;
                 return {200, "text/plain", "started"};
+            }
+            if (method == "POST" && path == "/pause") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_started)
+                    return {409, "text/plain", "not started"};
+                if (workload_paused)
+                    return {200, "text/plain", "already paused"};
+                if (writer && !writer->PauseAndDrain(
+                                  std::chrono::seconds(30))) {
+                    return {500, "text/plain", "outbound drain timeout"};
+                }
+                workload_paused = true;
+                measurement_armed = false;
+                LOG(INFO) << "warmup transition: writer paused, outbound "
+                             "notifications drained";
+                return {200, "text/plain", "paused"};
+            }
+            if (method == "POST" && path == "/drain") {
+                if (!dispatcher.WaitIdle(std::chrono::seconds(30))) {
+                    return {500, "text/plain", "inbound drain timeout"};
+                }
+                LOG(INFO) << "warmup transition: inbound notifications drained";
+                return {200, "text/plain", "drained"};
+            }
+            if (method == "POST" && path == "/reset") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_started)
+                    return {409, "text/plain", "not started"};
+                if (writer && !workload_paused)
+                    return {409, "text/plain", "writer is not paused"};
+                metrics.ResetPaused();
+                measurement_armed = false;
+                LOG(INFO) << "warmup transition: metrics cleared and paused";
+                return {200, "text/plain", "reset"};
+            }
+            if (method == "POST" && path == "/arm") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_started || !workload_paused)
+                    return {409, "text/plain", "workload is not paused"};
+                if (!measurement_armed) {
+                    metrics.BeginMeasurement();
+                    measurement_armed = true;
+                }
+                LOG(INFO) << "measurement metrics armed";
+                return {200, "text/plain", "armed"};
+            }
+            if (method == "POST" && path == "/resume") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_started)
+                    return {409, "text/plain", "not started"};
+                if (!workload_paused)
+                    return {200, "text/plain", "already running"};
+                if (!measurement_armed)
+                    return {409, "text/plain", "measurement is not armed"};
+                std::string resume_error;
+                if (writer && !writer->Start(&resume_error)) {
+                    return {500, "text/plain", resume_error};
+                }
+                workload_paused = false;
+                LOG(INFO) << "measurement workload resumed";
+                return {200, "text/plain", "resumed"};
             }
             if (method == "POST" && path == "/summary") {
                 metrics.WriteSummary();
@@ -636,17 +712,21 @@ int main(int argc, char **argv) {
                 std::lock_guard<std::mutex> lock(workload_mutex);
                 metrics.Freeze();
                 running.store(false, std::memory_order_release);
-                dispatcher.StopNow();
                 if (writer) writer->RequestStop();
                 return {200, "text/plain", "stopping"};
             }
             return {404, "text/plain", "not found"};
         });
     int exit_code = 0;
-    if (!server.Start(&error)) {
+    if (!notify_rpc_server.Start(&error)) {
+        LOG(ERROR) << "YLT notify RPC server failed: " << error;
+        exit_code = 1;
+        running.store(false, std::memory_order_release);
+    } else if (!server.Start(&error)) {
         LOG(ERROR) << "HTTP server failed: " << error;
         exit_code = 1;
         running.store(false, std::memory_order_release);
+        notify_rpc_server.Stop();
     }
     if (running.load(std::memory_order_acquire) && !config.start_paused) {
         std::lock_guard<std::mutex> lock(workload_mutex);
@@ -665,6 +745,7 @@ int main(int argc, char **argv) {
               << " write_threads=" << config.num_threads
               << " read_threads=" << config.NumReadThreads()
               << " listen_port=" << config.listen_port
+              << " notify_rpc_port=" << config.notify_rpc_port
               << " start_paused=" << config.start_paused;
 
     std::vector<MetricSnapshot> previous;
@@ -701,8 +782,11 @@ int main(int argc, char **argv) {
     LOG(INFO) << "mooncake_kvtest shutdown: draining workload";
     metrics.Freeze();
     if (writer) writer->RequestStop();
-    dispatcher.StopNow();
+    // Join outbound RPC tasks before destroying the client pools or stopping
+    // this process's RPC server. This also preserves self-notify in dual mode.
     if (writer) writer->Stop();
+    notify_rpc_server.Stop();
+    dispatcher.StopNow();
     dispatcher.Stop();
     // Persist the final artifacts before stopping the HTTP listener.  Even if
     // listener teardown regresses, the harness can still recover a complete

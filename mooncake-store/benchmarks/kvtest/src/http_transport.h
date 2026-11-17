@@ -1,15 +1,15 @@
 #pragma once
 
-#include "thread_pool.h"
-
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace mooncake::kvtest {
 
@@ -32,19 +32,15 @@ class HttpServer {
     void Stop();
 
    private:
-    void AcceptLoop();
-    void HandleConnection(std::shared_ptr<asio::ip::tcp::socket> socket);
+    void DoAccept();
 
     int port_;
+    size_t connection_threads_;
     HttpHandler handler_;
     asio::io_context io_;
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
-    ThreadPool connection_pool_;
-    std::thread accept_thread_;
+    std::vector<std::thread> io_threads_;
     std::atomic<bool> running_{false};
 };
-
-bool HttpPost(const std::string &url, const std::string &path,
-              const std::string &body, std::string *error);
 
 }  // namespace mooncake::kvtest

@@ -74,6 +74,12 @@ void MetricsCollector::Start() {
 }
 
 void MetricsCollector::Reset() {
+    ResetPaused();
+    BeginMeasurement();
+}
+
+void MetricsCollector::ResetPaused() {
+    recording_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> operations_lock(operations_mutex_);
     for (const auto &[name, metric] : operations_) {
         (void)name;
@@ -85,6 +91,11 @@ void MetricsCollector::Reset() {
         metric->samples.clear();
     }
     verify_failures_.store(0, std::memory_order_relaxed);
+    start_time_us_.store(0, std::memory_order_release);
+    end_time_us_.store(0, std::memory_order_release);
+}
+
+void MetricsCollector::BeginMeasurement() {
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
     end_time_us_.store(0, std::memory_order_release);
     recording_.store(true, std::memory_order_release);

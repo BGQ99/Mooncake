@@ -1,9 +1,10 @@
 # Mooncake kvtest
 
 `mooncake_kvtest` is a C++ writer/reader pipeline benchmark modeled after the
-YuanRong DataSystem `tests/kvtest` process and configuration model. It keeps
-HTTP notification handling, the notification queue, Mooncake calls, and metric
-collection in C++; Python is not part of the request path.
+YuanRong DataSystem `tests/kvtest` process and configuration model. Peer
+notifications use YLT `coro_rpc`; HTTP remains the low-rate control plane. The
+notification queue, Mooncake calls, and metric collection stay in C++; Python
+is not part of the request path.
 
 ## Build
 
@@ -28,9 +29,21 @@ configuration without connecting to Mooncake:
   this matches Mooncake-Performance rank/recall's dual-client deployment.
 - `role=reader` only receives notifications.
 - Every process creates `num_total_threads - num_threads` C++ notification
-  workers. An HTTP handler only parses and enqueues a notification; a worker
+  workers. A YLT RPC handler only decodes and enqueues a notification; a worker
   runs `notify_pipeline` independently.
-- `notify_threads` controls the writer's outbound HTTP pool.
+- `notify_threads` controls the writer's bounded outbound task pool.
+- `notify_rpc_connections_per_peer` sets YLT's per-peer long-lived connection
+  cache size. The default is 4; YLT can create overflow clients during a burst
+  and retires them through its short-connection queue.
+- `notify_rpc_reuse_limit` controls when the YLT client pool starts pipelining
+  requests on reusable connections. `notify_rpc_pool_lookup`,
+  `notify_rpc_pool_dispatch`, `notify_rpc_await_response`, and `notify_rpc`
+  expose the client-side breakdown. `pool_dispatch` includes connection
+  acquisition/reconnect; because YLT may also await the response inside
+  `send_request` below the reuse threshold, it is intentionally not named a
+  pure serialization/send duration.
+- `listen_port` serves HTTP control endpoints. `notify_rpc_port` serves only
+  YLT notifications and defaults to `listen_port + 10000` when omitted.
 
 The reader therefore accepts later notifications while earlier Mooncake reads
 are still running. There is no CPython GIL, but CPU scheduling, C++ locks,
@@ -69,11 +82,15 @@ Buffer lifecycle. Use `upsertFrom` for the zero-copy writer path.
 
 ## Control endpoints
 
-- `POST /notify`: enqueue `{keys, sender, size}` for `notify_pipeline`.
 - `GET /stats`: cumulative JSON counters.
 - `GET /health`: liveness response.
 - `POST /start`: reset metrics and release a `start_paused=true` workload;
   repeated calls are idempotent.
+- `POST /pause`: stop writer loops and drain outbound RPC notifications.
+- `POST /drain`: wait until inbound notification work is complete.
+- `POST /reset`: clear warmup metrics and request samples, keeping recording paused.
+- `POST /arm`: start the measured metrics clock while workload remains paused.
+- `POST /resume`: restart writer loops for the measured phase.
 - `POST /summary`: write `summary.json` immediately.
 - `POST /stop`: stop accepting pipeline work and begin graceful shutdown.
 
@@ -93,8 +110,8 @@ nearest-rank percentile rule as the Python benchmark/plotting path.
 
 Start readers before writers. `nodes` is compatible with YuanRong kvtest;
 writers automatically select entries whose `role` is `reader` or `dual`.
-Explicit `peers` values such as `http://10.0.0.2:9001` override node
-discovery.
+Explicit `peers` values such as `10.0.0.2:19001` override node discovery and
+must refer to the peer's YLT `notify_rpc_port`.
 
 The Mooncake-specific `store` object maps directly to `RealClient::setup_real`.
 Environment variables such as `MC_WORKERS_PER_CTX` are still consumed by the

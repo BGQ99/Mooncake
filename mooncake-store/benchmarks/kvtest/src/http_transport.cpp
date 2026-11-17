@@ -1,45 +1,21 @@
 #include "http_transport.h"
 
-#include <asio/connect.hpp>
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
-#include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/write.hpp>
-#include <sys/socket.h>
 
 #include <algorithm>
 #include <cctype>
-#include <chrono>
 #include <istream>
 #include <ostream>
 #include <sstream>
-#include <thread>
+#include <utility>
 
 namespace mooncake::kvtest {
 namespace {
 
-struct Endpoint {
-    std::string host;
-    std::string port;
-};
-
-bool ParseUrl(const std::string &url, Endpoint *endpoint, std::string *error) {
-    std::string value = url;
-    constexpr const char *prefix = "http://";
-    if (value.rfind(prefix, 0) == 0)
-        value.erase(0, std::char_traits<char>::length(prefix));
-    const auto slash = value.find('/');
-    if (slash != std::string::npos) value.resize(slash);
-    const auto colon = value.rfind(':');
-    if (colon == std::string::npos || colon == 0 || colon + 1 == value.size()) {
-        if (error) *error = "invalid HTTP peer URL: " + url;
-        return false;
-    }
-    endpoint->host = value.substr(0, colon);
-    endpoint->port = value.substr(colon + 1);
-    return true;
-}
+constexpr size_t kMaxRequestBody = 4 * 1024 * 1024;
 
 std::string Trim(std::string value) {
     while (!value.empty() &&
@@ -52,216 +28,196 @@ std::string Trim(std::string value) {
     return value.substr(start);
 }
 
+std::string Lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value;
+}
+
+class HttpSession : public std::enable_shared_from_this<HttpSession> {
+   public:
+    HttpSession(asio::ip::tcp::socket socket, HttpHandler handler)
+        : socket_(std::move(socket)), handler_(std::move(handler)) {}
+
+    void Start() { ReadHeaders(); }
+
+   private:
+    void ReadHeaders() {
+        auto self = shared_from_this();
+        asio::async_read_until(
+            socket_, buffer_, "\r\n\r\n",
+            [self](const asio::error_code &ec, size_t) {
+                if (!ec) self->ParseHeaders();
+            });
+    }
+
+    void ParseHeaders() {
+        std::istream input(&buffer_);
+        std::string request_line;
+        std::getline(input, request_line);
+        std::istringstream request_stream(Trim(request_line));
+        request_stream >> method_ >> path_ >> version_;
+
+        content_length_ = 0;
+        bool connection_close = false;
+        bool connection_keep_alive = false;
+        std::string line;
+        while (std::getline(input, line) && line != "\r") {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string name = Lower(Trim(line.substr(0, colon)));
+            const std::string value = Lower(Trim(line.substr(colon + 1)));
+            if (name == "content-length") {
+                try {
+                    content_length_ = static_cast<size_t>(std::stoull(value));
+                } catch (...) {
+                    WriteResponse({400, "text/plain", "bad content-length"},
+                                  false);
+                    return;
+                }
+            } else if (name == "connection") {
+                connection_close = value == "close";
+                connection_keep_alive = value == "keep-alive";
+            }
+        }
+
+        keep_alive_ = version_ == "HTTP/1.1" ? !connection_close
+                                               : connection_keep_alive;
+        if (method_.empty() || path_.empty()) {
+            WriteResponse({400, "text/plain", "bad request"}, false);
+            return;
+        }
+        if (content_length_ > kMaxRequestBody) {
+            WriteResponse({413, "text/plain", ""}, false);
+            return;
+        }
+        if (buffer_.size() >= content_length_) {
+            ProcessRequest();
+            return;
+        }
+        const size_t remaining = content_length_ - buffer_.size();
+        auto self = shared_from_this();
+        asio::async_read(socket_, buffer_, asio::transfer_exactly(remaining),
+                         [self](const asio::error_code &ec, size_t) {
+                             if (!ec) self->ProcessRequest();
+                         });
+    }
+
+    void ProcessRequest() {
+        std::string body(content_length_, '\0');
+        if (content_length_ != 0) {
+            std::istream input(&buffer_);
+            input.read(body.data(),
+                       static_cast<std::streamsize>(content_length_));
+            if (static_cast<size_t>(input.gcount()) != content_length_) return;
+        }
+
+        HttpResponse response;
+        try {
+            response = handler_(method_, path_, body);
+        } catch (...) {
+            response = {500, "text/plain", "handler failure"};
+            keep_alive_ = false;
+        }
+        WriteResponse(std::move(response), keep_alive_);
+    }
+
+    void WriteResponse(HttpResponse response, bool keep_alive) {
+        keep_alive_ = keep_alive;
+        std::ostringstream output;
+        output << "HTTP/1.1 " << response.status
+               << (response.status == 200 ? " OK" : " ERROR") << "\r\n"
+               << "Content-Type: " << response.content_type << "\r\n"
+               << "Content-Length: " << response.body.size() << "\r\n"
+               << "Connection: " << (keep_alive_ ? "keep-alive" : "close")
+               << "\r\n\r\n"
+               << response.body;
+        response_ = output.str();
+        auto self = shared_from_this();
+        asio::async_write(
+            socket_, asio::buffer(response_),
+            [self](const asio::error_code &ec, size_t) {
+                if (ec || !self->keep_alive_) return;
+                self->method_.clear();
+                self->path_.clear();
+                self->version_.clear();
+                self->response_.clear();
+                self->ReadHeaders();
+            });
+    }
+
+    asio::ip::tcp::socket socket_;
+    HttpHandler handler_;
+    asio::streambuf buffer_;
+    std::string method_;
+    std::string path_;
+    std::string version_;
+    std::string response_;
+    size_t content_length_{0};
+    bool keep_alive_{false};
+};
+
 }  // namespace
 
 HttpServer::HttpServer(int port, size_t connection_threads,
                        HttpHandler handler)
     : port_(port),
-      handler_(std::move(handler)),
-      connection_pool_(std::max<size_t>(1, connection_threads), 4096) {}
+      connection_threads_(std::max<size_t>(1, connection_threads)),
+      handler_(std::move(handler)) {}
 
 HttpServer::~HttpServer() { Stop(); }
 
 bool HttpServer::Start(std::string *error) {
     try {
+        io_.restart();
         acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(io_);
         acceptor_->open(asio::ip::tcp::v4());
         acceptor_->set_option(asio::ip::tcp::acceptor::reuse_address(true));
         acceptor_->bind(
             asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port_));
         acceptor_->listen();
-        // AcceptLoop used to block in a synchronous accept().  On Linux,
-        // cancel()/close() from Stop() did not reliably wake that call, so
-        // shutdown could hang in accept_thread_.join() until another client
-        // happened to connect.  A non-blocking accept loop gives Stop() a
-        // bounded (10 ms) join latency without requiring a second /stop.
-        acceptor_->non_blocking(true);
         running_.store(true, std::memory_order_release);
-        accept_thread_ = std::thread([this] { AcceptLoop(); });
+        DoAccept();
+        io_threads_.reserve(connection_threads_);
+        for (size_t i = 0; i < connection_threads_; ++i)
+            io_threads_.emplace_back([this] { io_.run(); });
         return true;
     } catch (const std::exception &e) {
         if (error) *error = e.what();
+        Stop();
         return false;
     }
 }
 
 void HttpServer::Stop() {
-    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    const bool was_running =
+        running_.exchange(false, std::memory_order_acq_rel);
+    if (!was_running && io_threads_.empty() && !acceptor_) return;
     if (acceptor_) {
         asio::error_code ec;
         acceptor_->cancel(ec);
         acceptor_->close(ec);
     }
     io_.stop();
-    if (accept_thread_.joinable()) accept_thread_.join();
-    connection_pool_.Stop();
-}
-
-void HttpServer::AcceptLoop() {
-    while (running_.load(std::memory_order_acquire)) {
-        auto socket = std::make_shared<asio::ip::tcp::socket>(io_);
-        asio::error_code ec;
-        acceptor_->accept(*socket, ec);
-        if (ec) {
-            if (!running_.load(std::memory_order_acquire)) return;
-            if (ec == asio::error::would_block || ec == asio::error::try_again) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            continue;
-        }
-        // Stop may race with a successful accept.  Do not enqueue one last
-        // request after shutdown has begun.
-        if (!running_.load(std::memory_order_acquire)) {
-            socket->close(ec);
-            return;
-        }
-        socket->non_blocking(false, ec);
-        if (ec) {
-            socket->close(ec);
-            continue;
-        }
-        socket->set_option(asio::ip::tcp::no_delay(true), ec);
-        if (!connection_pool_.Submit(
-                [this, socket] { HandleConnection(socket); })) {
-            socket->close(ec);
-        }
+    for (auto &thread : io_threads_) {
+        if (thread.joinable()) thread.join();
     }
+    io_threads_.clear();
+    acceptor_.reset();
 }
 
-void HttpServer::HandleConnection(
-    std::shared_ptr<asio::ip::tcp::socket> socket) {
-    try {
-        asio::streambuf headers;
-        asio::read_until(*socket, headers, "\r\n\r\n");
-        std::istream input(&headers);
-        std::string request_line;
-        std::getline(input, request_line);
-        request_line = Trim(request_line);
-        std::istringstream request_stream(request_line);
-        std::string method;
-        std::string path;
-        std::string version;
-        request_stream >> method >> path >> version;
-
-        size_t content_length = 0;
-        std::string line;
-        while (std::getline(input, line) && line != "\r") {
-            const auto colon = line.find(':');
-            if (colon == std::string::npos) continue;
-            std::string name = line.substr(0, colon);
-            std::transform(name.begin(), name.end(), name.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
-            if (name == "content-length") {
-                content_length =
-                    static_cast<size_t>(std::stoull(Trim(line.substr(colon + 1))));
+void HttpServer::DoAccept() {
+    acceptor_->async_accept(
+        [this](const asio::error_code &ec, asio::ip::tcp::socket socket) {
+            if (!ec && running_.load(std::memory_order_acquire)) {
+                asio::error_code option_error;
+                socket.set_option(asio::ip::tcp::no_delay(true), option_error);
+                if (!option_error)
+                    std::make_shared<HttpSession>(std::move(socket), handler_)
+                        ->Start();
             }
-        }
-
-        constexpr size_t kMaxRequestBody = 4 * 1024 * 1024;
-        if (content_length > kMaxRequestBody) {
-            static constexpr char response[] =
-                "HTTP/1.1 413 Payload Too Large\r\n"
-                "Content-Length: 0\r\nConnection: close\r\n\r\n";
-            asio::write(*socket, asio::buffer(response, sizeof(response) - 1));
-            return;
-        }
-
-        std::string body(content_length, '\0');
-        size_t copied = 0;
-        while (copied < content_length && headers.size() > 0) {
-            input.read(body.data() + copied,
-                       static_cast<std::streamsize>(content_length - copied));
-            const auto read = static_cast<size_t>(input.gcount());
-            if (read == 0) break;
-            copied += read;
-        }
-        if (copied < content_length) {
-            asio::read(*socket,
-                       asio::buffer(body.data() + copied,
-                                    content_length - copied));
-        }
-
-        HttpResponse response;
-        if (method.empty() || path.empty()) {
-            response = {400, "text/plain", "bad request"};
-        } else {
-            response = handler_(method, path, body);
-        }
-        std::ostringstream output;
-        output << "HTTP/1.1 " << response.status
-               << (response.status == 200 ? " OK" : " ERROR") << "\r\n"
-               << "Content-Type: " << response.content_type << "\r\n"
-               << "Content-Length: " << response.body.size() << "\r\n"
-               << "Connection: close\r\n\r\n"
-               << response.body;
-        asio::write(*socket, asio::buffer(output.str()));
-    } catch (...) {
-    }
-    asio::error_code ec;
-    socket->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-    socket->close(ec);
-}
-
-bool HttpPost(const std::string &url, const std::string &path,
-              const std::string &body, std::string *error) {
-    try {
-        Endpoint endpoint;
-        if (!ParseUrl(url, &endpoint, error)) return false;
-        asio::io_context io;
-        asio::ip::tcp::resolver resolver(io);
-        asio::ip::tcp::socket socket(io);
-        asio::steady_timer timer(io);
-        asio::error_code connect_error = asio::error::would_block;
-        timer.expires_after(std::chrono::seconds(3));
-        timer.async_wait([&](const asio::error_code &timer_error) {
-            if (!timer_error && connect_error == asio::error::would_block) {
-                asio::error_code ignored;
-                socket.close(ignored);
-            }
+            if (running_.load(std::memory_order_acquire)) DoAccept();
         });
-        asio::async_connect(
-            socket, resolver.resolve(endpoint.host, endpoint.port),
-            [&](const asio::error_code &ec, const asio::ip::tcp::endpoint &) {
-                connect_error = ec;
-                timer.cancel();
-            });
-        io.run();
-        if (connect_error) {
-            if (error)
-                *error = connect_error == asio::error::operation_aborted
-                             ? "connect timeout"
-                             : connect_error.message();
-            return false;
-        }
-        socket.set_option(asio::ip::tcp::no_delay(true));
-        timeval timeout{3, 0};
-        setsockopt(socket.native_handle(), SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                   sizeof(timeout));
-        setsockopt(socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout));
-        std::ostringstream request;
-        request << "POST " << path << " HTTP/1.1\r\n"
-                << "Host: " << endpoint.host << "\r\n"
-                << "Content-Type: application/json\r\n"
-                << "Content-Length: " << body.size() << "\r\n"
-                << "Connection: close\r\n\r\n"
-                << body;
-        asio::write(socket, asio::buffer(request.str()));
-        asio::streambuf response;
-        asio::read_until(socket, response, "\r\n");
-        std::istream input(&response);
-        std::string version;
-        int status = 0;
-        input >> version >> status;
-        if (status != 200) {
-            if (error) *error = "HTTP status " + std::to_string(status);
-            return false;
-        }
-        return true;
-    } catch (const std::exception &e) {
-        if (error) *error = e.what();
-        return false;
-    }
 }
 
 }  // namespace mooncake::kvtest

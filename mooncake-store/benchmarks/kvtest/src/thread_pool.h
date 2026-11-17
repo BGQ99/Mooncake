@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <chrono>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -51,6 +52,13 @@ class ThreadPool {
         return dropped_.load(std::memory_order_relaxed);
     }
 
+    bool WaitIdle(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return idle_cv_.wait_for(lock, timeout, [this] {
+            return tasks_.empty() && active_tasks_ == 0;
+        });
+    }
+
     void StopNow() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -83,22 +91,30 @@ class ThreadPool {
                 if (stopped_) return;
                 task = std::move(tasks_.front());
                 tasks_.pop();
+                ++active_tasks_;
             }
             try {
                 task();
             } catch (...) {
                 task_failures_.fetch_add(1, std::memory_order_relaxed);
             }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --active_tasks_;
+                if (tasks_.empty() && active_tasks_ == 0) idle_cv_.notify_all();
+            }
         }
     }
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    std::condition_variable idle_cv_;
     std::queue<std::function<void()>> tasks_;
     std::vector<std::thread> workers_;
     size_t max_queue_;
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> task_failures_{0};
+    size_t active_tasks_{0};
     bool stopped_{false};
 };
 

@@ -27,6 +27,8 @@ class MetricsCollector {
 
     void Start();
     void Reset();
+    void ResetPaused();
+    void BeginMeasurement();
     void Freeze();
     void Stop();
     void Record(const std::string &operation, double latency_ms, bool success,
