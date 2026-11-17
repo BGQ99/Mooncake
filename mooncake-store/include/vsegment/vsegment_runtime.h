@@ -110,6 +110,9 @@ class LogicalRangeAllocator {
                       std::string* detail = nullptr);
 
     uint64_t FreeBytes() const;
+    // Bytes held by in-flight PutStart reservations. Together with
+    // FreeBytes() and the committed ranges this partitions logical_capacity_.
+    uint64_t ReservedBytes() const;
     size_t ReservationCount() const;
     size_t CommittedCount() const;
     bool Empty() const;
